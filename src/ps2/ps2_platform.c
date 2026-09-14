@@ -36,7 +36,7 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* Strict Uppercase Flat-Root Path Resolver */
+/* Flat-root path resolver: keeps device prefix lowercase, uppercases filenames for ISO compliance */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
         strncpy(output_path, "cdrom0:\\", max_len);
@@ -47,12 +47,11 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         strncpy(output_path, input_path, max_len);
         for (int i = 0; output_path[i]; i++) {
             if (output_path[i] == '/') output_path[i] = '\\';
-            output_path[i] = toupper((unsigned char)output_path[i]);
         }
+        output_path[max_len - 1] = '\0';
         return;
     }
 
-    // Isolate the filename component, stripping any directory prefixes
     const char *filename = strrchr(input_path, '/');
     if (!filename) filename = strrchr(input_path, '\\');
     if (filename) filename++; else filename = input_path;
@@ -66,7 +65,6 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    // Unconditionally convert the filename to UPPERCASE for ISO9660 compliance
     char upper_filename[256];
     int i = 0;
     for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
@@ -82,9 +80,7 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     resolve_iso_path(filename, resolved, sizeof(resolved));
-    FILE *f = __real_fopen(resolved, mode);
-    printf("[FOPEN] Requested: '%s' -> Resolved: '%s' -> %s\n", filename, resolved, f ? "SUCCESS" : "FAILED");
-    return f;
+    return __real_fopen(resolved, mode);
 }
 
 DIR *__wrap_opendir(const char *name) {
@@ -97,7 +93,6 @@ static struct dirent fake_entry;
 struct dirent *__wrap_readdir(DIR *dirp) {
     struct dirent *entry = __real_readdir(dirp);
     
-    // Force-inject AVSP.ZIP in uppercase if directory listing finishes
     if (!entry && !g_injected_rom_listed) {
         g_injected_rom_listed = true;
         memset(&fake_entry, 0, sizeof(fake_entry));
