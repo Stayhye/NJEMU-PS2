@@ -19,23 +19,16 @@
 #include <ps2_audio_driver.h>
 #include <ps2_cdfs_driver.h>
 
-/* Forward declare real linker-wrapped functions at the top to prevent implicit declarations */
 extern FILE *__real_fopen(const char *filename, const char *mode);
 extern DIR *__real_opendir(const char *name);
 extern struct dirent *__real_readdir(DIR *dirp);
 extern int __real_stat(const char *path, struct stat *buf);
 extern int __real_access(const char *path, int amode);
 
-static char g_iso_rom_base[256] = "";
+static char g_active_rom_path[256] = "cdrom0:\\";
 
-/* Enable console logging */
-void boot_log(const char *msg)
-{
-    printf("[NJEMU-BOOT] %s\n", msg);
-}
-
-void dbg_printf(const char *fmt, ...)
-{
+void boot_log(const char *msg) { printf("[NJEMU] %s\n", msg); }
+void dbg_printf(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
@@ -43,120 +36,67 @@ void dbg_printf(const char *fmt, ...)
     printf("\n");
 }
 
-/* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Matching */
-static bool iso_name_match(const char *filename, const char *search_name) {
-    char f_copy[256];
-    char s_copy[256];
-    strncpy(f_copy, filename, sizeof(f_copy) - 1);
-    f_copy[sizeof(f_copy) - 1] = '\0';
-    strncpy(s_copy, search_name, sizeof(s_copy) - 1);
-    s_copy[sizeof(s_copy) - 1] = '\0';
-
-    char *semi = strchr(f_copy, ';');
-    if (semi) *semi = '\0';
-    char *semi2 = strchr(s_copy, ';');
-    if (semi2) *semi2 = '\0';
-
-    return strcasecmp(f_copy, s_copy) == 0;
-}
-
-static void resolve_case_path(const char *input_path, char *output_path, size_t max_len) {
-    if (!input_path) {
-        output_path[0] = '\0';
+/* Bulletproof path normalizer: Forces relative paths to absolute device paths */
+static void force_absolute_path(const char *input, char *output, size_t max_len) {
+    if (!input) {
+        strcpy(output, g_active_rom_path);
         return;
     }
 
-    char temp_path[1024];
-    if ((strcmp(input_path, ".") == 0 || strcmp(input_path, "") == 0) && g_iso_rom_base[0] != '\0') {
-        strncpy(output_path, g_iso_rom_base, max_len);
-        output_path[max_len - 1] = '\0';
+    // If it's already an absolute device path, normalize slashes and keep it
+    if (strncasecmp(input, "cdrom0:", 7) == 0 || strncasecmp(input, "mass0:", 6) == 0 || strncasecmp(input, "host:", 5) == 0) {
+        strncpy(output, input, max_len);
+        output[max_len - 1] = '\0';
+        for (int i = 0; output[i]; i++) {
+            if (output[i] == '/') output[i] = '\\';
+        }
         return;
     }
 
-    if (input_path[0] != '/' && input_path[0] != '\\' && strchr(input_path, ':') == NULL) {
-        if (g_iso_rom_base[0] != '\0') {
-            snprintf(temp_path, sizeof(temp_path), "%s\\%s", g_iso_rom_base, input_path);
-            input_path = temp_path;
+    // If it's a relative path or '.', map it directly to our active base path
+    if (strcmp(input, ".") == 0 || strcmp(input, "") == 0 || input[0] != '/') {
+        if (input[0] == '.' && (input[1] == '/' || input[1] == '\\')) input += 2;
+        
+        if (strlen(input) > 0) {
+            snprintf(output, max_len, "%s\\%s", g_active_rom_path, input);
+        } else {
+            strncpy(output, g_active_rom_path, max_len);
         }
+    } else {
+        snprintf(output, max_len, "%s%s", g_active_rom_path, input);
     }
 
-    strncpy(output_path, input_path, max_len);
-    output_path[max_len - 1] = '\0';
-
-    // Normalize forward slashes to backslashes for cdrom0: compatibility
-    if (strncasecmp(output_path, "cdrom0:", 7) == 0 || strncasecmp(output_path, "cdrom:", 6) == 0) {
-        for (int i = 0; output_path[i] != '\0'; i++) {
-            if (output_path[i] == '/') output_path[i] = '\\';
-        }
-
-        int prefix_len = (strncasecmp(output_path, "cdrom0:\\", 8) == 0) ? 8 : 7;
-        char work_path[1024];
-        strncpy(work_path, output_path + prefix_len, sizeof(work_path) - 1);
-        work_path[sizeof(work_path) - 1] = '\0';
-
-        char current_dir[1024];
-        snprintf(current_dir, sizeof(current_dir), "%.*s", prefix_len, output_path);
-
-        char *token = strtok(work_path, "/\\");
-        while (token != NULL) {
-            if (strcmp(token, ".") == 0) {
-                token = strtok(NULL, "/\\");
-                continue;
-            }
-
-            DIR *dir = __real_opendir(current_dir);
-            if (!dir) break;
-
-            bool found = false;
-            struct dirent *entry;
-            char matched_name[256];
-
-            while ((entry = __real_readdir(dir)) != NULL) {
-                if (iso_name_match(entry->d_name, token)) {
-                    strncpy(matched_name, entry->d_name, sizeof(matched_name));
-                    found = true;
-                    break;
-                }
-            }
-            closedir(dir);
-
-            int len = strlen(current_dir);
-            if (len > 0 && current_dir[len - 1] != '\\') {
-                strcat(current_dir, "\\");
-            }
-            if (found) {
-                strcat(current_dir, matched_name);
-            } else {
-                strcat(current_dir, token);
-            }
-
-            token = strtok(NULL, "/\\");
-        }
-        strncpy(output_path, current_dir, max_len);
-        output_path[max_len - 1] = '\0';
+    output[max_len - 1] = '\0';
+    for (int i = 0; output[i]; i++) {
+        if (output[i] == '/') output[i] = '\\';
     }
 }
 
-/* Linker Wrappers: Intercept filesystem calls */
+/* Linker Wrappers */
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
-    resolve_case_path(filename, resolved, sizeof(resolved));
-    printf("[FOPEN] Req: '%s' -> Resolved: '%s'\n", filename ? filename : "NULL", resolved);
+    force_absolute_path(filename, resolved, sizeof(resolved));
     return __real_fopen(resolved, mode);
 }
 
 DIR *__wrap_opendir(const char *name) {
     char resolved[1024];
-    resolve_case_path(name, resolved, sizeof(resolved));
-    printf("[OPENDIR] Req: '%s' -> Resolved: '%s'\n", name ? name : "NULL", resolved);
-    return __real_opendir(resolved);
+    force_absolute_path(name, resolved, sizeof(resolved));
+    DIR *d = __real_opendir(resolved);
+    if (!d && strcmp(resolved, g_active_rom_path) != 0) {
+        // Fallback fallback: try root if specific subfolder fails
+        d = __real_opendir(g_active_rom_path);
+    }
+    return d;
 }
 
 struct dirent *__wrap_readdir(DIR *dirp) {
     struct dirent *entry = __real_readdir(dirp);
     if (entry) {
+        // Strip ISO9660 version suffix (e.g. ";1")
         char *semi = strchr(entry->d_name, ';');
         if (semi) *semi = '\0';
+        // Convert to lowercase so extension filters (.zip) match
         for (int i = 0; entry->d_name[i]; i++) {
             entry->d_name[i] = tolower((unsigned char)entry->d_name[i]);
         }
@@ -166,121 +106,68 @@ struct dirent *__wrap_readdir(DIR *dirp) {
 
 int __wrap_stat(const char *path, struct stat *buf) {
     char resolved[1024];
-    resolve_case_path(path, resolved, sizeof(resolved));
+    force_absolute_path(path, resolved, sizeof(resolved));
     return __real_stat(resolved, buf);
 }
 
 int __wrap_access(const char *path, int amode) {
     char resolved[1024];
-    resolve_case_path(path, resolved, sizeof(resolved));
+    force_absolute_path(path, resolved, sizeof(resolved));
     return __real_access(resolved, amode);
 }
 
-typedef struct ps2_platform {
-} ps2_platform_t;
+typedef struct ps2_platform {} ps2_platform_t;
 
-static void reset_IOP()
-{
+static void *ps2_init(void) {
+    ps2_platform_t *ps2 = (ps2_platform_t*)calloc(1, sizeof(ps2_platform_t));
+
     SifInitRpc(0);
     while (!SifIopReset(NULL, 0)) {}
     while (!SifIopSync()) {}
-}
-
-static void prepare_IOP()
-{
-    reset_IOP();
-    SifInitRpc(0);
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
     sbv_patch_fileio();
-}
 
-static void init_drivers()
-{
     init_ps2_filesystem_driver();
     init_usb_driver(true);
     init_mx4sio_driver(true);
     init_cdfs_driver();
     init_audio_driver();
-}
 
-static void deinit_drivers()
-{
-    deinit_audio_driver();
-    deinit_ps2_filesystem_driver();
-}
-
-static void *ps2_init(void) {
-    ps2_platform_t *ps2 = (ps2_platform_t*)calloc(1, sizeof(ps2_platform_t));
-
-    prepare_IOP();
-    init_drivers();
-
-    const char *candidates[] = {
-        "cdrom0:\\ROMS", "cdrom0:\\roms", "cdrom0:\\ROM", "cdrom0:\\",
-        "cdrom:\\ROMS", "cdrom:\\roms", "cdrom:\\",
-        "mass0:\\ROMS", "mass0:\\roms", "."
+    // Probe to find where the ROMs actually exist
+    const char *test_paths[] = {
+        "cdrom0:\\ROMS", "cdrom0:\\roms", "cdrom0:\\",
+        "mass0:\\ROMS", "mass0:\\roms", "mass0:\\"
     };
 
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        DIR *d = __real_opendir(candidates[i]);
+    for (size_t i = 0; i < sizeof(test_paths)/sizeof(test_paths[0]); i++) {
+        DIR *d = __real_opendir(test_paths[i]);
         if (d) {
-            strcpy(g_iso_rom_base, candidates[i]);
+            strcpy(g_active_rom_path, test_paths[i]);
             closedir(d);
-            printf("[PS2_INIT] Found valid ROM base directory: %s\n", g_iso_rom_base);
             break;
         }
     }
 
-    if (g_iso_rom_base[0] == '\0') {
-        strcpy(g_iso_rom_base, "cdrom0:\\");
-        printf("[PS2_INIT] Warning: No specific ROM folder found, defaulting to cdrom0:\\\n");
-    }
-
-    chdir(g_iso_rom_base);
-
+    chdir(g_active_rom_path);
     return ps2;
 }
 
 static void ps2_free(void *data) {
-    ps2_platform_t *ps2 = (ps2_platform_t*)data;
-    deinit_drivers();
-    free(ps2);
+    deinit_audio_driver();
+    deinit_ps2_filesystem_driver();
+    free(data);
 }
 
 static void ps2_main(void *data, int argc, char *argv[]) {
-    ps2_platform_t *ps2 = (ps2_platform_t*)data;
-
-    for (int i = 0; i < argc; i++) {
-        char resolved[1024];
-        resolve_case_path(argv[i], resolved, sizeof(resolved));
-        strncpy(argv[i], resolved, strlen(argv[i]) + 1);
-    }
-
+    (void)data; (void)argc; (void)argv;
     getcwd(screenshotDir, sizeof(screenshotDir));
     strcat(screenshotDir, "/PICTURE");
     mkdir(screenshotDir, 0777);
-#if   (EMU_SYSTEM == CPS1)
-    strcat(screenshotDir, "/CPS1");
-#endif
-#if   (EMU_SYSTEM == CPS2)
-    strcat(screenshotDir, "/CPS2");
-#endif
-#if   (EMU_SYSTEM == MVS)
-    strcat(screenshotDir, "/MVS");
-#endif
-#if   (EMU_SYSTEM == NCDZ)
-    strcat(screenshotDir, "/NCDZ");
-#endif
 }
 
-static bool ps2_startSystemButtons(void *data) {
-    return false;
-}
-
-static int32_t ps2_getDevkitVersion(void *data) {
-    return 0;
-}
+static bool ps2_startSystemButtons(void *data) { return false; }
+static int32_t ps2_getDevkitVersion(void *data) { return 0; }
 
 platform_driver_t platform_ps2 = {
     "ps2",
