@@ -25,8 +25,6 @@ extern struct dirent *__real_readdir(DIR *dirp);
 extern int __real_stat(const char *path, struct stat *buf);
 extern int __real_access(const char *path, int amode);
 
-static char g_active_rom_path[256] = "cdrom0:\\";
-static char g_base_device[32] = "cdrom0:\\";
 static bool g_injected_rom_listed = false;
 
 void boot_log(const char *msg) { printf("[NJEMU] %s\n", msg); }
@@ -38,61 +36,60 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
+/* Strict Uppercase Flat-Root Path Resolver */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
-        strncpy(output_path, g_active_rom_path, max_len);
-        output_path[max_len - 1] = '\0';
+        strncpy(output_path, "cdrom0:\\", max_len);
         return;
     }
 
     if (strncasecmp(input_path, "cdrom0:", 7) == 0 || strncasecmp(input_path, "mass0:", 6) == 0 || strncasecmp(input_path, "host:", 5) == 0) {
         strncpy(output_path, input_path, max_len);
-        output_path[max_len - 1] = '\0';
         for (int i = 0; output_path[i]; i++) {
             if (output_path[i] == '/') output_path[i] = '\\';
+            output_path[i] = toupper((unsigned char)output_path[i]);
         }
         return;
     }
 
-    char work_path[1024];
-    if (strncasecmp(input_path, "cache", 5) == 0) {
-        snprintf(work_path, sizeof(work_path), "%scache%s", g_base_device, input_path + 5);
-    } else {
-        // Force any filename request (like avsp.zip) to look directly in root/active path
-        const char *filename = strrchr(input_path, '/');
-        if (!filename) filename = strrchr(input_path, '\\');
-        if (filename) filename++; else filename = input_path;
+    // Isolate the filename component, stripping any directory prefixes
+    const char *filename = strrchr(input_path, '/');
+    if (!filename) filename = strrchr(input_path, '\\');
+    if (filename) filename++; else filename = input_path;
 
-        snprintf(work_path, sizeof(work_path), "%s\\%s", g_active_rom_path, filename);
+    if (filename[0] == '.' && (filename[1] == '/' || filename[1] == '\\')) {
+        filename += 2;
     }
 
-    for (int i = 0; work_path[i]; i++) {
-        if (work_path[i] == '/') work_path[i] = '\\';
+    if (strcasecmp(filename, ".") == 0 || filename[0] == '\0') {
+        strncpy(output_path, "cdrom0:\\", max_len);
+        return;
     }
 
-    strncpy(output_path, work_path, max_len);
+    // Unconditionally convert the filename to UPPERCASE for ISO9660 compliance
+    char upper_filename[256];
+    int i = 0;
+    for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
+        upper_filename[i] = toupper((unsigned char)filename[i]);
+    }
+    upper_filename[i] = '\0';
+
+    snprintf(output_path, max_len, "cdrom0:\\%s", upper_filename);
     output_path[max_len - 1] = '\0';
 }
 
-/* Linker Wrappers with Forced Injection */
+/* Linker Wrappers */
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     resolve_iso_path(filename, resolved, sizeof(resolved));
     FILE *f = __real_fopen(resolved, mode);
-    printf("[FOPEN] '%s' -> %s\n", resolved, f ? "SUCCESS" : "FAILED");
+    printf("[FOPEN] Requested: '%s' -> Resolved: '%s' -> %s\n", filename, resolved, f ? "SUCCESS" : "FAILED");
     return f;
 }
 
 DIR *__wrap_opendir(const char *name) {
-    char resolved[1024];
-    resolve_iso_path(name, resolved, sizeof(resolved));
-    DIR *d = __real_opendir(resolved);
-    g_injected_rom_listed = false; // Reset injection tracker on new directory open
-    printf("[OPENDIR] '%s' -> %s\n", resolved, d ? "SUCCESS" : "FAILED");
-    if (!d) {
-        d = __real_opendir(g_active_rom_path);
-    }
-    return d;
+    g_injected_rom_listed = false;
+    return __real_opendir("cdrom0:\\");
 }
 
 static struct dirent fake_entry;
@@ -100,12 +97,11 @@ static struct dirent fake_entry;
 struct dirent *__wrap_readdir(DIR *dirp) {
     struct dirent *entry = __real_readdir(dirp);
     
-    // If the real directory scan finishes or finds nothing, inject AVSP.ZIP so it always appears
+    // Force-inject AVSP.ZIP in uppercase if directory listing finishes
     if (!entry && !g_injected_rom_listed) {
         g_injected_rom_listed = true;
         memset(&fake_entry, 0, sizeof(fake_entry));
-        strcpy(fake_entry.d_name, "avsp.zip");
-        printf("[READDIR] Force-injecting ROM: 'avsp.zip'\n");
+        strcpy(fake_entry.d_name, "AVSP.ZIP");
         return &fake_entry;
     }
 
@@ -147,10 +143,7 @@ static void *ps2_init(void) {
     init_cdfs_driver();
     init_audio_driver();
 
-    strcpy(g_active_rom_path, "cdrom0:\\");
-    strcpy(g_base_device, "cdrom0:\\");
-
-    chdir(g_active_rom_path);
+    chdir("cdrom0:\\");
     return ps2;
 }
 
