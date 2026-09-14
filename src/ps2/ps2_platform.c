@@ -25,7 +25,8 @@ extern struct dirent *__real_readdir(DIR *dirp);
 extern int __real_stat(const char *path, struct stat *buf);
 extern int __real_access(const char *path, int amode);
 
-static char g_active_rom_path[256] = "cdrom0:\\";
+static char g_active_rom_path[256] = "cdrom0:\\ROMS";
+static char g_base_device[32] = "cdrom0:\\";
 
 void boot_log(const char *msg) { printf("[NJEMU] %s\n", msg); }
 void dbg_printf(const char *fmt, ...) {
@@ -36,60 +37,132 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-static void force_absolute_path(const char *input, char *output, size_t max_len) {
-    if (!input || input[0] == '\0' || strcmp(input, ".") == 0) {
-        strncpy(output, g_active_rom_path, max_len);
-        output[max_len - 1] = '\0';
+/* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Matching */
+static bool iso_name_match(const char *filename, const char *search_name) {
+    char f_copy[256];
+    char s_copy[256];
+    strncpy(f_copy, filename, sizeof(f_copy) - 1);
+    f_copy[sizeof(f_copy) - 1] = '\0';
+    strncpy(s_copy, search_name, sizeof(s_copy) - 1);
+    s_copy[sizeof(s_copy) - 1] = '\0';
+
+    char *semi = strchr(f_copy, ';');
+    if (semi) *semi = '\0';
+    char *semi2 = strchr(s_copy, ';');
+    if (semi2) *semi2 = '\0';
+
+    return strcasecmp(f_copy, s_copy) == 0;
+}
+
+/* Intelligent path resolver: Walks directories segment-by-segment to match ISO uppercase/version-suffixed names */
+static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
+    if (!input_path || input_path[0] == '\0') {
+        strncpy(output_path, g_active_rom_path, max_len);
+        output_path[max_len - 1] = '\0';
         return;
     }
 
-    // If input matches the leaf directory name of our base path (e.g. "roms" matching "cdrom0:\ROMS"), 
-    // point directly to base path instead of nesting it.
-    const char *leaf = strrchr(g_active_rom_path, '\\');
-    if (!leaf) leaf = strrchr(g_active_rom_path, '/');
-    if (leaf) leaf++; else leaf = g_active_rom_path;
-
-    if (strcasecmp(input, leaf) == 0) {
-        strncpy(output, g_active_rom_path, max_len);
-        output[max_len - 1] = '\0';
-        return;
-    }
-
-    if (strncasecmp(input, "cdrom0:", 7) == 0 || strncasecmp(input, "mass0:", 6) == 0 || strncasecmp(input, "host:", 5) == 0) {
-        strncpy(output, input, max_len);
-        output[max_len - 1] = '\0';
-        for (int i = 0; output[i]; i++) {
-            if (output[i] == '/') output[i] = '\\';
+    // If already fully qualified device path, clean up slashes
+    if (strncasecmp(input_path, "cdrom0:", 7) == 0 || strncasecmp(input_path, "mass0:", 6) == 0 || strncasecmp(input_path, "host:", 5) == 0) {
+        strncpy(output_path, input_path, max_len);
+        output_path[max_len - 1] = '\0';
+        for (int i = 0; output_path[i]; i++) {
+            if (output_path[i] == '/') output_path[i] = '\\';
         }
         return;
     }
 
-    char clean_input[512];
-    strncpy(clean_input, input, sizeof(clean_input) - 1);
-    clean_input[sizeof(clean_input) - 1] = '\0';
-    if (clean_input[0] == '.' && (clean_input[1] == '/' || clean_input[1] == '\\')) {
-        memmove(clean_input, clean_input + 2, strlen(clean_input));
+    char work_path[1024];
+    if (strcmp(input_path, ".") == 0) {
+        strncpy(output_path, g_active_rom_path, max_len);
+        return;
     }
 
-    snprintf(output, max_len, "%s\\%s", g_active_rom_path, clean_input);
-    output[max_len - 1] = '\0';
-    for (int i = 0; output[i]; i++) {
-        if (output[i] == '/') output[i] = '\\';
+    // Handle relative paths or root-relative paths like "cache/avsp.cache" or "avsp.zip"
+    if (input_path[0] == '.' && (input_path[1] == '/' || input_path[1] == '\\')) {
+        input_path += 2;
     }
+
+    if (strncasecmp(input_path, "cache", 5) == 0) {
+        snprintf(work_path, sizeof(work_path), "%scache%s", g_base_device, input_path + 5);
+    } else if (strncasecmp(input_path, "roms", 4) == 0 || strncasecmp(input_path, "ROMS", 4) == 0) {
+        // If it explicitly references ROMs, map to active path + remainder
+        const char *remainder = input_path + 4;
+        if (*remainder == '/' || *remainder == '\\') remainder++;
+        if (*remainder != '\0') {
+            snprintf(work_path, sizeof(work_path), "%s\\%s", g_active_rom_path, remainder);
+        } else {
+            strncpy(work_path, g_active_rom_path, sizeof(work_path));
+        }
+    } else {
+        // Treat as a file/folder inside the active ROM path
+        snprintf(work_path, sizeof(work_path), "%s\\%s", g_active_rom_path, input_path);
+    }
+
+    // Normalize slashes
+    for (int i = 0; work_path[i]; i++) {
+        if (work_path[i] == '/') work_path[i] = '\\';
+    }
+
+    // If targeting cdrom0:, resolve each segment against the ISO filesystem for correct case/version
+    if (strncasecmp(work_path, "cdrom0:", 7) == 0) {
+        int prefix_len = (strncasecmp(work_path, "cdrom0:\\", 8) == 0) ? 8 : 7;
+        char path_tokens[1024];
+        strncpy(path_tokens, work_path + prefix_len, sizeof(path_tokens) - 1);
+        path_tokens[sizeof(path_tokens) - 1] = '\0';
+
+        char current_dir[1024];
+        snprintf(current_dir, sizeof(current_dir), "%.*s", prefix_len, work_path);
+
+        char *token = strtok(path_tokens, "\\");
+        while (token != NULL) {
+            DIR *dir = __real_opendir(current_dir);
+            if (!dir) break;
+
+            bool found = false;
+            struct dirent *entry;
+            char matched_name[256];
+
+            while ((entry = __real_readdir(dir)) != NULL) {
+                if (iso_name_match(entry->d_name, token)) {
+                    strncpy(matched_name, entry->d_name, sizeof(matched_name));
+                    found = true;
+                    break;
+                }
+            }
+            closedir(dir);
+
+            int len = strlen(current_dir);
+            if (len > 0 && current_dir[len - 1] != '\\') {
+                strcat(current_dir, "\\");
+            }
+            if (found) {
+                strcat(current_dir, matched_name);
+            } else {
+                // Fallback to uppercase if not found in directory listing
+                for (int i = 0; token[i]; i++) token[i] = toupper((unsigned char)token[i]);
+                strcat(current_dir, token);
+            }
+
+            token = strtok(NULL, "\\");
+        }
+        strncpy(output_path, current_dir, max_len);
+    } else {
+        strncpy(output_path, work_path, max_len);
+    }
+    output[max_len - 1] = '\0';
 }
 
 /* Linker Wrappers */
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
-    force_absolute_path(filename, resolved, sizeof(resolved));
+    resolve_iso_path(filename, resolved, sizeof(resolved));
     return __real_fopen(resolved, mode);
 }
 
 DIR *__wrap_opendir(const char *name) {
     char resolved[1024];
-    force_absolute_path(name, resolved, sizeof(resolved));
-    printf("[OPENDIR_DEBUG] Requested: '%s' -> Resolved to: '%s'\n", name ? name : "NULL", resolved);
-    
+    resolve_iso_path(name, resolved, sizeof(resolved));
     DIR *d = __real_opendir(resolved);
     if (!d) {
         d = __real_opendir(g_active_rom_path);
@@ -111,13 +184,13 @@ struct dirent *__wrap_readdir(DIR *dirp) {
 
 int __wrap_stat(const char *path, struct stat *buf) {
     char resolved[1024];
-    force_absolute_path(path, resolved, sizeof(resolved));
+    resolve_iso_path(path, resolved, sizeof(resolved));
     return __real_stat(resolved, buf);
 }
 
 int __wrap_access(const char *path, int amode) {
     char resolved[1024];
-    force_absolute_path(path, resolved, sizeof(resolved));
+    resolve_iso_path(path, resolved, sizeof(resolved));
     return __real_access(resolved, amode);
 }
 
@@ -146,8 +219,11 @@ static void *ps2_init(void) {
         DIR *d = __real_opendir(test_paths[i]);
         if (d) {
             strcpy(g_active_rom_path, test_paths[i]);
+            strncpy(g_base_device, test_paths[i], sizeof(g_base_device));
+            char *slash = strchr(g_base_device + 7, '\\');
+            if (slash) *(slash + 1) = '\0';
+            
             closedir(d);
-            printf("[PS2_INIT] Successfully locked ROM base path to: %s\n", g_active_rom_path);
             break;
         }
     }
