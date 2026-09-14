@@ -19,9 +19,16 @@
 #include <ps2_audio_driver.h>
 #include <ps2_cdfs_driver.h>
 
+/* Forward declare real linker-wrapped functions at the top to prevent implicit declarations */
+extern FILE *__real_fopen(const char *filename, const char *mode);
+extern DIR *__real_opendir(const char *name);
+extern struct dirent *__real_readdir(DIR *dirp);
+extern int __real_stat(const char *path, struct stat *buf);
+extern int __real_access(const char *path, int amode);
+
 static char g_iso_rom_base[256] = "";
 
-/* Enable console logging so you can see what paths are being opened */
+/* Enable console logging */
 void boot_log(const char *msg)
 {
     printf("[NJEMU-BOOT] %s\n", msg);
@@ -125,12 +132,6 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
 }
 
 /* Linker Wrappers: Intercept filesystem calls */
-extern FILE *__real_fopen(const char *filename, const char *mode);
-extern DIR *__real_opendir(const char *name);
-extern struct dirent *__real_readdir(DIR *dirp);
-extern int __real_stat(const char *path, struct stat *buf);
-extern int __real_access(const char *path, int amode);
-
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     resolve_case_path(filename, resolved, sizeof(resolved));
@@ -209,14 +210,13 @@ static void *ps2_init(void) {
     prepare_IOP();
     init_drivers();
 
-    /* Try multiple potential ISO structures to locate where ROMs live */
     const char *candidates[] = {
         "cdrom0:/ROMS", "cdrom0:/roms", "cdrom0:/ROM", "cdrom0:/",
         "cdrom:/ROMS", "cdrom:/roms", "cdrom:/",
         "mass0:/ROMS", "mass0:/roms", "."
     };
 
-    for (int i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
         DIR *d = __real_opendir(candidates[i]);
         if (d) {
             strcpy(g_iso_rom_base, candidates[i]);
@@ -231,7 +231,6 @@ static void *ps2_init(void) {
         printf("[PS2_INIT] Warning: No specific ROM folder found, defaulting to cdrom0:/\n");
     }
 
-    // Force working directory to the ROM folder so relative searches succeed instantly
     chdir(g_iso_rom_base);
 
     return ps2;
