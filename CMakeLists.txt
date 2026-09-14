@@ -3,11 +3,6 @@ project(NJEMU)
 
 # Configuration
 
-target_link_options(CPS2 PRIVATE 
-    "-Wl,--wrap=fopen"
-    "-Wl,--wrap=opendir"
-)
-
 # Different target availables
 set(TARGET_VALUES 
     "CPS1"  # 0
@@ -450,7 +445,8 @@ endif()
 set(ALL_SRC ${COMMON_SRC} ${OS_SRC} ${TARGET_SRC})
 
 list(TRANSFORM ALL_SRC PREPEND "src/")
-# # Create the executable
+
+# Create the executable
 add_executable(${TARGET}
     ${ALL_SRC}
 )
@@ -479,11 +475,19 @@ message(STATUS "Resources copied from ${RESOURCE_DIR} to: ${DESTINATION_DIR}")
 target_compile_options(${TARGET} PUBLIC ${COMMON_FLAGS} ${WARNING_OPTIONS} ${ASAN_OPTIONS})
 target_link_options(${TARGET} PUBLIC ${ASAN_OPTIONS})
 
+# Add case-insensitive file wrapping for PS2 platform
+if (PLATFORM STREQUAL "PS2")
+    target_link_options(${TARGET} PUBLIC 
+        "-Wl,--wrap=fopen"
+        "-Wl,--wrap=opendir"
+    )
+endif()
+
 # Add platform specific libraries
 if (PLATFORM STREQUAL "DESKTOP")
     find_package(SDL2 REQUIRED)
     target_include_directories(${TARGET} PUBLIC 
-        ${SDL2_INCLUDE_DIRS}
+        ${SDL2_INCLUDE_DIR_NAMES}
     )
     target_link_libraries(${TARGET} PUBLIC
         ${SDL2_LIBRARIES}
@@ -533,7 +537,7 @@ endif()
 target_link_libraries(${TARGET} PUBLIC
     z
 )
-       
+        
 # Create the PBP file for PSP
 if(PLATFORM STREQUAL "PSP")
     set(BUILD_PRX ON)
