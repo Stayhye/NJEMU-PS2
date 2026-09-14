@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <unistd.h>
 #include "emumain.h"
 
 #include <kernel.h>
@@ -70,6 +71,24 @@ static void *ps2_init(void) {
     boot_log("[S0] after prepare_IOP");
     init_drivers();
     boot_log("[S1] after init_drivers");
+
+    /* FIX: If "roms" isn't found in current CWD, check and switch to cdrom0:/ for ISO booting */
+    DIR *d = opendir("roms");
+    if (d) {
+        closedir(d);
+    } else {
+        d = opendir("cdrom0:/roms");
+        if (d) {
+            closedir(d);
+            chdir("cdrom0:/");
+        } else {
+            d = opendir("mass:/roms");
+            if (d) {
+                closedir(d);
+                chdir("mass:/");
+            }
+        }
+    }
 
     boot_log("[S2] ps2_init end");
     return ps2;
