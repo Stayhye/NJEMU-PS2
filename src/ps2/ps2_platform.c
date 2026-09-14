@@ -37,7 +37,19 @@ void dbg_printf(const char *fmt, ...) {
 }
 
 static void force_absolute_path(const char *input, char *output, size_t max_len) {
-    if (!input || input[0] == '\0') {
+    if (!input || input[0] == '\0' || strcmp(input, ".") == 0) {
+        strncpy(output, g_active_rom_path, max_len);
+        output[max_len - 1] = '\0';
+        return;
+    }
+
+    // If input matches the leaf directory name of our base path (e.g. "roms" matching "cdrom0:\ROMS"), 
+    // point directly to base path instead of nesting it.
+    const char *leaf = strrchr(g_active_rom_path, '\\');
+    if (!leaf) leaf = strrchr(g_active_rom_path, '/');
+    if (leaf) leaf++; else leaf = g_active_rom_path;
+
+    if (strcasecmp(input, leaf) == 0) {
         strncpy(output, g_active_rom_path, max_len);
         output[max_len - 1] = '\0';
         return;
@@ -52,31 +64,21 @@ static void force_absolute_path(const char *input, char *output, size_t max_len)
         return;
     }
 
-    if (strcmp(input, ".") == 0 || input[0] != '/') {
-        char clean_input[512];
-        strncpy(clean_input, input, sizeof(clean_input) - 1);
-        clean_input[sizeof(clean_input) - 1] = '\0';
-        
-        if (clean_input[0] == '.' && (clean_input[1] == '/' || clean_input[1] == '\\')) {
-            memmove(clean_input, clean_input + 2, strlen(clean_input));
-        }
-        
-        if (strlen(clean_input) > 0) {
-            snprintf(output, max_len, "%s\\%s", g_active_rom_path, clean_input);
-        } else {
-            strncpy(output, g_active_rom_path, max_len);
-        }
-    } else {
-        snprintf(output, max_len, "%s%s", g_active_rom_path, input);
+    char clean_input[512];
+    strncpy(clean_input, input, sizeof(clean_input) - 1);
+    clean_input[sizeof(clean_input) - 1] = '\0';
+    if (clean_input[0] == '.' && (clean_input[1] == '/' || clean_input[1] == '\\')) {
+        memmove(clean_input, clean_input + 2, strlen(clean_input));
     }
 
+    snprintf(output, max_len, "%s\\%s", g_active_rom_path, clean_input);
     output[max_len - 1] = '\0';
     for (int i = 0; output[i]; i++) {
         if (output[i] == '/') output[i] = '\\';
     }
 }
 
-/* Linker Wrappers with live logging to catch empty/null device queries */
+/* Linker Wrappers */
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     force_absolute_path(filename, resolved, sizeof(resolved));
@@ -90,7 +92,6 @@ DIR *__wrap_opendir(const char *name) {
     
     DIR *d = __real_opendir(resolved);
     if (!d) {
-        printf("[OPENDIR_DEBUG] Failed to open '%s', falling back to base: '%s'\n", resolved, g_active_rom_path);
         d = __real_opendir(g_active_rom_path);
     }
     return d;
