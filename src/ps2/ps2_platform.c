@@ -5,6 +5,8 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "emumain.h"
 
 #include <kernel.h>
@@ -17,7 +19,9 @@
 #include <ps2_audio_driver.h>
 #include <ps2_cdfs_driver.h>
 
-/* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Resolution */
+static char g_iso_rom_base[256] = "";
+
+/* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Matching */
 static bool iso_name_match(const char *filename, const char *search_name) {
     char f_copy[256];
     char s_copy[256];
@@ -26,7 +30,6 @@ static bool iso_name_match(const char *filename, const char *search_name) {
     strncpy(s_copy, search_name, sizeof(s_copy) - 1);
     s_copy[sizeof(s_copy) - 1] = '\0';
 
-    /* Strip ISO version suffixes like ";1" */
     char *semi = strchr(f_copy, ';');
     if (semi) *semi = '\0';
     char *semi2 = strchr(s_copy, ';');
@@ -36,23 +39,44 @@ static bool iso_name_match(const char *filename, const char *search_name) {
 }
 
 static void resolve_case_path(const char *input_path, char *output_path, size_t max_len) {
+    if (!input_path) {
+        output_path[0] = '\0';
+        return;
+    }
+
+    char temp_path[1024];
+    if ((strcmp(input_path, ".") == 0 || strcmp(input_path, "") == 0) && g_iso_rom_base[0] != '\0') {
+        strncpy(output_path, g_iso_rom_base, max_len);
+        output_path[max_len - 1] = '\0';
+        return;
+    }
+
+    if (input_path[0] != '/' && strchr(input_path, ':') == NULL) {
+        if (g_iso_rom_base[0] != '\0') {
+            snprintf(temp_path, sizeof(temp_path), "%s/%s", g_iso_rom_base, input_path);
+            input_path = temp_path;
+        }
+    }
+
     strncpy(output_path, input_path, max_len);
     output_path[max_len - 1] = '\0';
 
-    if (!input_path) return;
-
-    /* Automatically scan and resolve paths on cdrom0:/ or cdrom:/ case-insensitively */
-    if (strncasecmp(input_path, "cdrom0:/", 8) == 0 || strncasecmp(input_path, "cdrom:/", 7) == 0) {
-        int prefix_len = (strncasecmp(input_path, "cdrom0:/", 8) == 0) ? 8 : 7;
+    if (strncasecmp(output_path, "cdrom0:/", 8) == 0 || strncasecmp(output_path, "cdrom:/", 7) == 0) {
+        int prefix_len = (strncasecmp(output_path, "cdrom0:/", 8) == 0) ? 8 : 7;
         char work_path[1024];
-        strncpy(work_path, input_path + prefix_len, sizeof(work_path) - 1);
+        strncpy(work_path, output_path + prefix_len, sizeof(work_path) - 1);
         work_path[sizeof(work_path) - 1] = '\0';
 
         char current_dir[1024];
-        snprintf(current_dir, sizeof(current_dir), "%.*s", prefix_len, input_path);
+        snprintf(current_dir, sizeof(current_dir), "%.*s", prefix_len, output_path);
 
         char *token = strtok(work_path, "/\\");
         while (token != NULL) {
+            if (strcmp(token, ".") == 0) {
+                token = strtok(NULL, "/\\");
+                continue;
+            }
+
             DIR *dir = opendir(current_dir);
             if (!dir) break;
 
@@ -85,9 +109,12 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
     }
 }
 
-/* Linker Wrappers: Intercepts all global fopen and opendir calls to enforce case-insensitivity */
+/* Linker Wrappers: Intercept filesystem calls for total case-insensitivity */
 extern FILE *__real_fopen(const char *filename, const char *mode);
 extern DIR *__real_opendir(const char *name);
+extern struct dirent *__real_readdir(DIR *dirp);
+extern int __real_stat(const char *path, struct stat *buf);
+extern int __real_access(const char *path, int amode);
 
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
@@ -99,6 +126,30 @@ DIR *__wrap_opendir(const char *name) {
     char resolved[1024];
     resolve_case_path(name, resolved, sizeof(resolved));
     return __real_opendir(resolved);
+}
+
+struct dirent *__wrap_readdir(DIR *dirp) {
+    struct dirent *entry = __real_readdir(dirp);
+    if (entry) {
+        char *semi = strchr(entry->d_name, ';');
+        if (semi) *semi = '\0';
+        for (int i = 0; entry->d_name[i]; i++) {
+            entry->d_name[i] = tolower((unsigned char)entry->d_name[i]);
+        }
+    }
+    return entry;
+}
+
+int __wrap_stat(const char *path, struct stat *buf) {
+    char resolved[1024];
+    resolve_case_path(path, resolved, sizeof(resolved));
+    return __real_stat(resolved, buf);
+}
+
+int __wrap_access(const char *path, int amode) {
+    char resolved[1024];
+    resolve_case_path(path, resolved, sizeof(resolved));
+    return __real_access(resolved, amode);
 }
 
 /* BOOT LOG */
@@ -147,10 +198,18 @@ static void *ps2_init(void) {
     prepare_IOP();
     init_drivers();
 
-    if (chdir("roms") != 0 && chdir("ROMS") != 0) {
-        if (chdir("cdrom0:/roms") != 0 && chdir("cdrom0:/ROMS") != 0) {
-            if (chdir("mass:/roms") != 0 && chdir("mass:/ROMS") != 0) {
-                chdir("cdrom0:/");
+    /* Automatically detect where ROMs are located on CD, USB, or CWD */
+    DIR *d = __real_opendir("cdrom0:/ROMS");
+    if (d) { closedir(d); strcpy(g_iso_rom_base, "cdrom0:/ROMS"); }
+    else {
+        d = __real_opendir("cdrom0:/roms");
+        if (d) { closedir(d); strcpy(g_iso_rom_base, "cdrom0:/roms"); }
+        else {
+            d = __real_opendir("ROMS");
+            if (d) { closedir(d); strcpy(g_iso_rom_base, "ROMS"); }
+            else {
+                d = __real_opendir("roms");
+                if (d) { closedir(d); strcpy(g_iso_rom_base, "roms"); }
             }
         }
     }
