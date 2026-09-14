@@ -36,14 +36,12 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* Bulletproof path normalizer: Forces relative paths to absolute device paths */
 static void force_absolute_path(const char *input, char *output, size_t max_len) {
     if (!input) {
         strcpy(output, g_active_rom_path);
         return;
     }
 
-    // If it's already an absolute device path, normalize slashes and keep it
     if (strncasecmp(input, "cdrom0:", 7) == 0 || strncasecmp(input, "mass0:", 6) == 0 || strncasecmp(input, "host:", 5) == 0) {
         strncpy(output, input, max_len);
         output[max_len - 1] = '\0';
@@ -53,7 +51,6 @@ static void force_absolute_path(const char *input, char *output, size_t max_len)
         return;
     }
 
-    // If it's a relative path or '.', map it directly to our active base path
     if (strcmp(input, ".") == 0 || strcmp(input, "") == 0 || input[0] != '/') {
         if (input[0] == '.' && (input[1] == '/' || input[1] == '\\')) input += 2;
         
@@ -84,7 +81,6 @@ DIR *__wrap_opendir(const char *name) {
     force_absolute_path(name, resolved, sizeof(resolved));
     DIR *d = __real_opendir(resolved);
     if (!d && strcmp(resolved, g_active_rom_path) != 0) {
-        // Fallback fallback: try root if specific subfolder fails
         d = __real_opendir(g_active_rom_path);
     }
     return d;
@@ -93,10 +89,8 @@ DIR *__wrap_opendir(const char *name) {
 struct dirent *__wrap_readdir(DIR *dirp) {
     struct dirent *entry = __real_readdir(dirp);
     if (entry) {
-        // Strip ISO9660 version suffix (e.g. ";1")
         char *semi = strchr(entry->d_name, ';');
         if (semi) *semi = '\0';
-        // Convert to lowercase so extension filters (.zip) match
         for (int i = 0; entry->d_name[i]; i++) {
             entry->d_name[i] = tolower((unsigned char)entry->d_name[i]);
         }
@@ -121,9 +115,9 @@ typedef struct ps2_platform {} ps2_platform_t;
 static void *ps2_init(void) {
     ps2_platform_t *ps2 = (ps2_platform_t*)calloc(1, sizeof(ps2_platform_t));
 
+    // DO NOT call SifIopReset(NULL, 0) here! 
+    // It destroys the BIOS CDVDMAN/CDFS drivers and freezes on black screen.
     SifInitRpc(0);
-    while (!SifIopReset(NULL, 0)) {}
-    while (!SifIopSync()) {}
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
     sbv_patch_fileio();
@@ -134,7 +128,6 @@ static void *ps2_init(void) {
     init_cdfs_driver();
     init_audio_driver();
 
-    // Probe to find where the ROMs actually exist
     const char *test_paths[] = {
         "cdrom0:\\ROMS", "cdrom0:\\roms", "cdrom0:\\",
         "mass0:\\ROMS", "mass0:\\roms", "mass0:\\"
