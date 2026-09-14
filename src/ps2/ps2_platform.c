@@ -72,20 +72,11 @@ static void *ps2_init(void) {
     init_drivers();
     boot_log("[S1] after init_drivers");
 
-    /* FIX: If "roms" isn't found in current CWD, check and switch to cdrom0:/ for ISO booting */
-    DIR *d = opendir("roms");
-    if (d) {
-        closedir(d);
-    } else {
-        d = opendir("cdrom0:/roms");
-        if (d) {
-            closedir(d);
-            chdir("cdrom0:/");
-        } else {
-            d = opendir("mass:/roms");
-            if (d) {
-                closedir(d);
-                chdir("mass:/");
+    /* FIX: Robustly check both lowercase and uppercase variants for ISO/disc compatibility */
+    if (chdir("roms") != 0 && chdir("ROMS") != 0) {
+        if (chdir("cdrom0:/roms") != 0 && chdir("cdrom0:/ROMS") != 0) {
+            if (chdir("mass:/roms") != 0 && chdir("mass:/ROMS") != 0) {
+                chdir("cdrom0:/"); // Fallback to root if folder search fails
             }
         }
     }
