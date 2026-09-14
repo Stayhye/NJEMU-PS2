@@ -3,6 +3,11 @@ project(NJEMU)
 
 # Configuration
 
+target_link_options(CPS2 PRIVATE 
+    "-Wl,--wrap=fopen"
+    "-Wl,--wrap=opendir"
+)
+
 # Different target availables
 set(TARGET_VALUES 
     "CPS1"  # 0
