@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include "emumain.h"
 
@@ -15,18 +17,93 @@
 #include <ps2_audio_driver.h>
 #include <ps2_cdfs_driver.h>
 
-/* HELPER: Converts any path or filename string to lowercase for case-insensitive handling */
-static void path_to_lowercase(char *str) {
-    if (!str) return;
-    for (int i = 0; str[i]; i++) {
-        str[i] = tolower((unsigned char)str[i]);
+/* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Resolution */
+static bool iso_name_match(const char *filename, const char *search_name) {
+    char f_copy[256];
+    char s_copy[256];
+    strncpy(f_copy, filename, sizeof(f_copy) - 1);
+    f_copy[sizeof(f_copy) - 1] = '\0';
+    strncpy(s_copy, search_name, sizeof(s_copy) - 1);
+    s_copy[sizeof(s_copy) - 1] = '\0';
+
+    /* Strip ISO version suffixes like ";1" */
+    char *semi = strchr(f_copy, ';');
+    if (semi) *semi = '\0';
+    char *semi2 = strchr(s_copy, ';');
+    if (semi2) *semi2 = '\0';
+
+    return strcasecmp(f_copy, s_copy) == 0;
+}
+
+static void resolve_case_path(const char *input_path, char *output_path, size_t max_len) {
+    strncpy(output_path, input_path, max_len);
+    output_path[max_len - 1] = '\0';
+
+    if (!input_path) return;
+
+    /* Automatically scan and resolve paths on cdrom0:/ or cdrom:/ case-insensitively */
+    if (strncasecmp(input_path, "cdrom0:/", 8) == 0 || strncasecmp(input_path, "cdrom:/", 7) == 0) {
+        int prefix_len = (strncasecmp(input_path, "cdrom0:/", 8) == 0) ? 8 : 7;
+        char work_path[1024];
+        strncpy(work_path, input_path + prefix_len, sizeof(work_path) - 1);
+        work_path[sizeof(work_path) - 1] = '\0';
+
+        char current_dir[1024];
+        snprintf(current_dir, sizeof(current_dir), "%.*s", prefix_len, input_path);
+
+        char *token = strtok(work_path, "/\\");
+        while (token != NULL) {
+            DIR *dir = opendir(current_dir);
+            if (!dir) break;
+
+            bool found = false;
+            struct dirent *entry;
+            char matched_name[256];
+
+            while ((entry = readdir(dir)) != NULL) {
+                if (iso_name_match(entry->d_name, token)) {
+                    strncpy(matched_name, entry->d_name, sizeof(matched_name));
+                    found = true;
+                    break;
+                }
+            }
+            closedir(dir);
+
+            if (current_dir[strlen(current_dir) - 1] != '/') {
+                strcat(current_dir, "/");
+            }
+            if (found) {
+                strcat(current_dir, matched_name);
+            } else {
+                strcat(current_dir, token);
+            }
+
+            token = strtok(NULL, "/\\");
+        }
+        strncpy(output_path, current_dir, max_len);
+        output_path[max_len - 1] = '\0';
     }
 }
 
-/* BOOT LOG (diagnostic). Writes to CWD (USB root) first, then device paths. */
+/* Linker Wrappers: Intercepts all global fopen and opendir calls to enforce case-insensitivity */
+extern FILE *__real_fopen(const char *filename, const char *mode);
+extern DIR *__real_opendir(const char *name);
+
+FILE *__wrap_fopen(const char *filename, const char *mode) {
+    char resolved[1024];
+    resolve_case_path(filename, resolved, sizeof(resolved));
+    return __real_fopen(resolved, mode);
+}
+
+DIR *__wrap_opendir(const char *name) {
+    char resolved[1024];
+    resolve_case_path(name, resolved, sizeof(resolved));
+    return __real_opendir(resolved);
+}
+
+/* BOOT LOG */
 void boot_log(const char *msg)
 {
-    /* DEBUG LOG DISABLED (v16 cleanup): no njemu_boot.txt output. */
     (void)msg;
 }
 
@@ -51,45 +128,39 @@ static void prepare_IOP()
 
 static void init_drivers()
 {
-    init_only_boot_ps2_filesystem_driver();
+    init_ps2_filesystem_driver();
     init_usb_driver(true);
     init_mx4sio_driver(true);
-    init_cdfs_driver();       // Enables cdrom0:/ for ISO / disc loading
+    init_cdfs_driver();
     init_audio_driver();
 }
 
 static void deinit_drivers()
 {
     deinit_audio_driver();
-    deinit_only_boot_ps2_filesystem_driver();
+    deinit_ps2_filesystem_driver();
 }
 
 static void *ps2_init(void) {
     ps2_platform_t *ps2 = (ps2_platform_t*)calloc(1, sizeof(ps2_platform_t));
 
     prepare_IOP();
-    boot_log("[S0] after prepare_IOP");
     init_drivers();
-    boot_log("[S1] after init_drivers");
 
-    /* FIX: Robustly check both lowercase and uppercase variants for ISO/disc compatibility */
     if (chdir("roms") != 0 && chdir("ROMS") != 0) {
         if (chdir("cdrom0:/roms") != 0 && chdir("cdrom0:/ROMS") != 0) {
             if (chdir("mass:/roms") != 0 && chdir("mass:/ROMS") != 0) {
-                chdir("cdrom0:/"); // Fallback to root if folder search fails
+                chdir("cdrom0:/");
             }
         }
     }
 
-    boot_log("[S2] ps2_init end");
     return ps2;
 }
 
 static void ps2_free(void *data) {
     ps2_platform_t *ps2 = (ps2_platform_t*)data;
-
     deinit_drivers();
-
     free(ps2);
 }
 
@@ -101,9 +172,10 @@ void dbg_printf(const char *fmt, ...)
 static void ps2_main(void *data, int argc, char *argv[]) {
     ps2_platform_t *ps2 = (ps2_platform_t*)data;
 
-    /* Force all command-line arguments (e.g., ROM paths) to lowercase */
     for (int i = 0; i < argc; i++) {
-        path_to_lowercase(argv[i]);
+        char resolved[1024];
+        resolve_case_path(argv[i], resolved, sizeof(resolved));
+        strncpy(argv[i], resolved, strlen(argv[i]) + 1);
     }
 
     getcwd(screenshotDir, sizeof(screenshotDir));
