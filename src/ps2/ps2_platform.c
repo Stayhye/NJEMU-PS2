@@ -21,6 +21,21 @@
 
 static char g_iso_rom_base[256] = "";
 
+/* Enable console logging so you can see what paths are being opened */
+void boot_log(const char *msg)
+{
+    printf("[NJEMU-BOOT] %s\n", msg);
+}
+
+void dbg_printf(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
+}
+
 /* ISO9660 Case-Insensitive & Version-Suffix (e.g. ;1) File Matching */
 static bool iso_name_match(const char *filename, const char *search_name) {
     char f_copy[256];
@@ -77,14 +92,14 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
                 continue;
             }
 
-            DIR *dir = opendir(current_dir);
+            DIR *dir = __real_opendir(current_dir);
             if (!dir) break;
 
             bool found = false;
             struct dirent *entry;
             char matched_name[256];
 
-            while ((entry = readdir(dir)) != NULL) {
+            while ((entry = __real_readdir(dir)) != NULL) {
                 if (iso_name_match(entry->d_name, token)) {
                     strncpy(matched_name, entry->d_name, sizeof(matched_name));
                     found = true;
@@ -109,7 +124,7 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
     }
 }
 
-/* Linker Wrappers: Intercept filesystem calls for total case-insensitivity */
+/* Linker Wrappers: Intercept filesystem calls */
 extern FILE *__real_fopen(const char *filename, const char *mode);
 extern DIR *__real_opendir(const char *name);
 extern struct dirent *__real_readdir(DIR *dirp);
@@ -119,12 +134,14 @@ extern int __real_access(const char *path, int amode);
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     resolve_case_path(filename, resolved, sizeof(resolved));
+    printf("[FOPEN] Req: '%s' -> Resolved: '%s'\n", filename ? filename : "NULL", resolved);
     return __real_fopen(resolved, mode);
 }
 
 DIR *__wrap_opendir(const char *name) {
     char resolved[1024];
     resolve_case_path(name, resolved, sizeof(resolved));
+    printf("[OPENDIR] Req: '%s' -> Resolved: '%s'\n", name ? name : "NULL", resolved);
     return __real_opendir(resolved);
 }
 
@@ -150,12 +167,6 @@ int __wrap_access(const char *path, int amode) {
     char resolved[1024];
     resolve_case_path(path, resolved, sizeof(resolved));
     return __real_access(resolved, amode);
-}
-
-/* BOOT LOG */
-void boot_log(const char *msg)
-{
-    (void)msg;
 }
 
 typedef struct ps2_platform {
@@ -198,21 +209,30 @@ static void *ps2_init(void) {
     prepare_IOP();
     init_drivers();
 
-    /* Automatically detect where ROMs are located on CD, USB, or CWD */
-    DIR *d = __real_opendir("cdrom0:/ROMS");
-    if (d) { closedir(d); strcpy(g_iso_rom_base, "cdrom0:/ROMS"); }
-    else {
-        d = __real_opendir("cdrom0:/roms");
-        if (d) { closedir(d); strcpy(g_iso_rom_base, "cdrom0:/roms"); }
-        else {
-            d = __real_opendir("ROMS");
-            if (d) { closedir(d); strcpy(g_iso_rom_base, "ROMS"); }
-            else {
-                d = __real_opendir("roms");
-                if (d) { closedir(d); strcpy(g_iso_rom_base, "roms"); }
-            }
+    /* Try multiple potential ISO structures to locate where ROMs live */
+    const char *candidates[] = {
+        "cdrom0:/ROMS", "cdrom0:/roms", "cdrom0:/ROM", "cdrom0:/",
+        "cdrom:/ROMS", "cdrom:/roms", "cdrom:/",
+        "mass0:/ROMS", "mass0:/roms", "."
+    };
+
+    for (int i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        DIR *d = __real_opendir(candidates[i]);
+        if (d) {
+            strcpy(g_iso_rom_base, candidates[i]);
+            closedir(d);
+            printf("[PS2_INIT] Found valid ROM base directory: %s\n", g_iso_rom_base);
+            break;
         }
     }
+
+    if (g_iso_rom_base[0] == '\0') {
+        strcpy(g_iso_rom_base, "cdrom0:/");
+        printf("[PS2_INIT] Warning: No specific ROM folder found, defaulting to cdrom0:/\n");
+    }
+
+    // Force working directory to the ROM folder so relative searches succeed instantly
+    chdir(g_iso_rom_base);
 
     return ps2;
 }
@@ -221,11 +241,6 @@ static void ps2_free(void *data) {
     ps2_platform_t *ps2 = (ps2_platform_t*)data;
     deinit_drivers();
     free(ps2);
-}
-
-void dbg_printf(const char *fmt, ...)
-{
-    (void)fmt;
 }
 
 static void ps2_main(void *data, int argc, char *argv[]) {
