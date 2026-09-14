@@ -36,13 +36,14 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* Intelligent root scanner: matches requested files against actual disc entries ignoring case & version suffixes */
+/* Forces all incoming filenames to UPPERCASE to match the ISO layout */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
         strncpy(output_path, "cdrom0:\\", max_len);
         return;
     }
 
+    // Keep device prefix intact, lowercase device name
     if (strncasecmp(input_path, "cdrom0:", 7) == 0 || strncasecmp(input_path, "mass0:", 6) == 0 || strncasecmp(input_path, "host:", 5) == 0) {
         strncpy(output_path, input_path, max_len);
         for (int i = 0; output_path[i]; i++) {
@@ -65,43 +66,15 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    char matched_name[256];
-    bool found = false;
-
-    char search_clean[256];
-    strncpy(search_clean, filename, sizeof(search_clean) - 1);
-    search_clean[sizeof(search_clean) - 1] = '\0';
-    char *semi_req = strchr(search_clean, ';');
-    if (semi_req) *semi_req = '\0';
-
-    DIR *dir = __real_opendir("cdrom0:\\");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = __real_readdir(dir)) != NULL) {
-            char entry_clean[256];
-            strncpy(entry_clean, entry->d_name, sizeof(entry_clean) - 1);
-            entry_clean[sizeof(entry_clean) - 1] = '\0';
-            char *semi_ent = strchr(entry_clean, ';');
-            if (semi_ent) *semi_ent = '\0';
-
-            if (strcasecmp(entry_clean, search_clean) == 0) {
-                strncpy(matched_name, entry->d_name, sizeof(matched_name));
-                found = true;
-                break;
-            }
-        }
-        closedir(dir);
+    // Unconditionally uppercase the filename portion for the ISO
+    char upper_filename[256];
+    int i = 0;
+    for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
+        upper_filename[i] = toupper((unsigned char)filename[i]);
     }
+    upper_filename[i] = '\0';
 
-    if (!found) {
-        int i = 0;
-        for (; filename[i] && i < sizeof(matched_name) - 1; i++) {
-            matched_name[i] = toupper((unsigned char)filename[i]);
-        }
-        matched_name[i] = '\0';
-    }
-
-    snprintf(output_path, max_len, "cdrom0:\\%s", matched_name);
+    snprintf(output_path, max_len, "cdrom0:\\%s", upper_filename);
     output_path[max_len - 1] = '\0';
 }
 
@@ -129,13 +102,6 @@ struct dirent *__wrap_readdir(DIR *dirp) {
         return &fake_entry;
     }
 
-    if (entry) {
-        char *semi = strchr(entry->d_name, ';');
-        if (semi) *semi = '\0';
-        for (int i = 0; entry->d_name[i]; i++) {
-            entry->d_name[i] = tolower((unsigned char)entry->d_name[i]);
-        }
-    }
     return entry;
 }
 
