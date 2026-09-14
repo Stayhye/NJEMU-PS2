@@ -480,6 +480,9 @@ if (PLATFORM STREQUAL "PS2")
     target_link_options(${TARGET} PUBLIC 
         "-Wl,--wrap=fopen"
         "-Wl,--wrap=opendir"
+        "-Wl,--wrap=readdir"
+        "-Wl,--wrap=stat"
+        "-Wl,--wrap=access"
     )
 endif()
 
