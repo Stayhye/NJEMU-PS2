@@ -62,7 +62,6 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    // If already fully qualified device path, clean up slashes
     if (strncasecmp(input_path, "cdrom0:", 7) == 0 || strncasecmp(input_path, "mass0:", 6) == 0 || strncasecmp(input_path, "host:", 5) == 0) {
         strncpy(output_path, input_path, max_len);
         output_path[max_len - 1] = '\0';
@@ -75,10 +74,10 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
     char work_path[1024];
     if (strcmp(input_path, ".") == 0) {
         strncpy(output_path, g_active_rom_path, max_len);
+        output_path[max_len - 1] = '\0';
         return;
     }
 
-    // Handle relative paths or root-relative paths like "cache/avsp.cache" or "avsp.zip"
     if (input_path[0] == '.' && (input_path[1] == '/' || input_path[1] == '\\')) {
         input_path += 2;
     }
@@ -86,7 +85,6 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
     if (strncasecmp(input_path, "cache", 5) == 0) {
         snprintf(work_path, sizeof(work_path), "%scache%s", g_base_device, input_path + 5);
     } else if (strncasecmp(input_path, "roms", 4) == 0 || strncasecmp(input_path, "ROMS", 4) == 0) {
-        // If it explicitly references ROMs, map to active path + remainder
         const char *remainder = input_path + 4;
         if (*remainder == '/' || *remainder == '\\') remainder++;
         if (*remainder != '\0') {
@@ -95,16 +93,13 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
             strncpy(work_path, g_active_rom_path, sizeof(work_path));
         }
     } else {
-        // Treat as a file/folder inside the active ROM path
         snprintf(work_path, sizeof(work_path), "%s\\%s", g_active_rom_path, input_path);
     }
 
-    // Normalize slashes
     for (int i = 0; work_path[i]; i++) {
         if (work_path[i] == '/') work_path[i] = '\\';
     }
 
-    // If targeting cdrom0:, resolve each segment against the ISO filesystem for correct case/version
     if (strncasecmp(work_path, "cdrom0:", 7) == 0) {
         int prefix_len = (strncasecmp(work_path, "cdrom0:\\", 8) == 0) ? 8 : 7;
         char path_tokens[1024];
@@ -139,7 +134,6 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
             if (found) {
                 strcat(current_dir, matched_name);
             } else {
-                // Fallback to uppercase if not found in directory listing
                 for (int i = 0; token[i]; i++) token[i] = toupper((unsigned char)token[i]);
                 strcat(current_dir, token);
             }
@@ -150,7 +144,7 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
     } else {
         strncpy(output_path, work_path, max_len);
     }
-    output[max_len - 1] = '\0';
+    output_path[max_len - 1] = '\0';
 }
 
 /* Linker Wrappers */
