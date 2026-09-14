@@ -37,8 +37,9 @@ void dbg_printf(const char *fmt, ...) {
 }
 
 static void force_absolute_path(const char *input, char *output, size_t max_len) {
-    if (!input) {
-        strcpy(output, g_active_rom_path);
+    if (!input || input[0] == '\0') {
+        strncpy(output, g_active_rom_path, max_len);
+        output[max_len - 1] = '\0';
         return;
     }
 
@@ -51,11 +52,17 @@ static void force_absolute_path(const char *input, char *output, size_t max_len)
         return;
     }
 
-    if (strcmp(input, ".") == 0 || strcmp(input, "") == 0 || input[0] != '/') {
-        if (input[0] == '.' && (input[1] == '/' || input[1] == '\\')) input += 2;
+    if (strcmp(input, ".") == 0 || input[0] != '/') {
+        char clean_input[512];
+        strncpy(clean_input, input, sizeof(clean_input) - 1);
+        clean_input[sizeof(clean_input) - 1] = '\0';
         
-        if (strlen(input) > 0) {
-            snprintf(output, max_len, "%s\\%s", g_active_rom_path, input);
+        if (clean_input[0] == '.' && (clean_input[1] == '/' || clean_input[1] == '\\')) {
+            memmove(clean_input, clean_input + 2, strlen(clean_input));
+        }
+        
+        if (strlen(clean_input) > 0) {
+            snprintf(output, max_len, "%s\\%s", g_active_rom_path, clean_input);
         } else {
             strncpy(output, g_active_rom_path, max_len);
         }
@@ -69,7 +76,7 @@ static void force_absolute_path(const char *input, char *output, size_t max_len)
     }
 }
 
-/* Linker Wrappers */
+/* Linker Wrappers with live logging to catch empty/null device queries */
 FILE *__wrap_fopen(const char *filename, const char *mode) {
     char resolved[1024];
     force_absolute_path(filename, resolved, sizeof(resolved));
@@ -79,8 +86,11 @@ FILE *__wrap_fopen(const char *filename, const char *mode) {
 DIR *__wrap_opendir(const char *name) {
     char resolved[1024];
     force_absolute_path(name, resolved, sizeof(resolved));
+    printf("[OPENDIR_DEBUG] Requested: '%s' -> Resolved to: '%s'\n", name ? name : "NULL", resolved);
+    
     DIR *d = __real_opendir(resolved);
-    if (!d && strcmp(resolved, g_active_rom_path) != 0) {
+    if (!d) {
+        printf("[OPENDIR_DEBUG] Failed to open '%s', falling back to base: '%s'\n", resolved, g_active_rom_path);
         d = __real_opendir(g_active_rom_path);
     }
     return d;
@@ -115,8 +125,6 @@ typedef struct ps2_platform {} ps2_platform_t;
 static void *ps2_init(void) {
     ps2_platform_t *ps2 = (ps2_platform_t*)calloc(1, sizeof(ps2_platform_t));
 
-    // DO NOT call SifIopReset(NULL, 0) here! 
-    // It destroys the BIOS CDVDMAN/CDFS drivers and freezes on black screen.
     SifInitRpc(0);
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
@@ -138,6 +146,7 @@ static void *ps2_init(void) {
         if (d) {
             strcpy(g_active_rom_path, test_paths[i]);
             closedir(d);
+            printf("[PS2_INIT] Successfully locked ROM base path to: %s\n", g_active_rom_path);
             break;
         }
     }
