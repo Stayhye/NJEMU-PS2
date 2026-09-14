@@ -73,9 +73,9 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
         return;
     }
 
-    if (input_path[0] != '/' && strchr(input_path, ':') == NULL) {
+    if (input_path[0] != '/' && input_path[0] != '\\' && strchr(input_path, ':') == NULL) {
         if (g_iso_rom_base[0] != '\0') {
-            snprintf(temp_path, sizeof(temp_path), "%s/%s", g_iso_rom_base, input_path);
+            snprintf(temp_path, sizeof(temp_path), "%s\\%s", g_iso_rom_base, input_path);
             input_path = temp_path;
         }
     }
@@ -83,8 +83,13 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
     strncpy(output_path, input_path, max_len);
     output_path[max_len - 1] = '\0';
 
-    if (strncasecmp(output_path, "cdrom0:/", 8) == 0 || strncasecmp(output_path, "cdrom:/", 7) == 0) {
-        int prefix_len = (strncasecmp(output_path, "cdrom0:/", 8) == 0) ? 8 : 7;
+    // Normalize forward slashes to backslashes for cdrom0: compatibility
+    if (strncasecmp(output_path, "cdrom0:", 7) == 0 || strncasecmp(output_path, "cdrom:", 6) == 0) {
+        for (int i = 0; output_path[i] != '\0'; i++) {
+            if (output_path[i] == '/') output_path[i] = '\\';
+        }
+
+        int prefix_len = (strncasecmp(output_path, "cdrom0:\\", 8) == 0) ? 8 : 7;
         char work_path[1024];
         strncpy(work_path, output_path + prefix_len, sizeof(work_path) - 1);
         work_path[sizeof(work_path) - 1] = '\0';
@@ -115,8 +120,9 @@ static void resolve_case_path(const char *input_path, char *output_path, size_t 
             }
             closedir(dir);
 
-            if (current_dir[strlen(current_dir) - 1] != '/') {
-                strcat(current_dir, "/");
+            int len = strlen(current_dir);
+            if (len > 0 && current_dir[len - 1] != '\\') {
+                strcat(current_dir, "\\");
             }
             if (found) {
                 strcat(current_dir, matched_name);
@@ -211,9 +217,9 @@ static void *ps2_init(void) {
     init_drivers();
 
     const char *candidates[] = {
-        "cdrom0:/ROMS", "cdrom0:/roms", "cdrom0:/ROM", "cdrom0:/",
-        "cdrom:/ROMS", "cdrom:/roms", "cdrom:/",
-        "mass0:/ROMS", "mass0:/roms", "."
+        "cdrom0:\\ROMS", "cdrom0:\\roms", "cdrom0:\\ROM", "cdrom0:\\",
+        "cdrom:\\ROMS", "cdrom:\\roms", "cdrom:\\",
+        "mass0:\\ROMS", "mass0:\\roms", "."
     };
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
@@ -227,8 +233,8 @@ static void *ps2_init(void) {
     }
 
     if (g_iso_rom_base[0] == '\0') {
-        strcpy(g_iso_rom_base, "cdrom0:/");
-        printf("[PS2_INIT] Warning: No specific ROM folder found, defaulting to cdrom0:/\n");
+        strcpy(g_iso_rom_base, "cdrom0:\\");
+        printf("[PS2_INIT] Warning: No specific ROM folder found, defaulting to cdrom0:\\\n");
     }
 
     chdir(g_iso_rom_base);
