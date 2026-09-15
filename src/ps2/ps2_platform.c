@@ -36,7 +36,7 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* Maps uppercase requests and automatically resolves extensionless driver names (like AVSP) to AVSP.ZIP */
+/* True Dynamic Case-Insensitive & Extension-Agnostic ISO Scanner */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
         strncpy(output_path, "cdrom0:\\", max_len);
@@ -65,19 +65,62 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    char upper_filename[256];
-    int i = 0;
-    for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
-        upper_filename[i] = toupper((unsigned char)filename[i]);
-    }
-    upper_filename[i] = '\0';
+    // Clean requested path of version numbers for matching
+    char req_clean[256];
+    strncpy(req_clean, filename, sizeof(req_clean) - 1);
+    req_clean[sizeof(req_clean) - 1] = '\0';
+    char *semi = strchr(req_clean, ';');
+    if (semi) *semi = '\0';
 
-    // If the request doesn't have an extension (e.g. "AVSP"), automatically append ".ZIP"
-    if (!strchr(upper_filename, '.')) {
-        strncat(upper_filename, ".ZIP", sizeof(upper_filename) - strlen(upper_filename) - 1);
+    char matched_name[256] = "";
+    bool found = false;
+
+    // Dynamically scan the ISO root directory
+    DIR *dir = __real_opendir("cdrom0:\\");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = __real_readdir(dir)) != NULL) {
+            char ent_clean[256];
+            strncpy(ent_clean, entry->d_name, sizeof(ent_clean) - 1);
+            ent_clean[sizeof(ent_clean) - 1] = '\0';
+            char *ent_semi = strchr(ent_clean, ';');
+            if (ent_semi) *ent_semi = '\0';
+
+            // 1. Exact case-insensitive match (ignoring version suffix)
+            if (strcasecmp(ent_clean, req_clean) == 0) {
+                strncpy(matched_name, entry->d_name, sizeof(matched_name));
+                found = true;
+                break;
+            }
+
+            // 2. Extensionless match (e.g. requested "AVSP", entry is "AVSP.ZIP")
+            char ent_no_ext[256];
+            strncpy(ent_no_ext, ent_clean, sizeof(ent_no_ext) - 1);
+            char *dot = strchr(ent_no_ext, '.');
+            if (dot) *dot = '\0';
+
+            if (strcasecmp(ent_no_ext, req_clean) == 0) {
+                strncpy(matched_name, entry->d_name, sizeof(matched_name));
+                found = true;
+                break;
+            }
+        }
+        closedir(dir);
     }
 
-    snprintf(output_path, max_len, "cdrom0:\\%s", upper_filename);
+    // Fallback if directory scan misses it: uppercase and add ;1
+    if (!found) {
+        int i = 0;
+        for (; filename[i] && i < sizeof(matched_name) - 3; i++) {
+            matched_name[i] = toupper((unsigned char)filename[i]);
+        }
+        matched_name[i] = '\0';
+        if (!strchr(matched_name, ';')) {
+            strcat(matched_name, ";1");
+        }
+    }
+
+    snprintf(output_path, max_len, "cdrom0:\\%s", matched_name);
     output_path[max_len - 1] = '\0';
 }
 
@@ -103,7 +146,7 @@ struct dirent *__wrap_readdir(DIR *dirp) {
     if (!entry && !g_injected_rom_listed) {
         g_injected_rom_listed = true;
         memset(&fake_entry, 0, sizeof(fake_entry));
-        strcpy(fake_entry.d_name, "AVSP.ZIP");
+        strcpy(fake_entry.d_name, "AVSP.ZIP;1");
         return &fake_entry;
     }
 
