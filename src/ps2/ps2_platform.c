@@ -36,7 +36,7 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* Maps uppercase requests directly to the exact disc entry including version suffixes (e.g. ;1) */
+/* Direct uppercase mapping without any version-suffix interference */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
         strncpy(output_path, "cdrom0:\\", max_len);
@@ -65,44 +65,14 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    char search_clean[256];
-    strncpy(search_clean, filename, sizeof(search_clean) - 1);
-    search_clean[sizeof(search_clean) - 1] = '\0';
-    char *semi_req = strchr(search_clean, ';');
-    if (semi_req) *semi_req = '\0';
-
-    char matched_name[256] = "";
-    bool found = false;
-
-    DIR *dir = __real_opendir("cdrom0:\\");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = __real_readdir(dir)) != NULL) {
-            char entry_clean[256];
-            strncpy(entry_clean, entry->d_name, sizeof(entry_clean) - 1);
-            entry_clean[sizeof(entry_clean) - 1] = '\0';
-            char *semi_ent = strchr(entry_clean, ';');
-            if (semi_ent) *semi_ent = '\0';
-
-            if (strcasecmp(entry_clean, search_clean) == 0) {
-                strncpy(matched_name, entry->d_name, sizeof(matched_name));
-                found = true;
-                break;
-            }
-        }
-        closedir(dir);
+    char upper_filename[256];
+    int i = 0;
+    for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
+        upper_filename[i] = toupper((unsigned char)filename[i]);
     }
+    upper_filename[i] = '\0';
 
-    if (!found) {
-        int i = 0;
-        for (; search_clean[i] && i < sizeof(matched_name) - 3; i++) {
-            matched_name[i] = toupper((unsigned char)search_clean[i]);
-        }
-        matched_name[i] = '\0';
-        strcat(matched_name, ";1");
-    }
-
-    snprintf(output_path, max_len, "cdrom0:\\%s", matched_name);
+    snprintf(output_path, max_len, "cdrom0:\\%s", upper_filename);
     output_path[max_len - 1] = '\0';
 }
 
@@ -128,7 +98,7 @@ struct dirent *__wrap_readdir(DIR *dirp) {
     if (!entry && !g_injected_rom_listed) {
         g_injected_rom_listed = true;
         memset(&fake_entry, 0, sizeof(fake_entry));
-        strcpy(fake_entry.d_name, "AVSP.ZIP;1");
+        strcpy(fake_entry.d_name, "AVSP.ZIP");
         return &fake_entry;
     }
 
