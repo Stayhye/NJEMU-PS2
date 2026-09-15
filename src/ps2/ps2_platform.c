@@ -36,7 +36,7 @@ void dbg_printf(const char *fmt, ...) {
     printf("\n");
 }
 
-/* True Case-Insensitive Resolver: Scans the ISO root and matches any request regardless of case */
+/* Maps uppercase requests and automatically resolves extensionless driver names (like AVSP) to AVSP.ZIP */
 static void resolve_iso_path(const char *input_path, char *output_path, size_t max_len) {
     if (!input_path || input_path[0] == '\0') {
         strncpy(output_path, "cdrom0:\\", max_len);
@@ -65,40 +65,19 @@ static void resolve_iso_path(const char *input_path, char *output_path, size_t m
         return;
     }
 
-    char matched_name[256];
-    strncpy(matched_name, filename, sizeof(matched_name) - 1);
-    matched_name[sizeof(matched_name) - 1] = '\0';
+    char upper_filename[256];
+    int i = 0;
+    for (; filename[i] && i < sizeof(upper_filename) - 1; i++) {
+        upper_filename[i] = toupper((unsigned char)filename[i]);
+    }
+    upper_filename[i] = '\0';
 
-    bool found = false;
-    DIR *dir = __real_opendir("cdrom0:\\");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = __real_readdir(dir)) != NULL) {
-            // Strip any ISO version suffixes like ;1 from directory entry for comparison
-            char entry_clean[256];
-            strncpy(entry_clean, entry->d_name, sizeof(entry_clean) - 1);
-            entry_clean[sizeof(entry_clean) - 1] = '\0';
-            char *semi = strchr(entry_clean, ';');
-            if (semi) *semi = '\0';
-
-            if (strcasecmp(entry_clean, filename) == 0) {
-                // Grab the exact real name from the disc (e.g. ROMINFO.CPS2)
-                strncpy(matched_name, entry->d_name, sizeof(matched_name));
-                found = true;
-                break;
-            }
-        }
-        closedir(dir);
+    // If the request doesn't have an extension (e.g. "AVSP"), automatically append ".ZIP"
+    if (!strchr(upper_filename, '.')) {
+        strncat(upper_filename, ".ZIP", sizeof(upper_filename) - strlen(upper_filename) - 1);
     }
 
-    // If not found in scan, fallback to uppercase just in case
-    if (!found) {
-        for (int i = 0; matched_name[i]; i++) {
-            matched_name[i] = toupper((unsigned char)matched_name[i]);
-        }
-    }
-
-    snprintf(output_path, max_len, "cdrom0:\\%s", matched_name);
+    snprintf(output_path, max_len, "cdrom0:\\%s", upper_filename);
     output_path[max_len - 1] = '\0';
 }
 
