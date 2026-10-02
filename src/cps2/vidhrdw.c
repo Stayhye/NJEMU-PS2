@@ -7,6 +7,8 @@
 ******************************************************************************/
 
 #include "cps2.h"
+#include "common/palette_convert.h"
+#include <string.h>
 
 
 /******************************************************************************
@@ -86,7 +88,7 @@ static int16_t cps2_scanline_end;
 static uint32_t cps2_scroll3_base;
 static uint32_t cps2_kludge;
 
-static uint16_t ALIGN16_DATA video_clut16[65536];
+static uint8_t ALIGN16_DATA cps_color_component_lut[16][16];
 uint16_t ALIGN16_DATA video_palette[cps2_palette_size >> 1];
 
 
@@ -182,8 +184,6 @@ WRITE16_HANDLER( cps1_output_w )
 	CPS2 Video Drawing Process
 ******************************************************************************/
 
-#if !USE_CACHE
-
 /*------------------------------------------------------
 	GFX Decode
 ------------------------------------------------------*/
@@ -222,7 +222,10 @@ void cps2_gfx_decode(void)
 
 	for (i = 0; i < memory_length_gfx1 / 4; i++)
 	{
-		uint32_t src = gfx[4 * i] + (gfx[4 * i + 1] << 8) + (gfx[4 * i + 2] << 16) + (gfx[4 * i + 3] << 24);
+		uint32_t src = (uint32_t)gfx[4 * i]
+		             | ((uint32_t)gfx[4 * i + 1] << 8)
+		             | ((uint32_t)gfx[4 * i + 2] << 16)
+		             | ((uint32_t)gfx[4 * i + 3] << 24);
 		uint32_t dw = 0;
 
 		for (j = 0; j < 8; j++)
@@ -235,7 +238,7 @@ void cps2_gfx_decode(void)
 			if (mask & 0x00ff0000) n |= 4;
 			if (mask & 0xff000000) n |= 8;
 
-			dw |= n << (j << 2);
+			dw |= (uint32_t)n << (j << 2);
 		}
 
 		data = ((dw & 0x0000000f) >>  0) | ((dw & 0x000000f0) <<  4)
@@ -319,50 +322,13 @@ void cps2_gfx_decode(void)
 	}
 }
 
-#endif
-
-
 /*------------------------------------------------------
 	Create Color Table
 ------------------------------------------------------*/
 
 static void cps2_init_tables(void)
 {
-	int r, g, b, bright;
-
-	for (bright = 0; bright < 16; bright++)
-	{
-		for (r = 0; r < 16; r++)
-		{
-			for (g = 0; g < 16; g++)
-			{
-				for (b = 0; b < 16; b++)
-				{
-					uint16_t pen;
-					int r2, g2, b2, bright2;
-					float fr, fg, fb;
-
-					pen = (bright << 12) | (r << 8) | (g << 4) | b;
-
-					bright2 = bright + 16;
-
-					fr = (float)(r * bright2) / (15.0 * 31.0);
-					fg = (float)(g * bright2) / (15.0 * 31.0);
-					fb = (float)(b * bright2) / (15.0 * 31.0);
-
-					r2 = (int)(fr * 255.0) - 15;
-					g2 = (int)(fg * 255.0) - 15;
-					b2 = (int)(fb * 255.0) - 15;
-
-					if (r2 < 0) r2 = 0;
-					if (g2 < 0) g2 = 0;
-					if (b2 < 0) b2 = 0;
-
-					video_clut16[pen] = MAKECOL15(r2, g2, b2);
-				}
-			}
-		}
-	}
+	cps_palette_component_lut_init(cps_color_component_lut);
 
 	if (driver->flags & 2)
 		cps2_build_palette = cps2_build_palette_delay;
@@ -467,7 +433,7 @@ static void cps2_build_palette_normal(void)
 			if (palette != cps2_old_palette[offset])
 			{
 				cps2_old_palette[offset] = palette;
-				video_palette[offset] = video_clut16[palette];
+					video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 			}
 		}
 	}
@@ -494,7 +460,7 @@ static void cps2_build_palette_delay(void)
 			if (palette != cps2_old_palette[offset])
 			{
 				cps2_old_palette[offset] = palette;
-				video_palette[offset] = video_clut16[palette];
+					video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 			}
 
 			palette = cps2_palette[offset];
@@ -513,7 +479,7 @@ static void cps2_build_palette_delay(void)
 			if (palette != cps2_old_palette[offset])
 			{
 				cps2_old_palette[offset] = palette;
-				video_palette[offset] = video_clut16[palette];
+					video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 			}
 		}
 	}
@@ -986,14 +952,6 @@ void cps2_screenrefresh(int start, int end)
 
 	if (start < FIRST_VISIBLE_LINE) start = FIRST_VISIBLE_LINE;
 	if (end > LAST_VISIBLE_LINE) end = LAST_VISIBLE_LINE;
-
-	/* Advance the tile-cache age counter once per frame (on the first
-	 * screen refresh call of the frame). */
-	if (start <= FIRST_VISIBLE_LINE)
-	{
-		extern uint32_t frames_displayed;
-		frames_displayed++;
-	}
 
 	cps2_scanline_start = start;
 	cps2_scanline_end   = end;

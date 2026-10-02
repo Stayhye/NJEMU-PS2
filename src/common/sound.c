@@ -7,7 +7,12 @@
 ******************************************************************************/
 
 #include <assert.h>
-#include "emumain.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/sound.h"
+#include "common/ui_text_driver.h"
+#include <string.h>
+#include <unistd.h>
 #include "thread_driver.h"
 #include "audio_driver.h"
 
@@ -19,7 +24,7 @@
 static volatile int sound_active;
 static void *sound_thread;
 static int sound_volume;
-static int sound_enable;
+static volatile int sound_enable;
 static int16_t ALIGN16_DATA sound_buffer[2][SOUND_BUFFER_SIZE];
 
 static struct sound_t sound_info;
@@ -44,6 +49,8 @@ struct sound_t *sound = &sound_info;
 static int32_t sound_update_thread(uint32_t args, void *argp)
 {
 	int flip = 0;
+	(void)args;
+	(void)argp;
 
 	while (sound_active)
 	{
@@ -55,24 +62,12 @@ static int32_t sound_update_thread(uint32_t args, void *argp)
 			} while (Sleep);
 		}
 
-		/* Every system's update path emits sound->samples interleaved
-		 * STEREO frames (CPS1's mono path L/R-copies each source sample;
-		 * CPS2/MVS/NCDZ render true stereo).  The output block handed to
-		 * the driver is therefore always 2 channels regardless of
-		 * sound->channels (which reflects the emulated system's internal
-		 * layout and is read by YM2151's pan handling).  Using
-		 * sound->channels here truncated CPS1's block to half its real
-		 * length: audsrv (always stereo) played only the first 736 of
-		 * 1472 frames and dropped the rest, running the music at ~2x
-		 * speed. */
-		const uint32_t out_samples = (uint32_t)sound->samples * 2;
-
 		if (sound_enable)
 			(*sound->update)(sound_buffer[flip]);
 		else
-			memset(sound_buffer[flip], 0, out_samples * sizeof(int16_t));
+			memset(sound_buffer[flip], 0, sound->samples * sound->channels * sizeof(int16_t));
 
-		audio_driver->srcOutputBlocking(game_audio, sound_volume, sound_buffer[flip], out_samples * sizeof(int16_t));
+		audio_driver->srcOutputBlocking(game_audio, sound_volume, sound_buffer[flip], sound->samples * sound->channels * sizeof(int16_t));
 		flip ^= 1;
 	}
 
@@ -128,6 +123,17 @@ void sound_thread_enable(int enable)
 
 
 /*--------------------------------------------------------
+	Sound Stream Pause/Resume
+--------------------------------------------------------*/
+
+void sound_thread_pause(int pause)
+{
+	if (sound_active && audio_driver->setPaused != NULL)
+		audio_driver->setPaused(game_audio, pause != 0);
+}
+
+
+/*--------------------------------------------------------
 	Sound Volume Setting
 --------------------------------------------------------*/
 
@@ -144,7 +150,7 @@ void sound_thread_set_volume(void)
 int sound_thread_start(void)
 {
 	/* Verify that the sound buffer is large enough for the configured audio format */
-	assert(sound->samples * 2 <= SOUND_BUFFER_SIZE);
+	assert(sound->samples * sound->channels <= SOUND_BUFFER_SIZE);
 
 	sound_active = 0;
 	sound_thread = NULL;
@@ -157,15 +163,7 @@ int sound_thread_start(void)
 
 	game_audio = audio_driver->init();
 
-	/* Reserve the output channel as STEREO regardless of the emulated
-	 * system's internal channel count.  This mirrors the PSP original
-	 * (sceAudioSRCChReserve(samples, freq, 2)): CPS1's mono render path
-	 * (sound_update_mono -> resample_stream mono branch) already outputs
-	 * interleaved L/R-copied stereo frames, so the data handed to the
-	 * driver is always stereo.  Passing sound->channels (1 for CPS1)
-	 * instead made audsrv interpret the buffer as mono, stretching each
-	 * block to double its real duration -> low/deep audio. */
-	if (!audio_driver->chSRCReserve(game_audio, sound->samples, sound->frequency, 2))
+	if (!audio_driver->chSRCReserve(game_audio, sound->samples, sound->frequency, sound->channels))
 	{
 		fatalerror(TEXT(COULD_NOT_RESERVE_AUDIO_CHANNEL_FOR_SOUND));
 		audio_driver->free(game_audio);

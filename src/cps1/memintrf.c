@@ -8,8 +8,30 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
 #include "cps1.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/cmdlist.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/loadrom.h"
 #include "common/memory_sizes.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/config.h"
 
 
 #define M68K_AMASK M68K_ADDR_MASK
@@ -128,7 +150,7 @@ static int load_rom_cpu1(void)
 		strcpy(fname, cpu1rom[i].name);
 		if ((res = file_open(game_name, parent, cpu1rom[i].crc, fname)) < 0)
 		{
-			if (res == -2)
+			if (res == ROM_FILE_OPEN_CRC_MISMATCH)
 				error_crc(fname);
 			else
 				error_file(fname);
@@ -169,7 +191,7 @@ static int load_rom_cpu2(void)
 		strcpy(fname, cpu2rom[i].name);
 		if ((res = file_open(game_name, parent, cpu2rom[i].crc, fname)) < 0)
 		{
-			if (res == -2)
+			if (res == ROM_FILE_OPEN_CRC_MISMATCH)
 				error_crc(fname);
 			else
 				error_file(fname);
@@ -210,7 +232,7 @@ static int load_rom_gfx1(void)
 		strcpy(fname, gfx1rom[i].name);
 		if ((res = file_open(game_name, parent, gfx1rom[i].crc, fname)) < 0)
 		{
-			if (res == -2)
+			if (res == ROM_FILE_OPEN_CRC_MISMATCH)
 				error_crc(fname);
 			else
 				error_file(fname);
@@ -253,7 +275,7 @@ static int load_rom_sound1(void)
 		strcpy(fname, snd1rom[i].name);
 		if ((res = file_open(game_name, parent, snd1rom[i].crc, fname)) < 0)
 		{
-			if (res == -2)
+			if (res == ROM_FILE_OPEN_CRC_MISMATCH)
 				error_crc(fname);
 			else
 				error_file(fname);
@@ -316,7 +338,7 @@ static int load_rom_info(const char *game_name)
 	machine_init_type    = 0;
 	machine_screen_type  = 0;
 
-	sprintf(path, "%srominfo.cps1", launchDir);
+	if (!path_format(path, sizeof(path), "%srominfo.cps1", launchDir)) return 0;
 
 	if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 	{
@@ -329,7 +351,7 @@ static int load_rom_info(const char *game_name)
 			return 3;	// Shortcut
 		}
 
-		read(fd, buf, size);
+		{ ssize_t io_result = read(fd, buf, size); (void)io_result; }
 		close(fd);
 
 		i = 0;
@@ -379,6 +401,19 @@ static int load_rom_info(const char *game_name)
 						sscanf(input, "%d", &machine_input_type);
 						sscanf(init, "%d", &machine_init_type);
 						sscanf(rotate, "%d", &machine_screen_type);
+#if !RELEASE
+						/*
+						 * Keep compatibility with the legacy CPS1 rominfo
+						 * names whose custom init ids were lost when the
+						 * database was regenerated.
+						 */
+						if (strcasecmp(game_name, "sf2m3") == 0
+						 && machine_init_type == INIT_cps1)
+							machine_init_type = INIT_sf2m3;
+						else if (strcasecmp(game_name, "wofb") == 0
+						      && machine_init_type == INIT_wof)
+							machine_init_type = INIT_wofb;
+#endif
 						rom_start = 1;
 					}
 				}
@@ -392,36 +427,36 @@ static int load_rom_info(const char *game_name)
 			{
 				if (str_cmp(&linebuf[1], "REGION(") == 0)
 				{
-					char *size, *type, *flag;
+					char *size, *type;
 
 					strtok(&linebuf[1], " ");
 					size = strtok(NULL, " ,");
 					type = strtok(NULL, " ,");
-					flag = strtok(NULL, " ");
+					(void)strtok(NULL, " ");
 
 					if (strcmp(type, "CPU1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu1);
+						sscanf(size, "%" SCNx32, &memory_length_cpu1);
 						region = REGION_CPU1;
 					}
 					else if (strcmp(type, "CPU2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu2);
+						sscanf(size, "%" SCNx32, &memory_length_cpu2);
 						region = REGION_CPU2;
 					}
 					else if (strcmp(type, "GFX1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_gfx1);
+						sscanf(size, "%" SCNx32, &memory_length_gfx1);
 						region = REGION_GFX1;
 					}
 					else if (strcmp(type, "SOUND1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_sound1);
+						sscanf(size, "%" SCNx32, &memory_length_sound1);
 						region = REGION_SOUND1;
 					}
 					else if (strcmp(type, "USER1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_user1);
+						sscanf(size, "%" SCNx32, &memory_length_user1);
 						region = REGION_USER1;
 					}
 					else
@@ -446,10 +481,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
 						cpu1rom[num_cpu1rom].group = 0;
 						cpu1rom[num_cpu1rom].skip = 0;
@@ -457,10 +492,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_CPU2:
-						sscanf(type, "%x", &cpu2rom[num_cpu2rom].type);
-						sscanf(offset, "%x", &cpu2rom[num_cpu2rom].offset);
-						sscanf(length, "%x", &cpu2rom[num_cpu2rom].length);
-						sscanf(crc, "%x", &cpu2rom[num_cpu2rom].crc);
+						sscanf(type, "%" SCNx32, &cpu2rom[num_cpu2rom].type);
+						sscanf(offset, "%" SCNx32, &cpu2rom[num_cpu2rom].offset);
+						sscanf(length, "%" SCNx32, &cpu2rom[num_cpu2rom].length);
+						sscanf(crc, "%" SCNx32, &cpu2rom[num_cpu2rom].crc);
 						if (name) strcpy(cpu2rom[num_cpu2rom].name, name);
 						cpu2rom[num_cpu2rom].group = 0;
 						cpu2rom[num_cpu2rom].skip = 0;
@@ -468,10 +503,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_GFX1:
-						sscanf(type, "%x", &gfx1rom[num_gfx1rom].type);
-						sscanf(offset, "%x", &gfx1rom[num_gfx1rom].offset);
-						sscanf(length, "%x", &gfx1rom[num_gfx1rom].length);
-						sscanf(crc, "%x", &gfx1rom[num_gfx1rom].crc);
+						sscanf(type, "%" SCNx32, &gfx1rom[num_gfx1rom].type);
+						sscanf(offset, "%" SCNx32, &gfx1rom[num_gfx1rom].offset);
+						sscanf(length, "%" SCNx32, &gfx1rom[num_gfx1rom].length);
+						sscanf(crc, "%" SCNx32, &gfx1rom[num_gfx1rom].crc);
 						if (name) strcpy(gfx1rom[num_gfx1rom].name, name);
 						gfx1rom[num_gfx1rom].group = 0;
 						gfx1rom[num_gfx1rom].skip = 0;
@@ -479,10 +514,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_SOUND1:
-						sscanf(type, "%x", &snd1rom[num_snd1rom].type);
-						sscanf(offset, "%x", &snd1rom[num_snd1rom].offset);
-						sscanf(length, "%x", &snd1rom[num_snd1rom].length);
-						sscanf(crc, "%x", &snd1rom[num_snd1rom].crc);
+						sscanf(type, "%" SCNx32, &snd1rom[num_snd1rom].type);
+						sscanf(offset, "%" SCNx32, &snd1rom[num_snd1rom].offset);
+						sscanf(length, "%" SCNx32, &snd1rom[num_snd1rom].length);
+						sscanf(crc, "%" SCNx32, &snd1rom[num_snd1rom].crc);
 						if (name) strcpy(snd1rom[num_snd1rom].name, name);
 						snd1rom[num_snd1rom].group = 0;
 						snd1rom[num_snd1rom].skip = 0;
@@ -510,10 +545,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						sscanf(group, "%x", &cpu1rom[num_cpu1rom].group);
 						sscanf(skip, "%x", &cpu1rom[num_cpu1rom].skip);
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
@@ -521,10 +556,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_GFX1:
-						sscanf(type, "%x", &gfx1rom[num_gfx1rom].type);
-						sscanf(offset, "%x", &gfx1rom[num_gfx1rom].offset);
-						sscanf(length, "%x", &gfx1rom[num_gfx1rom].length);
-						sscanf(crc, "%x", &gfx1rom[num_gfx1rom].crc);
+						sscanf(type, "%" SCNx32, &gfx1rom[num_gfx1rom].type);
+						sscanf(offset, "%" SCNx32, &gfx1rom[num_gfx1rom].offset);
+						sscanf(length, "%" SCNx32, &gfx1rom[num_gfx1rom].length);
+						sscanf(crc, "%" SCNx32, &gfx1rom[num_gfx1rom].crc);
 						sscanf(group, "%x", &gfx1rom[num_gfx1rom].group);
 						sscanf(skip, "%x", &gfx1rom[num_gfx1rom].skip);
 						if (name) strcpy(gfx1rom[num_gfx1rom].name, name);
@@ -579,7 +614,7 @@ int memory_init(void)
 		{
 		case 1: msg_printf(TEXT(THIS_GAME_NOT_SUPPORTED)); break;
 		case 2: msg_printf(TEXT(ROM_NOT_FOUND)); break;
-		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND)); break;
+		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND_CPS1)); break;
 		}
 		msg_printf(TEXT(PRESS_ANY_BUTTON2));
 		pad_wait_press(PAD_WAIT_INFINITY);
@@ -618,8 +653,8 @@ int memory_init(void)
 	{
 		/* Use fixed settings for some options during AdHoc communication */
 		cps_raster_enable    = 1;
-		platform_cpuclock    = power_driver->getHighestCpuClock(power_data);
-		option_vsync         = 1;
+		platform_performance_level    = power_get_highest_performance_level();
+		option_vsync         = 0;
 		option_autoframeskip = 0;
 		option_frameskip     = 0;
 		option_showfps       = 0;
@@ -638,7 +673,7 @@ int memory_init(void)
 #endif
 	}
 
-	power_driver->setCpuClock(power_data, platform_cpuclock);
+	power_set_performance_level(platform_performance_level);
 
 	if (load_rom_cpu1() == 0) return 0;
 	if (load_rom_cpu2() == 0) return 0;
@@ -646,8 +681,8 @@ int memory_init(void)
 	if (load_rom_sound1() == 0) return 0;
 	if (load_rom_user1() == 0) return 0;
 
-	static_ram1 = (uint8_t *)cps1_ram - 0xff0000;
-	static_ram2 = (uint8_t *)cps1_gfxram - 0x900000;
+	static_ram1 = (uint8_t *)cps1_ram;
+	static_ram2 = (uint8_t *)cps1_gfxram;
 
 	qsound_sharedram1 = &memory_region_cpu2[0xc000];
 	qsound_sharedram2 = &memory_region_cpu2[0xf000];
@@ -764,12 +799,12 @@ uint8_t m68000_read_memory_8(uint32_t offset)
 	switch (offset >> 16)
 	{
 	case 0xff:
-		return READ_BYTE(static_ram1, offset);
+		return READ_BYTE(static_ram1, (offset - 0xff0000));
 
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		return READ_BYTE(static_ram2, offset);
+		return READ_BYTE(static_ram2, (offset - 0x900000));
 
 	case 0xf0:
 		return qsound_rom_r(offset >> 1, mem_mask) >> shift;
@@ -854,12 +889,12 @@ uint16_t m68000_read_memory_16(uint32_t offset)
 	switch (offset >> 16)
 	{
 	case 0xff:
-		return READ_WORD(static_ram1, offset);
+		return READ_WORD(static_ram1, (offset - 0xff0000));
 
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		return READ_WORD(static_ram2, offset);
+		return READ_WORD(static_ram2, (offset - 0x900000));
 
 	case 0xf0:
 		return qsound_rom_r(offset >> 1, 0);
@@ -942,13 +977,13 @@ void m68000_write_memory_8(uint32_t offset, uint8_t data)
 	switch (offset >> 16)
 	{
 	case 0xff:
-		WRITE_BYTE(static_ram1, offset, data);
+		WRITE_BYTE(static_ram1, (offset - 0xff0000), data);
 		return;
 
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		WRITE_BYTE(static_ram2, offset, data);
+		WRITE_BYTE(static_ram2, (offset - 0x900000), data);
 		return;
 
 	case 0x80:
@@ -1018,11 +1053,11 @@ void m68000_write_memory_16(uint32_t offset, uint16_t data)
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		WRITE_WORD(static_ram2, offset, data);
+		WRITE_WORD(static_ram2, offset - 0x900000, data);
 		return;
 
 	case 0xff:
-		WRITE_WORD(static_ram1, offset, data);
+		WRITE_WORD(static_ram1, offset - 0xff0000, data);
 		return;
 
 	case 0x80:

@@ -12,11 +12,13 @@
 #include <unistd.h>
 #include <string.h>
 #include <mad.h>
+#include "common/mp3.h"
 #include "thread_driver.h"
 #include "audio_driver.h"
-
-// TODO: remove this import
-#include "emumain.h"
+#include "common/emulator_runtime.h"
+#include "common/ui_text_driver.h"
+#include "common/ui.h"
+#include "ncdz/cdda.h"
 
 #define MP3_SAMPLES			(736 * 2)
 #define MP3_BUFFER_SIZE		(MP3_SAMPLES * 4)
@@ -274,6 +276,8 @@ static void MP3Update(void)
 
 static int32_t MP3Thread(uint32_t args, void *argp)
 {
+	(void)args;
+	(void)argp;
 	while (mp3_active)
 	{
 		thread_driver->sleepThread(mp3_thread);

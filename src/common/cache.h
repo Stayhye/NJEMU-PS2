@@ -9,6 +9,8 @@
 #ifndef MEMORY_CACHE_H
 #define MEMORY_CACHE_H
 
+#include "memory_plan.h"
+
 #if USE_CACHE
 
 #if (EMU_SYSTEM == CPS2)
@@ -34,16 +36,25 @@ extern int cache_type;
 extern uint32_t (*read_cache)(uint32_t offset);
 extern void (*update_cache)(uint32_t offset);
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
 extern int pcm_cache_enable;
-#endif
+
+enum
+{
+	CACHE_INFO = 0,
+	CACHE_CROM,
+	CACHE_SROM,
+	CACHE_VROM
+};
+
+int cachefile_open(int type);
+size_t cachefile_zip_read(int type, const char *name, void *buf, size_t size);
 #else
 extern uint8_t *block_empty;
 extern uint32_t block_offset[MAX_CACHE_BLOCKS];
 #endif
 
 void cache_init(void);
-int cache_start(void);
+int cache_start(const memory_plan_t *plan, void *preallocated_gfx, void *preallocated_pcm);
 void cache_shutdown(void);
 void cache_sleep(int flag);
 
@@ -52,7 +63,7 @@ uint8_t *pcm_cache_read(uint16_t new_block);
 void pcm_cache_update(uint16_t block);
 #endif
 
-#ifdef STATE_SAVE
+#ifdef SAVE_STATE
 uint8_t *cache_alloc_state_buffer(int32_t size);
 void cache_free_state_buffer(int32_t size);
 #endif

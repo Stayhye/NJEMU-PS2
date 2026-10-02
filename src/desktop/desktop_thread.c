@@ -11,6 +11,29 @@ typedef struct desktop_thread {
     int32_t (*threadFunc)(uint32_t, void *);
 } desktop_thread_t;
 
+static void cleanupThread(desktop_thread_t *desktop)
+{
+    if (!desktop)
+        return;
+
+    if (desktop->thread) {
+        SDL_WaitThread(desktop->thread, NULL);
+        desktop->thread = NULL;
+    }
+
+    if (desktop->start) {
+        SDL_DestroySemaphore(desktop->start);
+        desktop->start = NULL;
+    }
+
+    if (desktop->end) {
+        SDL_DestroySemaphore(desktop->end);
+        desktop->end = NULL;
+    }
+
+    desktop->threadFunc = NULL;
+}
+
 
 static int childThread(void *arg)
 {
@@ -28,18 +51,39 @@ static void *desktop_init(void) {
 }
 
 static void desktop_free(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
-	free(desktop);
+    desktop_thread_t *desktop = (desktop_thread_t*)data;
+    if (!desktop)
+        return;
+
+    cleanupThread(desktop);
+    free(desktop);
 }
 
 static bool desktop_createThread(void *data, const char *name, int32_t (*threadFunc)(u_int32_t, void *), uint32_t priority, uint32_t stackSize) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
+    desktop_thread_t *desktop = (desktop_thread_t*)data;
+	(void)priority;
+
+	if (!desktop || !threadFunc)
+		return false;
+
     desktop->threadFunc = threadFunc;
     desktop->start = SDL_CreateSemaphore(0);
-    desktop->end = SDL_CreateSemaphore(0);
-    desktop->thread = SDL_CreateThread(childThread, name, desktop);
+    if (!desktop->start)
+        goto error;
 
-	return desktop->thread != NULL;
+    desktop->end = SDL_CreateSemaphore(0);
+    if (!desktop->end)
+        goto error;
+
+    desktop->thread = SDL_CreateThreadWithStackSize(childThread, name, stackSize, desktop);
+    if (!desktop->thread)
+        goto error;
+
+    return true;
+
+error:
+	cleanupThread(desktop);
+	return false;
 }
 
 static void desktop_startThread(void *data) {
@@ -48,30 +92,38 @@ static void desktop_startThread(void *data) {
 }
 
 static void desktop_waitThreadEnd(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
-    SDL_SemPost(desktop->end);
+    desktop_thread_t *desktop = (desktop_thread_t*)data;
+	if (desktop && desktop->end)
+		SDL_SemWait(desktop->end);
 }
 
 static void desktop_wakeupThread(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
+	(void)data;
 }
 
 static void desktop_deleteThread(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
+    desktop_thread_t *desktop = (desktop_thread_t*)data;
+	cleanupThread(desktop);
 }
 
 static void desktop_resumeThread(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
+	(void)data;
 }
 
 static void desktop_suspendThread(void *data) {
-	desktop_thread_t *desktop = (desktop_thread_t*)data;
+	(void)data;
 }
 
 static void desktop_sleepThread(void *data) {
+	(void)data;
+}
+
+static void desktop_yieldThread(void) {
 }
 
 static void desktop_exitThread(void *data, int32_t exitCode) {
+	(void)data;
+	(void)exitCode;
 }
 
 thread_driver_t thread_desktop = {
@@ -86,5 +138,6 @@ thread_driver_t thread_desktop = {
 	desktop_resumeThread,
 	desktop_suspendThread,
 	desktop_sleepThread,
+	desktop_yieldThread,
 	desktop_exitThread
 };

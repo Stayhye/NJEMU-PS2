@@ -10,7 +10,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "emumain.h"
 #include "c68k.h"
 
 
@@ -128,7 +127,6 @@ int32_t C68k_Exec(c68k_struc *CPU, int32_t cycles)
 
 		PC = CPU->PC;
 		CPU->ICount = cycles;
-
 
 C68k_Check_Interrupt:
 		CHECK_INT

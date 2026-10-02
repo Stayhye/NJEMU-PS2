@@ -6,21 +6,24 @@
 
 ******************************************************************************/
 
-#include "emumain.h"
-#include <stdio.h>
+#include "emucfg.h"
+#include "common/video_driver.h"
+#include "common/video_geometry.h"
+#include <string.h>
 
 #include <stdlib.h>
 #include <assert.h>
 #include <kernel.h>
 #include <malloc.h>
 #include <gsKit.h>
-#include <gsInit.h>
 #include <dmaKit.h>
 #include <gsToolkit.h>
-extern void boot_log(const char *);
+#include <screenshot.h>
 
 #include <gsInline.h>
 #include <gsCore.h>
+
+#include "ps2/ps2_video.h"
 
 
 /******************************************************************************
@@ -30,6 +33,8 @@ extern void boot_log(const char *);
 /* turn black GS Screen */
 #define GS_BLACK GS_SETREG_RGBA(0x00, 0x00, 0x00, 0x80)
 
+/* Alpha blending: Cs*As + Cd*(1-As) */
+#define GS_ALPHA_BLEND GS_SETREG_ALPHA(0, 1, 0, 1, 0)
 /******************************************************************************
  * PS2 CLUT (Color Look-Up Table) Architecture
  * ============================================
@@ -66,7 +71,7 @@ extern void boot_log(const char *);
  *   CLUT lookup = Bank base + (N * 256) + P
  *
  * Example - CPS1 SCROLL3 with palette index 5:
- *   - Texture pixels encoded as 0x50-0x5F (via color_table[5])
+ *   - Texture pixels encoded as 0x50-0x5F (via sprite_color_table[5])
  *   - current_clut = &clut[96 << 4] = &clut[1536]
  *   - COV = 1536 / 256 = 6
  *   - Pixel 0x55 → CLUT entry 6*256 + 0x55 = 1621
@@ -92,7 +97,13 @@ extern void boot_log(const char *);
  * Using BUF_WIDTH (512) ensures all targets fit.
  */
 #define RENDER_SCREEN_WIDTH BUF_WIDTH
+#if defined(GUI)
+/* The GUI caches full_rect (480x272) into SCREEN_BITMAP. */
+#define RENDER_SCREEN_HEIGHT SCR_HEIGHT
+#else
+/* Preserve the original game render target height. */
 #define RENDER_SCREEN_HEIGHT 264
+#endif
 
 typedef struct texture_layer {
 	GSTEXTURE *texture;
@@ -103,9 +114,20 @@ typedef struct ps2_video {
 	gs_rgbaq clearScreenColor;
 	gs_texclut currentTexclut;
 	GSGLOBAL *gsGlobal;
-	bool drawExtraInfo;
 
 	GSTEXTURE *scrbitmap;
+
+#if defined(GUI)
+	/* Legacy PSP GUI code historically had a dedicated 16-bit `tex_frame`
+	 * scratch surface.  COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER ended up
+	 * being used for that scratch during the driver abstraction, but on PS2 the
+	 * real layer 0 may be an indexed T8 atlas.  Keep a separate CT16 scratch
+	 * surface so GUI/NCDZ/title/state operations do not corrupt the emulator
+	 * atlas or reinterpret T8 storage as 16-bit pixels. */
+	GSTEXTURE *ui_scratch;
+	uint8_t *ui_scratch_mem;
+	uint8_t ui_scratch_cpu_dirty;
+#endif
 
 	/* CLUT configuration from emu_clut_info */
 	uint16_t *clut_base;
@@ -124,10 +146,10 @@ typedef struct ps2_video {
 
 	void *vram_cluts;
 	uint32_t clut_vram_size;
-	uint32_t finish_callback_id;
+	int32_t finish_callback_id;
 } ps2_video_t;
 
-static uint32_t finish_sema_id = 0;
+static int32_t finish_sema_id = -1;
 
 /*--------------------------------------------------------
 	Video Processing Initialization
@@ -135,7 +157,8 @@ static uint32_t finish_sema_id = 0;
 
 static int finish_handler(int reason)
 {
-	if (GS_CSR_FINISH) {
+	(void)reason;
+	if (GS_CSR_FINISH && finish_sema_id >= 0) {
 		iSignalSema(finish_sema_id);
 	}
 
@@ -143,33 +166,20 @@ static int finish_handler(int reason)
    return 0;
 }
 
-/*
- * Sleep-on-vsync replacement for gsKit's busy-wait vsync.
- *
- * gsKit_sync_flip() -> gsKit_vsync_wait() polls GS_CSR in a while loop,
- * pinning the EE core for the whole ~16.7ms of a frame.  The PSP original
- * waits on sceDisplayWaitVblankStart (a sleep).  With the busy wait the
- * main thread never yields, so the high-load sound thread (YM2151 + OKI,
- * priority 0x08) only gets CPU at interrupt scheduling points and its
- * 33ms/render audio blocks underrun -> stuttering.  We instead sleep on a
- * semaphore signalled by the VBLANK interrupt, exactly like the PSP.
- */
-static int vsync_sema_id = -1;
-static int vsync_callback_id = -1;
-
-static int vsync_handler(int reason)
+/* Public accessor used by ps2_ui_draw.c. */
+void *ps2_video_get_gsGlobal(void *video_data)
 {
-	(void)reason;
-	if (vsync_sema_id >= 0)
-		iSignalSema(vsync_sema_id);
-
-	ExitHandler();
-	return 0;
+	ps2_video_t *ps2 = (ps2_video_t *)video_data;
+	return ps2 ? ps2->gsGlobal : NULL;
 }
 
 static GSTEXTURE *initializeTexture(GSGLOBAL *gsGlobal, int width, int height, uint8_t bytes_per_pixel, void *mem) {
 	GSTEXTURE *tex = (GSTEXTURE *)calloc(1, sizeof(GSTEXTURE));
 	uint32_t psm = bytes_per_pixel == 1 ? GS_PSM_T8 : GS_PSM_CT16;
+
+	if (!tex)
+		return NULL;
+
 	tex->Width = width;
 	tex->Height = height;
 	tex->PSM = psm;
@@ -180,6 +190,10 @@ static GSTEXTURE *initializeTexture(GSGLOBAL *gsGlobal, int width, int height, u
 	tex->Filter = GS_FILTER_NEAREST;
 	tex->Mem = mem;
 	tex->Vram = gsKit_vram_alloc(gsGlobal, gsKit_texture_size(width, height, psm), GSKIT_ALLOC_USERBUFFER);
+	if (tex->Vram == GSKIT_ALLOC_ERROR) {
+		free(tex);
+		return NULL;
+	}
 
 	gsKit_setup_tbw(tex);
 	return tex;
@@ -187,15 +201,82 @@ static GSTEXTURE *initializeTexture(GSGLOBAL *gsGlobal, int width, int height, u
 
 static GSTEXTURE *initializeRenderTexture(GSGLOBAL *gsGlobal, int width, int height) {
 	GSTEXTURE *tex = (GSTEXTURE *)calloc(1, sizeof(GSTEXTURE));
+
+	if (!tex)
+		return NULL;
+
 	tex->Width = width;
 	tex->Height = height;
 	tex->PSM = GS_PSM_CT16;
 	tex->Filter = GS_FILTER_NEAREST;
 	tex->Mem = 0;
 	tex->Vram = gsKit_vram_alloc(gsGlobal, gsKit_texture_size(width, height, GS_PSM_CT16), GSKIT_ALLOC_USERBUFFER);
+	if (tex->Vram == GSKIT_ALLOC_ERROR) {
+		free(tex);
+		return NULL;
+	}
 
 	gsKit_setup_tbw(tex);
 	return tex;
+}
+
+#if defined(GUI)
+static GSTEXTURE *initializeCpuTexture(GSGLOBAL *gsGlobal, int width, int height,
+	uint8_t bytes_per_pixel, void **out_mem)
+{
+	size_t size = (size_t)width * height * bytes_per_pixel;
+	void *mem = memalign(64, size);
+	if (!mem)
+		return NULL;
+
+	memset(mem, 0, size);
+	GSTEXTURE *texture = initializeTexture(gsGlobal, width, height,
+		bytes_per_pixel, mem);
+	if (!texture) {
+		free(mem);
+		return NULL;
+	}
+
+	*out_mem = mem;
+	return texture;
+}
+#endif
+
+static void ps2_cleanup_failed_init(ps2_video_t *ps2)
+{
+	if (!ps2)
+		return;
+
+#if defined(GUI)
+	free(ps2->ui_scratch_mem);
+	ps2->ui_scratch_mem = NULL;
+	free(ps2->ui_scratch);
+	ps2->ui_scratch = NULL;
+#endif
+
+	if (ps2->tex_layers) {
+		for (int i = 0; i < ps2->tex_layers_count; i++)
+			free(ps2->tex_layers[i].texture);
+	}
+	free(ps2->tex_layers);
+	ps2->tex_layers = NULL;
+	free(ps2->texturesMem);
+	ps2->texturesMem = NULL;
+	free(ps2->scrbitmap);
+	ps2->scrbitmap = NULL;
+
+	if (ps2->gsGlobal) {
+		gsKit_vram_clear(ps2->gsGlobal);
+		gsKit_deinit_global(ps2->gsGlobal);
+		ps2->gsGlobal = NULL;
+	}
+
+	if (finish_sema_id >= 0) {
+		DeleteSema(finish_sema_id);
+		finish_sema_id = -1;
+	}
+
+	free(ps2);
 }
 
 static inline void *ps2_vramClutForBankIndex(void *data, uint8_t bank_index) {
@@ -216,16 +297,27 @@ static inline gs_texclut ps2_textclutForParameters(void *data, uint16_t *current
 void gsKit_custom_clear(GSGLOBAL *gsGlobal, gs_rgbaq color, uint16_t width, uint16_t height)
 {
 	u8 PrevZState;
-	u8 strips;
-	u8 remain;
+	u8 PrevAlphaTestState;
+	int PrevAlphaState;
 	u8 index;
-	u32 pos;
 	u8 slices = (width + 63)/ 64;
 	u32 count = (slices * 2) + 1;
 	u128 flat_content[count];
 
 	PrevZState = gsGlobal->Test->ZTST;
-	gsKit_set_test(gsGlobal, GS_ZTEST_OFF);
+	PrevAlphaTestState = gsGlobal->Test->ATE;
+	PrevAlphaState = gsGlobal->PrimAlphaEnable;
+	/* Clears are unconditional writes.  The normal game state enables a
+	 * TEQUAL/AREF=0 alpha test for indexed sprites; leaving that state active
+	 * rejects opaque clear colors (including the GUI's blue background) and
+	 * leaves stale pixels from the previous screen behind. */
+	gsGlobal->Test->ZTST = 1;
+	gsGlobal->Test->ATE = 0;
+	gsKit_set_test(gsGlobal, 0);
+	/* A clear must replace the render target.  PrimAlphaEnable is normally ON
+	 * for the emulator's textured primitives, but leaving it enabled here
+	 * makes the clear sprite blend with the previous framebuffer contents. */
+	gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
 
 	flat_content[0] = color.rgbaq;
 	for (index = 0; index < slices; index++)
@@ -235,7 +327,9 @@ void gsKit_custom_clear(GSGLOBAL *gsGlobal, gs_rgbaq color, uint16_t width, uint
 	}
 	gsKit_prim_list_sprite_flat(gsGlobal, count, flat_content);
 
+	gsGlobal->PrimAlphaEnable = PrevAlphaState;
 	gsGlobal->Test->ZTST = PrevZState;
+	gsGlobal->Test->ATE = PrevAlphaTestState;
 	gsKit_set_test(gsGlobal, 0);
 }
 
@@ -258,6 +352,43 @@ static inline void gsKit_setRegFrame(GSGLOBAL *gsGlobal, uint32_t fbp, uint32_t 
 	*p_data++ = GS_SETREG_SCISSOR_1(0, width - 1, 0, height - 1);
 	*p_data++ = GS_SCISSOR_1;
 }
+
+static inline void ps2_flushTextureCache(GSGLOBAL *gsGlobal)
+{
+	u64 *p_data;
+	u64 *p_store;
+	const int qsize = 1;
+
+	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, qsize * 16, GIF_AD);
+
+	if (p_store == gsGlobal->CurQueue->last_tag)
+	{
+		*p_data++ = GIF_TAG_AD(qsize);
+		*p_data++ = GIF_AD;
+	}
+
+	*p_data++ = 0;
+	*p_data++ = GS_TEXFLUSH;
+}
+
+#if defined(GUI)
+static void ps2_syncUiScratchToVram(ps2_video_t *ps2)
+{
+	if (!ps2->ui_scratch || !ps2->ui_scratch_cpu_dirty)
+		return;
+
+	size_t size = gsKit_texture_size_ee(ps2->ui_scratch->Width,
+		ps2->ui_scratch->Height, ps2->ui_scratch->PSM);
+	SyncDCache(ps2->ui_scratch->Mem,
+		(uint8_t *)ps2->ui_scratch->Mem + size);
+	gsKit_texture_send_inline(ps2->gsGlobal,
+		(u32 *)ps2->ui_scratch->Mem,
+		ps2->ui_scratch->Width, ps2->ui_scratch->Height,
+		ps2->ui_scratch->Vram, ps2->ui_scratch->PSM,
+		ps2->ui_scratch->TBW, GS_CLUT_NONE);
+	ps2->ui_scratch_cpu_dirty = 0;
+}
+#endif
 
 static inline void gsKit_renderToScreen(GSGLOBAL *gsGlobal)
 {
@@ -325,8 +456,13 @@ static inline u32 lzw(u32 val)
 
 static inline void gsKit_wait_finish(GSGLOBAL *gsGlobal)
 {
+	if (gsGlobal->FirstFrame)
+		return;
+	if (finish_sema_id < 0)
+		return;
+
 	if (!GS_CSR_FINISH)
-    	WaitSema(finish_sema_id);
+		WaitSema(finish_sema_id);
 
    	while (PollSema(finish_sema_id) >= 0);
 }
@@ -334,34 +470,32 @@ static inline void gsKit_wait_finish(GSGLOBAL *gsGlobal)
 static inline void gsKit_set_tw_th(const GSTEXTURE *Texture, int *tw, int *th)
 {
 	*tw = 31 - (lzw(Texture->Width) + 1);
-	if(Texture->Width > (1<<*tw))
+	if(Texture->Width > (u32)(1U << *tw))
 		(*tw)++;
 
 	*th = 31 - (lzw(Texture->Height) + 1);
-	if(Texture->Height > (1<<*th))
+	if(Texture->Height > (u32)(1U << *th))
 		(*th)++;
 }
 
-static inline void gskit_prim_list_sprite_texture_uv_flat_color2(GSGLOBAL *gsGlobal, const GSTEXTURE *Texture, gs_rgbaq color, int count, const GSPRIMUVPOINTFLAT *vertices)
+static inline GSPRIMUVPOINTFLAT *ps2_beginSpriteTextureList(
+	GSGLOBAL *gsGlobal, const GSTEXTURE *Texture, gs_rgbaq color, int count)
 {
-	u64* p_data;
-	u64* p_store;
+	u64 *p_data;
+	u64 *p_store;
 	int tw, th;
-
 	int qsize = (count * 2) + 3;
-	int bytes = count * sizeof(GSPRIMUVPOINTFLAT);
 
 	gsKit_set_tw_th(Texture, &tw, &th);
+	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, qsize * 16, GIF_AD);
 
-	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, (qsize*16), GIF_AD);
-
-	if(p_store == gsGlobal->CurQueue->last_tag)
+	if (p_store == gsGlobal->CurQueue->last_tag)
 	{
 		*p_data++ = GIF_TAG_AD(qsize);
 		*p_data++ = GIF_AD;
 	}
 
-	if(Texture->VramClut == 0)
+	if (Texture->VramClut == 0)
 	{
 		*p_data++ = GS_SETREG_TEX0(Texture->Vram/256, Texture->TBW, Texture->PSM,
 			tw, th, gsGlobal->PrimAlphaEnable, 0,
@@ -371,197 +505,104 @@ static inline void gskit_prim_list_sprite_texture_uv_flat_color2(GSGLOBAL *gsGlo
 	{
 		*p_data++ = GS_SETREG_TEX0(Texture->Vram/256, Texture->TBW, Texture->PSM,
 			tw, th, gsGlobal->PrimAlphaEnable, 0,
-			Texture->VramClut/256, Texture->ClutPSM, Texture->ClutStorageMode, 0, GS_CLUT_STOREMODE_LOAD);
+			Texture->VramClut/256, Texture->ClutPSM, Texture->ClutStorageMode, 0,
+			GS_CLUT_STOREMODE_LOAD);
 	}
 	*p_data++ = GS_TEX0_1 + gsGlobal->PrimContext;
 
-	*p_data++ = GS_SETREG_PRIM( GS_PRIM_PRIM_SPRITE, 0, 1, gsGlobal->PrimFogEnable,
-				gsGlobal->PrimAlphaEnable, gsGlobal->PrimAAEnable,
-				1, gsGlobal->PrimContext, 0);
-
+	*p_data++ = GS_SETREG_PRIM(GS_PRIM_PRIM_SPRITE, 0, 1, gsGlobal->PrimFogEnable,
+		gsGlobal->PrimAlphaEnable, gsGlobal->PrimAAEnable,
+		1, gsGlobal->PrimContext, 0);
 	*p_data++ = GS_PRIM;
 
-	// Copy color
 	memcpy(p_data, &color, sizeof(gs_rgbaq));
-	p_data += 2; // Advance 2 u64, which is 16 bytes the gs_rgbaq struct size
-	// Copy vertices
-	memcpy(p_data, vertices, bytes);
+	p_data += 2;
+	return (GSPRIMUVPOINTFLAT *)p_data;
 }
 
-/* Triangle version of the above: same GIF layout but PRIM=TRIANGLE so the
- * texture quad can be drawn with arbitrary vertex positions (needed for the
- * 90-degree rotate blit - a GS sprite is always axis-aligned).  count must
- * be a multiple of 3. */
-static inline void gskit_prim_list_triangle_texture_uv_flat(GSGLOBAL *gsGlobal, const GSTEXTURE *Texture, gs_rgbaq color, int count, const GSPRIMUVPOINTFLAT *vertices)
+static inline void gskit_prim_list_sprite_texture_uv_flat_color2(
+	GSGLOBAL *gsGlobal, const GSTEXTURE *Texture, gs_rgbaq color, int count,
+	const GSPRIMUVPOINTFLAT *vertices)
 {
-	u64* p_data;
-	u64* p_store;
-	int tw, th;
+	GSPRIMUVPOINTFLAT *destination =
+		ps2_beginSpriteTextureList(gsGlobal, Texture, color, count);
+	memcpy(destination, vertices, (size_t)count * sizeof(*vertices));
+}
 
-	int qsize = (count * 2) + 3;
-	int bytes = count * sizeof(GSPRIMUVPOINTFLAT);
+static inline GSPRIMPOINT *ps2_beginPointList(GSGLOBAL *gsGlobal, int count)
+{
+	u64 *p_data;
+	u64 *p_store;
+	int qsize = count * 2 + 2;
 
-	gsKit_set_tw_th(Texture, &tw, &th);
+	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, qsize * 16, GIF_AD);
+	*p_data++ = GIF_TAG_AD(qsize);
+	*p_data++ = GIF_AD;
 
-	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, (qsize*16), GIF_AD);
-
-	if(p_store == gsGlobal->CurQueue->last_tag)
+	if (p_store == gsGlobal->CurQueue->last_tag)
 	{
-		*p_data++ = GIF_TAG_AD(qsize);
-		*p_data++ = GIF_AD;
+		*p_data++ = GIF_TAG_POINT(count - 1);
+		*p_data++ = GIF_TAG_POINT_REGS;
 	}
 
-	if(Texture->VramClut == 0)
-	{
-		*p_data++ = GS_SETREG_TEX0(Texture->Vram/256, Texture->TBW, Texture->PSM,
-			tw, th, gsGlobal->PrimAlphaEnable, 0,
-			0, 0, 0, 0, GS_CLUT_STOREMODE_NOLOAD);
-	}
-	else
-	{
-		*p_data++ = GS_SETREG_TEX0(Texture->Vram/256, Texture->TBW, Texture->PSM,
-			tw, th, gsGlobal->PrimAlphaEnable, 0,
-			Texture->VramClut/256, Texture->ClutPSM, Texture->ClutStorageMode, 0, GS_CLUT_STOREMODE_LOAD);
-	}
-	*p_data++ = GS_TEX0_1 + gsGlobal->PrimContext;
-
-	*p_data++ = GS_SETREG_PRIM( GS_PRIM_PRIM_TRIANGLE, 0, 1, gsGlobal->PrimFogEnable,
-				gsGlobal->PrimAlphaEnable, gsGlobal->PrimAAEnable,
-				1, gsGlobal->PrimContext, 0);
-
+	*p_data++ = GS_SETREG_PRIM(GS_PRIM_PRIM_POINT, 0, 0, gsGlobal->PrimFogEnable,
+		gsGlobal->PrimAlphaEnable, gsGlobal->PrimAAEnable,
+		0, gsGlobal->PrimContext, 0);
 	*p_data++ = GS_PRIM;
-
-	// Copy color
-	memcpy(p_data, &color, sizeof(gs_rgbaq));
-	p_data += 2; // Advance 2 u64, which is 16 bytes the gs_rgbaq struct size
-	// Copy vertices
-	memcpy(p_data, vertices, bytes);
+	return (GSPRIMPOINT *)p_data;
 }
 
-static void *ps2_workFrame(void *data)
+static void ps2_getOutputSize(void *data, int *width, int *height)
 {
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-	return (void *)ps2->scrbitmap->Vram;
-}
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	int w = SCR_WIDTH;
+	int h = SCR_HEIGHT;
 
-static void *ps2_textureLayer(void *data, uint8_t layerIndex)
-{
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-	return ps2->tex_layers[layerIndex].texture->Mem;
+	if (ps2 && ps2->gsGlobal) {
+		w = ps2->gsGlobal->Width;
+		h = ps2->gsGlobal->Height;
+	}
+	if (width) *width = w;
+	if (height) *height = h;
 }
 
 static void ps2_flipScreen(void *data, bool vsync);
 
-/* Saved target params for deferred game-texture allocation (set by ps2_init,
- * consumed by ps2_video_switch_game_mode). */
-static layer_texture_info_t *ps2_saved_layer_textures = NULL;
-static uint8_t ps2_saved_layer_textures_count = 0;
-static clut_info_t *ps2_saved_clut_info = NULL;
-static ps2_video_t *ps2_global = NULL;
-
-static inline void ps2_setZBufMask(GSGLOBAL *gsGlobal, uint8_t zmsk) {
-	u64 *p_data;
-	u64 *p_store;
-	int qsize = 1;
-
-	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, (qsize * 16), GIF_AD);
-
-	if (p_store == gsGlobal->CurQueue->last_tag) {
-		*p_data++ = GIF_TAG_AD(qsize);
-		*p_data++ = GIF_AD;
-	}
-
-	*p_data++ = GS_SETREG_ZBUF(gsGlobal->ZBuffer / 8192, gsGlobal->PSMZ, zmsk);
-	*p_data++ = GS_ZBUF_1 + gsGlobal->PrimContext;
-}
-
-/*--------------------------------------------------------
-	Z-buffer sizing helper
-
-	gsKit_init_screen() sizes the Z-buffer from the DISPLAY resolution.
-	Rendering, however, happens into the scrbitmap
-	(RENDER_SCREEN_WIDTH x RENDER_SCREEN_HEIGHT), and the GS writes Z at
-	the *current frame buffer's* pitch. On 224P/240P the display-sized
-	Z-buffer (384x224x2 = 172 KB) is smaller than what the scrbitmap needs
-	(512x264x2 = 270 KB), so Z writes overran into the scrbitmap and
-	painted black blocks over the top of the picture. Re-allocate it.
---------------------------------------------------------*/
-static void ps2_realloc_zbuffer(GSGLOBAL *gsGlobal)
-{
-	uint32_t need = gsKit_texture_size(RENDER_SCREEN_WIDTH,
-		RENDER_SCREEN_HEIGHT, GS_PSM_CT16);
-	uint32_t have = gsKit_texture_size(gsGlobal->Width, gsGlobal->Height,
-		gsGlobal->PSMZ);
-
-	if (have >= need)
-		return;   /* display Z-buffer already big enough (480i builds) */
-
-	uint32_t zb = gsKit_vram_alloc(gsGlobal, need, GSKIT_ALLOC_SYSBUFFER);
-	if (zb >= 4194304U) {
-		printf("ZBUF: re-alloc FAILED (need %u), keeping %u\n", need,
-			gsGlobal->ZBuffer);
-		return;
-	}
-	printf("ZBUF: %u -> %u (need %u for %dx%d render target)\n",
-		gsGlobal->ZBuffer, zb, need,
-		RENDER_SCREEN_WIDTH, RENDER_SCREEN_HEIGHT);
-	gsGlobal->ZBuffer = zb;
-
-	/* Re-point the GS and leave Z writes disabled until a target
-	 * explicitly enables depth testing (ps2_enableDepthTest). */
-	ps2_setZBufMask(gsGlobal, 1);
-}
-
-/*--------------------------------------------------------
-	Wait until the GS has consumed everything queued so far
-
-	The menu uploads its texture with gsKit_texture_send(), which runs as
-	an asynchronous DMA chain. Queueing the draw immediately afterwards
-	sampled a texture that had not landed in VRAM yet, so the right-hand
-	part of the menu (the panel's right border) never appeared.
---------------------------------------------------------*/
-void ps2_wait_gs_idle(void)
-{
-	ps2_video_t *ps2 = ps2_global;
-	if (!ps2 || !ps2->gsGlobal)
-		return;
-	gsKit_queue_exec(ps2->gsGlobal);
-	gsKit_wait_finish(ps2->gsGlobal);
-}
-
 static void *ps2_init(layer_texture_info_t *layer_textures, uint8_t layer_textures_count, clut_info_t *clut_info)
 {
 	ee_sema_t sema;
-	ps2_video_t *ps2 = (ps2_video_t*)calloc(1, sizeof(ps2_video_t));
-	boot_log("[S4] video ps2_init start");
-	GSGLOBAL *gsGlobal = gsKit_init_global();
-	boot_log("[S5] after gsKit_init_global");
+	ps2_video_t *ps2;
+	GSGLOBAL *gsGlobal;
+
+	ps2 = (ps2_video_t*)calloc(1, sizeof(ps2_video_t));
+	if (!ps2)
+		return NULL;
+	ps2->finish_callback_id = -1;
+
+	gsGlobal = gsKit_init_global();
+	if (!gsGlobal) {
+		free(ps2);
+		return NULL;
+	}
 
    	sema.init_count = 0;
    	sema.max_count  = 1;
    	sema.option     = 0;
 
-   	finish_sema_id   = CreateSema(&sema);
+	finish_sema_id = CreateSema(&sema);
+	if (finish_sema_id < 0) {
+		gsKit_deinit_global(gsGlobal);
+		free(ps2);
+		return NULL;
+	}
 
-	/* Sleep-style vsync: create the semaphore and hook the VBLANK
-	 * interrupt (see vsync_handler above).  gsKit_add_vsync_handler()
-	 * enables INTC_VBLANK_S and unmasks the VSync IMR bit. */
-   	vsync_sema_id    = CreateSema(&sema);
-	vsync_callback_id = gsKit_add_vsync_handler(vsync_handler);
-
-	/* Pure 224P/240P build: menu and game share the same progressive
-	 * low-res framebuffer (one VRAM layout, memory-efficient).
-	 * CPS1/CPS2 native = 384x224 (224p); MVS/NCDZ = 320x240 (240p). */
+	/* NJEMU's emulated systems run around 60 Hz and the common frame scheduler
+	 * may use VSync as part of its limiter (CPS2 enables it by default).
+	 * gsKit's automatic PAL detection would make that wait run at 50 Hz on
+	 * European consoles and slow emulation down. Keep the historical NTSC
+	 * 60-Hz output deliberately, even on PAL-region PS2 hardware. */
 	gsGlobal->Mode = GS_MODE_NTSC;
-#if (EMU_SYSTEM == MVS) || (EMU_SYSTEM == NCDZ)
-	gsGlobal->Width  = 320;
-	gsGlobal->Height = 240;
-#else
-	gsGlobal->Width  = 384;
-	gsGlobal->Height = 224;
-#endif
-	gsGlobal->Interlace = GS_NONINTERLACED;
-	gsGlobal->Field     = GS_FRAME;
+	gsGlobal->Height = 448;
 
 	gsGlobal->PSM  = GS_PSM_CT16;
 	gsGlobal->PSMZ = GS_PSMZ_16S;
@@ -572,7 +613,9 @@ static void *ps2_init(layer_texture_info_t *layer_textures, uint8_t layer_textur
 
 	gsKit_set_test(gsGlobal, GS_ATEST_ON);
 
-	// Do not draw pixels if they are fully transparent
+	/* Indexed game textures use the legacy CT16 alpha convention expected by
+	 * the original PS2 backend: only alpha == 0 passes.  UI textures manage
+	 * their alpha-test state locally in ps2_ui_draw.c. */
 	gsGlobal->Test->ATE  = GS_SETTING_ON;
 	gsGlobal->Test->ATST = 4; // TEQUAL to AREF passes
 	gsGlobal->Test->AREF = 0x00;
@@ -584,21 +627,6 @@ static void *ps2_init(layer_texture_info_t *layer_textures, uint8_t layer_textur
 	gsKit_vram_clear(gsGlobal);
 
 	gsKit_init_screen(gsGlobal);
-	boot_log("[S6] after gsKit_init_screen");
-
-	/* ---- Z-buffer must be sized for the RENDER TARGET, not the display ----
-	 * The GS writes Z using the width of the CURRENT frame buffer. All game
-	 * rendering goes into the scrbitmap (RENDER_SCREEN_WIDTH x
-	 * RENDER_SCREEN_HEIGHT = 512x264), but gsKit_init_screen() sized the
-	 * Z-buffer from the DISPLAY resolution:
-	 *       224P/240P : 384x224x2 = 172 KB  <-- far too small (need 270 KB)
-	 *       480i      : 640x448x2 = 560 KB  <-- big enough, never overran
-	 * VRAM is one pointer growing upward (framebuffers, Z-buffer, scrbitmap,
-	 * tile textures, CLUT...), so with a 512-texel pitch every sprite drawn
-	 * at scrbitmap y >= 168 wrote past the Z-buffer and straight into the
-	 * scrbitmap, painting black blocks over the top of the picture.
-	 * Re-allocate the Z-buffer at render-target size and re-point the GS. */
-	ps2_realloc_zbuffer(gsGlobal);
 
 	/* Default depth test to "always pass" so Z-buffering doesn't
 	   interfere with targets that don't need it (CPS1, MVS, NCDZ).
@@ -609,34 +637,46 @@ static void *ps2_init(layer_texture_info_t *layer_textures, uint8_t layer_textur
     gsKit_clear(gsGlobal, GS_BLACK);
 	ps2->gsGlobal = gsGlobal;
 
-	/* FIX: no vsync handler (pad I/O in VBLANK ISR stalled hardware). */
-
-	/* Game textures allocated here (menu and game share the same 224P/240P
-	 * framebuffer, so they coexist in VRAM like the original build). */
-	ps2_saved_layer_textures = layer_textures;
-	ps2_saved_layer_textures_count = layer_textures_count;
-	ps2_saved_clut_info = clut_info;
-
 	// Original buffers containing clut indexes
 	size_t totalTextureSize = 0;
 	for (int i = 0; i < layer_textures_count; i++) {
-		totalTextureSize += layer_textures[i].width * layer_textures[i].height;
+		totalTextureSize += layer_textures[i].width * layer_textures[i].height *
+			layer_textures[i].bytes_per_pixel;
 	}
 	uint8_t *textures = (uint8_t*)malloc(totalTextureSize);
+	if (!textures) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
 	ps2->texturesMem = textures;
 
 	// Initialize textures
 	ps2->tex_layers = (texture_layer_t *)calloc(layer_textures_count, sizeof(texture_layer_t));
+	if (!ps2->tex_layers) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
 	ps2->tex_layers_count = layer_textures_count;
 
 	ps2->scrbitmap = initializeRenderTexture(gsGlobal, RENDER_SCREEN_WIDTH, RENDER_SCREEN_HEIGHT);
+	if (!ps2->scrbitmap) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
+
 	size_t texOffset = 0;
 	for (int i = 0; i < layer_textures_count; i++) {
 		ps2->tex_layers[i].texture = initializeTexture(gsGlobal, layer_textures[i].width, layer_textures[i].height, layer_textures[i].bytes_per_pixel, textures + texOffset);
-		texOffset += layer_textures[i].width * layer_textures[i].height;
+		if (!ps2->tex_layers[i].texture) {
+			ps2_cleanup_failed_init(ps2);
+			return NULL;
+		}
+		texOffset += layer_textures[i].width * layer_textures[i].height *
+			layer_textures[i].bytes_per_pixel;
 	}
 
-	/* Store CLUT configuration from target. */
+	/* Store CLUT configuration from target.
+	 * Bank height is entries_per_bank / CLUT_WIDTH, rounded up to ensure full coverage. */
 	ps2->clut_base = clut_info->base;
 	ps2->clut_entries_per_bank = clut_info->entries_per_bank;
 	ps2->clut_bank_count = clut_info->bank_count;
@@ -646,207 +686,77 @@ static void *ps2_init(layer_texture_info_t *layer_textures, uint8_t layer_textur
 	uint32_t clut_vram_size = gsKit_texture_size(CLUT_WIDTH, CLUT_HEIGHT * ps2->clut_bank_height, GS_PSM_CT16);
 	uint32_t all_clut_vram_size = clut_vram_size * ps2->clut_bank_count;
 	void *vram_cluts = (void *)gsKit_vram_alloc(gsGlobal, all_clut_vram_size, GSKIT_ALLOC_USERBUFFER);
-	printf("CLUT VRAM: %p (banks=%d, entries/bank=%d, height=%d, size/bank=%u)\n",
-		   vram_cluts, ps2->clut_bank_count, ps2->clut_entries_per_bank, ps2->clut_bank_height, clut_vram_size);
+	if ((uintptr_t)vram_cluts == (uintptr_t)GSKIT_ALLOC_ERROR) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
+	printf("CLUT VRAM: %p (banks=%d, entries/bank=%d, height=%d, size/bank=%lu)\n",
+		   vram_cluts, ps2->clut_bank_count, ps2->clut_entries_per_bank, ps2->clut_bank_height, (unsigned long)clut_vram_size);
 	ps2->clut_vram_size = clut_vram_size;
 	ps2->vram_cluts = vram_cluts;
 
-	ps2->vertexColor = color_to_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
-	ps2->clearScreenColor = color_to_RGBAQ(0x00, 0x00, 0x00, 0x0, 0);
+#if defined(GUI)
+	/* Allocate GUI-only VRAM after mandatory game atlases and CLUTs. */
+	ps2->ui_scratch = initializeCpuTexture(gsGlobal, BUF_WIDTH, SCR_HEIGHT, 2,
+		(void **)&ps2->ui_scratch_mem);
+	if (!ps2->ui_scratch) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
+#endif
 
-	ui_init();
+	ps2->vertexColor = color_to_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
+	ps2->clearScreenColor = color_to_RGBAQ(0x00, 0x00, 0x00, 0x80, 0);
 
 	ps2->finish_callback_id = gsKit_add_finish_handler(finish_handler);
+	if (ps2->finish_callback_id < 0) {
+		ps2_cleanup_failed_init(ps2);
+		return NULL;
+	}
 
 	video_driver->clearFrame(ps2, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER);
 	video_driver->clearFrame(ps2, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER);
 	video_driver->clearFrame(ps2, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP);
 	ps2_flipScreen(ps2, true);
 
-	ps2->drawExtraInfo = false;
-
-	
-#if 0 /* DEBUG LOG DISABLED (v16 cleanup): no njemu_video.txt output */
- {
-  static const char *vouts[] = {
-   "mass:/njemu_video.txt", "mass0:/njemu_video.txt",
-   "mc0:/njemu_video.txt", "host:/njemu_video.txt", NULL
-  };
-  int vi;
-  FILE *vf = NULL;
-  for (vi = 0; vouts[vi] != NULL; vi++) {
-   vf = fopen(vouts[vi], "w");
-   if (vf != NULL) break;
-  }
-  if (vf != NULL) {
-   fprintf(vf, "NJEMU video init OK\n");
-   fprintf(vf, "Mode: %s\n", (gsGlobal->Mode == GS_MODE_PAL) ? "PAL" : "NTSC");
-   fprintf(vf, "Interlace: %s\n", (gsGlobal->Interlace == GS_INTERLACED) ? "INTERLACED" : "NONINTERLACED");
-   fprintf(vf, "Framebuffer: %dx%d\n", gsGlobal->Width, gsGlobal->Height);
-   fprintf(vf, "PSM: 0x%02x\n", gsGlobal->PSM);
-   fclose(vf);
-  }
- }
-#endif /* DEBUG LOG DISABLED */
-	ps2_global = ps2;
-	boot_log("[S7] video ps2_init end");
-return ps2;
+	return ps2;
 }
 
-
-
-/* Switch video to GAME mode: 224P (CPS1/CPS2) or 240P (MVS/NCDZ)
- * progressive. Clears VRAM and allocates the game textures. */
-void ps2_video_switch_game_mode(void)
-{
-	ps2_video_t *ps2 = ps2_global;
-	if (!ps2) return;
-	GSGLOBAL *gsGlobal = ps2->gsGlobal;
-
-	gsKit_vram_clear(gsGlobal);
-
-	/* Progressive low-res output (CRT / 240p-capable displays only). */
-#if (EMU_SYSTEM == MVS) || (EMU_SYSTEM == NCDZ)
-	gsGlobal->Width  = 320;
-	gsGlobal->Height = 240;
-#else
-	gsGlobal->Width  = 384;
-	gsGlobal->Height = 224;
-#endif
-	gsGlobal->Interlace = GS_NONINTERLACED;
-	gsGlobal->Field     = GS_FRAME;
-
-	gsKit_init_screen(gsGlobal);
-	/* Same reason as in ps2_init: the Z-buffer must fit the scrbitmap the
-	 * game renders into, not the (smaller) display resolution. */
-	ps2_realloc_zbuffer(gsGlobal);
-
-	gsKit_mode_switch(gsGlobal, GS_ONESHOT);
-	gsKit_clear(gsGlobal, GS_BLACK);
-
-	/* Allocate game textures (moved from ps2_init). */
-	layer_texture_info_t *layer_textures = ps2_saved_layer_textures;
-	uint8_t layer_textures_count = ps2_saved_layer_textures_count;
-	clut_info_t *clut_info = ps2_saved_clut_info;
-
-	size_t totalTextureSize = 0;
-	for (int i = 0; i < layer_textures_count; i++) {
-		totalTextureSize += layer_textures[i].width * layer_textures[i].height;
-	}
-	uint8_t *textures = (uint8_t*)malloc(totalTextureSize);
-	ps2->texturesMem = textures;
-
-	ps2->tex_layers = (texture_layer_t *)calloc(layer_textures_count, sizeof(texture_layer_t));
-	ps2->tex_layers_count = layer_textures_count;
-
-	ps2->scrbitmap = initializeRenderTexture(gsGlobal, RENDER_SCREEN_WIDTH, RENDER_SCREEN_HEIGHT);
-	size_t texOffset = 0;
-	for (int i = 0; i < layer_textures_count; i++) {
-		ps2->tex_layers[i].texture = initializeTexture(gsGlobal, layer_textures[i].width, layer_textures[i].height, layer_textures[i].bytes_per_pixel, textures + texOffset);
-		texOffset += layer_textures[i].width * layer_textures[i].height;
-	}
-
-	ps2->clut_base = clut_info->base;
-	ps2->clut_entries_per_bank = clut_info->entries_per_bank;
-	ps2->clut_bank_count = clut_info->bank_count;
-	ps2->clut_bank_height = (clut_info->entries_per_bank + CLUT_WIDTH - 1) / CLUT_WIDTH;
-
-	uint32_t clut_vram_size = gsKit_texture_size(CLUT_WIDTH, CLUT_HEIGHT * ps2->clut_bank_height, GS_PSM_CT16);
-	uint32_t all_clut_vram_size = clut_vram_size * ps2->clut_bank_count;
-	void *vram_cluts = (void *)gsKit_vram_alloc(gsGlobal, all_clut_vram_size, GSKIT_ALLOC_USERBUFFER);
-	printf("CLUT VRAM: %p (banks=%d, entries/bank=%d, height=%d, size/bank=%u)\n",
-		   vram_cluts, ps2->clut_bank_count, ps2->clut_entries_per_bank, ps2->clut_bank_height, clut_vram_size);
-	ps2->clut_vram_size = clut_vram_size;
-	ps2->vram_cluts = vram_cluts;
-
-	video_driver->clearFrame(ps2, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP);
-	ps2_flipScreen(ps2, true);
-	boot_log("[GM] game mode 224P/240P");
-}
-
-/* Switch video back to MENU mode: 480i interlaced 640x448.
- * Frees game textures, clears VRAM, resets the menu texture so the next
- * menu_present() re-allocates it. */
-void ps2_video_switch_menu_mode(void)
-{
-	ps2_video_t *ps2 = ps2_global;
-	if (!ps2) return;
-	GSGLOBAL *gsGlobal = ps2->gsGlobal;
-
-	/* Free game-side host buffers. */
-	if (ps2->tex_layers) {
-		for (int i = 0; i < ps2->tex_layers_count; i++) {
-			if (ps2->tex_layers[i].texture) {
-				free(ps2->tex_layers[i].texture);
-				ps2->tex_layers[i].texture = NULL;
-			}
-		}
-		free(ps2->tex_layers);
-		ps2->tex_layers = NULL;
-	}
-	free(ps2->scrbitmap);
-	ps2->scrbitmap = NULL;
-	free(ps2->texturesMem);
-	ps2->texturesMem = NULL;
-	ps2->tex_layers_count = 0;
-
-	gsKit_vram_clear(gsGlobal);
-	/* Menu mode uses the SAME progressive low-res framebuffer as game mode
-	 * (pure 224P/240P build). The old 480i 640x448 interlaced setting made
-	 * the menu a non-uniform stretch of the MENU_W x MENU_H layout, which
-	 * pushed the panel's right border outside the visible area and halved
-	 * the bottom hint lines through field sampling.
-	 * CPS1/CPS2 native = 384x224 (224p); MVS/NCDZ = 320x240 (240p). */
-	gsGlobal->Mode = GS_MODE_NTSC;
-#if (EMU_SYSTEM == MVS) || (EMU_SYSTEM == NCDZ)
-	gsGlobal->Width  = 320;
-	gsGlobal->Height = 240;
-#else
-	gsGlobal->Width  = 384;
-	gsGlobal->Height = 224;
-#endif
-	gsGlobal->Interlace = GS_NONINTERLACED;
-	gsGlobal->Field     = GS_FRAME;
-
-	gsKit_init_screen(gsGlobal);
-	gsKit_mode_switch(gsGlobal, GS_ONESHOT);
-	gsKit_clear(gsGlobal, GS_BLACK);
-
-#ifndef NO_GUI
-	/* Only the GUI build links ps2_gui.c (which provides this); the
-	 * no-GUI build (NO_GUI=ON, the CMake default) must not reference it
-	 * or the link fails with "undefined reference to
-	 * ui_menu_texture_reset". */
-	extern void ui_menu_texture_reset(void);
-	ui_menu_texture_reset();
-#endif
-
-	ps2_flipScreen(ps2, true);
-	boot_log("[MM] menu mode 480i");
-}
 
 /*--------------------------------------------------------
 	Video Processing Termination (Common)
 --------------------------------------------------------*/
 
-static void ps2_exit(ps2_video_t *ps2) {
+static void ps2_free(void *data)
+{
+	ps2_video_t *ps2 = (ps2_video_t*)data;
+
+	if (!ps2)
+		return;
+
+	if (ps2->finish_callback_id >= 0) {
+		gsKit_remove_finish_handler(ps2->finish_callback_id);
+		ps2->finish_callback_id = -1;
+	}
+
 	gsKit_clear(ps2->gsGlobal, GS_BLACK);
 	gsKit_vram_clear(ps2->gsGlobal);
 	gsKit_deinit_global(ps2->gsGlobal);
-	gsKit_remove_finish_handler(ps2->finish_callback_id);
 	if (finish_sema_id >= 0)
-    	DeleteSema(finish_sema_id);
-
-	if (vsync_sema_id >= 0) {
-		if (vsync_callback_id >= 0)
-			gsKit_remove_vsync_handler(vsync_callback_id);
-    	DeleteSema(vsync_sema_id);
-		vsync_sema_id = -1;
-		vsync_callback_id = -1;
+	{
+		DeleteSema(finish_sema_id);
+		finish_sema_id = -1;
 	}
 	
 	free(ps2->scrbitmap);
 	ps2->scrbitmap = NULL;
+
+#if defined(GUI)
+	free(ps2->ui_scratch_mem);
+	ps2->ui_scratch_mem = NULL;
+	free(ps2->ui_scratch);
+	ps2->ui_scratch = NULL;
+#endif
 
 	free(ps2->texturesMem);
 	ps2->texturesMem = NULL;
@@ -858,13 +768,7 @@ static void ps2_exit(ps2_video_t *ps2) {
 	free(ps2->tex_layers);
 	ps2->tex_layers = NULL;
 	// We don't need to free vram, it's done with gsKit_vram_clear
-}
 
-static void ps2_free(void *data)
-{
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-	
-	ps2_exit(ps2);
 	free(ps2);
 }
 
@@ -875,9 +779,8 @@ static void ps2_free(void *data)
 
 static void ps2_waitVsync(void *data)
 {
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-
-	gsKit_sync_flip(ps2->gsGlobal);
+	(void)data;
+	gsKit_vsync_wait();
 }
 
 
@@ -892,43 +795,60 @@ static void ps2_flipScreen(void *data, bool vsync)
 	gsKit_wait_finish(ps2->gsGlobal);
 	gsKit_queue_exec(ps2->gsGlobal);
 
-	if (vsync)
-	{
-		/* Mirror gsKit_sync_flip() exactly, except that the vsync wait is
-		 * a semaphore sleep (VBLANK interrupt) instead of gsKit's
-		 * GS_CSR busy-wait loop.  The busy wait starved the sound thread
-		 * of CPU and made audio stutter under vsync. */
-		if (!ps2->gsGlobal->FirstFrame)
-		{
-			WaitSema(vsync_sema_id);
-			while (PollSema(vsync_sema_id) >= 0)
-				;
-
-			if (ps2->gsGlobal->DoubleBuffering == GS_SETTING_ON)
-			{
-				GS_SET_DISPFB2(ps2->gsGlobal->ScreenBuffer[ps2->gsGlobal->ActiveBuffer & 1] / 8192,
-					ps2->gsGlobal->Width / 64, ps2->gsGlobal->PSM, 0, 0);
-				ps2->gsGlobal->ActiveBuffer ^= 1;
-			}
-		}
-		gsKit_setactive(ps2->gsGlobal);
-	}
-	else
-	{
+	if (vsync) {
+		gsKit_sync_flip(ps2->gsGlobal);
+	} else {
 		gsKit_flip(ps2->gsGlobal);
 	}
 }
 
-
-/*--------------------------------------------------------
-	Get VRAM Address
---------------------------------------------------------*/
-
-static void *ps2_frameAddr(void *data, void *frame, int x, int y)
+static void ps2_beginFrame(void *data)
 {
-	// TODO: FJTRUJY so far just used by the menu
-// 		return (void *)(((uint32_t)frame | 0x44000000) + ((x + (y << 9)) << 1));
-	return NULL;
+	ps2_video_t *ps2 = (ps2_video_t*)data;
+	gsKit_renderToScreen(ps2->gsGlobal);
+}
+
+static void ps2_endFrame(void *data)
+{
+	(void)data;
+	/* No-op: gsKit queue is executed in flipScreen */
+}
+
+static void *ps2_frameAddr(void *data, int frameIndex, int x, int y)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSTEXTURE *texture = NULL;
+	uint8_t bytes_per_pixel = 0;
+
+#if defined(GUI)
+	/* See ps2_video_t::ui_scratch.  The GUI's legacy CPU-accessible surface is
+	 * intentionally separate from emulator texture layer 0. */
+	if (frameIndex == COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER) {
+		texture = ps2->ui_scratch;
+		bytes_per_pixel = 2;
+		ps2->ui_scratch_cpu_dirty = 1;
+	}
+#endif
+
+	if (!texture && frameIndex >= COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER) {
+		int layer_index = frameIndex - COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER;
+		if (layer_index < 0 || layer_index >= ps2->tex_layers_count)
+			return NULL;
+		texture = ps2->tex_layers[layer_index].texture;
+		bytes_per_pixel = texture->PSM == GS_PSM_T8 ? 1 : 2;
+	}
+
+	/* GS frame buffers and render textures live only in local GS VRAM and have
+	 * no directly CPU-addressable pointer on PS2.  Callers that need readback
+	 * must use an explicit local-to-host transfer rather than frameAddr(). */
+	if (!texture || !texture->Mem)
+		return NULL;
+
+	if (x < 0 || y < 0 || (u32)x >= texture->Width || (u32)y >= texture->Height)
+		return NULL;
+
+	return (uint8_t *)texture->Mem +
+		((size_t)y * texture->Width + (size_t)x) * bytes_per_pixel;
 }
 
 static void ps2_scissor(void *data, uint16_t left, uint16_t top, uint16_t right, uint16_t bottom)
@@ -943,15 +863,18 @@ static void ps2_scissor(void *data, uint16_t left, uint16_t top, uint16_t right,
 --------------------------------------------------------*/
 
 static void ps2_clearScreen(void *data) {
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-	gsKit_clear(ps2->gsGlobal, ps2->clearScreenColor.color.rgbaq);
+	/* Keep the same semantic contract as the PSP backend: clear both physical
+	 * screen buffers.  Clearing only whichever target happened to be active left
+	 * GUI pixels visible when the emulator switched to the other buffer. */
+	video_driver->clearFrame(data, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER);
+	video_driver->clearFrame(data, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER);
 }
 
 /*--------------------------------------------------------
 	Clear Specified Frame
 --------------------------------------------------------*/
 
-static void ps2_clearFrame(void *data, int index)
+static void ps2_fillFrameRGBAQ(void *data, int index, gs_rgbaq color)
 {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
 	uint32_t buffer_width;
@@ -960,7 +883,7 @@ static void ps2_clearFrame(void *data, int index)
 	uint8_t psm = GS_PSM_CT16;
 	switch (index) {
 	case COMMON_GRAPHIC_OBJECTS_GLOBAL_CONTEXT:
-		assert("Cannot clear global context");
+		assert(!"Cannot clear global context");
 		return;
 	case COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER:
 		fbp = ps2->gsGlobal->ScreenBuffer[!(ps2->gsGlobal->ActiveBuffer & 1)];
@@ -981,12 +904,19 @@ static void ps2_clearFrame(void *data, int index)
 		psm = ps2->scrbitmap->PSM;
 		break;
 	default:
-		assert("Shouldn't clear texture layers");
+		assert(!"Shouldn't clear texture layers");
 		return;
 	}
 
 	gsKit_setRegFrame(ps2->gsGlobal, fbp, buffer_width, buffer_height, psm);
-	gsKit_custom_clear(ps2->gsGlobal, ps2->clearScreenColor, buffer_width, buffer_height);
+	gsKit_custom_clear(ps2->gsGlobal, color, buffer_width, buffer_height);
+}
+	
+static void ps2_clearFrame(void *data, int index)
+{
+	ps2_video_t *ps2 = (ps2_video_t*)data;
+	gs_rgbaq color = ps2->clearScreenColor;
+	ps2_fillFrameRGBAQ(data, index, color);
 }
 
 
@@ -994,17 +924,15 @@ static void ps2_clearFrame(void *data, int index)
 	Fill Specified Frame
 --------------------------------------------------------*/
 
-static void ps2_fillFrame(void *data, void *frame, uint32_t color)
+static void ps2_fillFrame(void *data, int frameIndex, uint32_t color)
 {
-	// TODO: FJTRUJY so far just used by the menu
-
-	// sceGuStart(GU_DIRECT, gulist);
-	// sceGuDrawBufferList(pixel_format, frame, BUF_WIDTH);
-	// sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
-	// sceGuClearColor(color);
-	// sceGuClear(GU_COLOR_BUFFER_BIT | GU_FAST_CLEAR_BIT);
-	// sceGuFinish();
-	// sceGuSync(0, GU_SYNC_FINISH);
+	gs_rgbaq rgbaq_color = color_to_RGBAQ(
+		(color >> 0) & 0xFF,
+		(color >> 8) & 0xFF,
+		(color >> 16) & 0xFF,
+		(color >> 24) & 0xFF,
+		0);
+	ps2_fillFrameRGBAQ(data, frameIndex, rgbaq_color);
 }
 
 
@@ -1028,11 +956,16 @@ static void ps2_startWorkFrame(void *data, uint32_t color) {
 	gsKit_set_texfilter(ps2->gsGlobal, ps2->scrbitmap->Filter);
 	gsKit_renderToTexture(ps2->gsGlobal, ps2->scrbitmap);
 	gsKit_custom_clear(ps2->gsGlobal, ps2_color, ps2->scrbitmap->Width, ps2->scrbitmap->Height);
+
+	/* Enable alpha test so transparent pixels are discarded during sprite rendering */
+	gsKit_set_test(ps2->gsGlobal, GS_ATEST_ON);
 }
 
 static void ps2_transferWorkFrame(void *data, RECT *src_rect, RECT *dst_rect)
 {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
+	int prev_alpha = ps2->gsGlobal->PrimAlphaEnable;
+	int prev_alpha_test = ps2->gsGlobal->Test->ATE;
 
 	uint8_t textureVertexCount = 2;
 	GSPRIMUVPOINTFLAT textureVertex[textureVertexCount];
@@ -1042,188 +975,268 @@ static void ps2_transferWorkFrame(void *data, RECT *src_rect, RECT *dst_rect)
 	textureVertex[1].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dst_rect->right - 0.5, dst_rect->bottom - 0.5, 0);
 	textureVertex[1].uv = vertex_to_UV(ps2->scrbitmap, src_rect->right, src_rect->bottom);
 
+	/* Disable alpha test for frame copy (all pixels should transfer) */
+	gsKit_set_test(ps2->gsGlobal, GS_ATEST_OFF);
+	ps2_flushTextureCache(ps2->gsGlobal);
+	ps2->gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
+
 	gsKit_renderToScreen(ps2->gsGlobal);
 	gsKit_set_texfilter(ps2->gsGlobal, ps2->scrbitmap->Filter);
 	gskit_prim_list_sprite_texture_uv_flat_color2(ps2->gsGlobal, ps2->scrbitmap, ps2->vertexColor, textureVertexCount, textureVertex);
+	ps2->gsGlobal->PrimAlphaEnable = prev_alpha;
 
-
-
-	// printf("transferWorkFrame %d\n", transfer_count);
-	// // sleep(1);
-    // if (transfer_count == 530) {
-        // SleepThread();
-    // }
-	if (!ps2->drawExtraInfo) return;
-	gs_rgbaq color = color_to_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
-
-	// Choose texture to print
-	GSTEXTURE *tex = ps2->tex_layers[0].texture;
-
-	#define LEFT 350
-	#define TOP 20
-	#define RIGHT (LEFT + tex->Width / 2)
-	#define BOTTOM (TOP + tex->Height / 2)
-	#define BORDER_LEFT LEFT - 1
-	#define BORDER_TOP TOP - 1
-	#define BORDER_RIGHT RIGHT + 1
-	#define BORDER_BOTTOM BOTTOM + 1
-
-	gsKit_prim_quad(ps2->gsGlobal, 
-		BORDER_LEFT, BORDER_TOP, 
-		BORDER_RIGHT, BORDER_TOP, 
-		BORDER_LEFT, BORDER_BOTTOM, 
-		BORDER_RIGHT, BORDER_BOTTOM, 
-		0, GS_SETREG_RGBA(0x80, 0, 0, 0x80));
-	gsKit_prim_quad(ps2->gsGlobal, 
-		LEFT, TOP, 
-		RIGHT, TOP, 
-		LEFT, BOTTOM, 
-		RIGHT, BOTTOM, 
-		0, GS_SETREG_RGBA(0, 0, 0, 0x80));
-
-	GSPRIMUVPOINTFLAT *verts2 = (GSPRIMUVPOINTFLAT *)malloc(sizeof(GSPRIMUVPOINTFLAT) * 2);
-	verts2[0].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, LEFT, TOP, 0);
-	verts2[0].uv = vertex_to_UV(tex, 0, 0);
-
-	verts2[1].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, RIGHT, BOTTOM, 0);
-	verts2[1].uv = vertex_to_UV(tex, tex->Width, tex->Height);
-
-	gskit_prim_list_sprite_texture_uv_flat_color(ps2->gsGlobal, tex, color, 2, verts2);
-
-	free(verts2);
+	/* Restore the caller's alpha-test state. */
+	gsKit_set_test(ps2->gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
-static void ps2_copyRect(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect)
+/*--------------------------------------------------------
+	Helpers: resolve source/destination buffer indices
+--------------------------------------------------------*/
+
+/* Resolve a source index to a stack-local GSTEXTURE.
+   For frame buffers (SHOW/DRAW), builds a temporary GSTEXTURE
+   referencing the VRAM address. */
+static bool ps2_resolveSourceTexture(ps2_video_t *ps2, int index, GSTEXTURE *tex) {
+	if (!ps2 || !tex)
+		return false;
+
+	memset(tex, 0, sizeof(*tex));
+	switch (index) {
+	case COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER:
+		tex->Vram = ps2->gsGlobal->ScreenBuffer[!(ps2->gsGlobal->ActiveBuffer & 1)];
+		tex->Width = ps2->gsGlobal->Width;
+		tex->Height = ps2->gsGlobal->Height;
+		tex->PSM = ps2->gsGlobal->PSM;
+		tex->Filter = GS_FILTER_NEAREST;
+		gsKit_setup_tbw(tex);
+		break;
+	case COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER:
+		tex->Vram = ps2->gsGlobal->ScreenBuffer[ps2->gsGlobal->ActiveBuffer & 1];
+		tex->Width = ps2->gsGlobal->Width;
+		tex->Height = ps2->gsGlobal->Height;
+		tex->PSM = ps2->gsGlobal->PSM;
+		tex->Filter = GS_FILTER_NEAREST;
+		gsKit_setup_tbw(tex);
+		break;
+	case COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP:
+		*tex = *ps2->scrbitmap;
+		break;
+	case COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER:
+#if defined(GUI)
+		ps2_syncUiScratchToVram(ps2);
+		*tex = *ps2->ui_scratch;
+#else
+		if (ps2->tex_layers_count <= 0)
+			return false;
+		*tex = *ps2->tex_layers[0].texture;
+#endif
+		break;
+	default: {
+		int layer_index = index - COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER;
+		if (layer_index < 0 || layer_index >= ps2->tex_layers_count)
+			return false;
+		*tex = *ps2->tex_layers[layer_index].texture;
+		break;
+	}
+	}
+	return true;
+}
+
+int ps2_video_read_frame(void *data, int frame_index,
+	int x, int y, int width, int height,
+	uint16_t *dst, int dst_pitch)
 {
-	// TODO: FJTRUJY so far just used by the menu, adhoc, and state
-	// It is also used in the biosmenu but let's ignore it for now
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal;
+	GSTEXTURE source;
+	uint16_t *readback;
+	size_t readback_size;
+	int had_pending_queue;
+	int result;
 
-	// int j, sw, dw, sh, dh;
-	// struct Vertex *vertices;
+	if (!ps2 || !dst || width <= 0 || height <= 0 || dst_pitch < width)
+		return 0;
+	gsGlobal = ps2->gsGlobal;
 
-	// sw = src_rect->right - src_rect->left;
-	// dw = dst_rect->right - dst_rect->left;
-	// sh = src_rect->bottom - src_rect->top;
-	// dh = dst_rect->bottom - dst_rect->top;
+	if (!ps2_resolveSourceTexture(ps2, frame_index, &source))
+		return 0;
+	/* VRAM address 0 is valid (it is commonly the first screen buffer). */
+	if (source.PSM != GS_PSM_CT16)
+		return 0;
 
-	// sceGuStart(GU_DIRECT, gulist);
+	if (x < 0 || y < 0 || (u32)(x + width) > source.Width || (u32)(y + height) > source.Height)
+		return 0;
 
-	// sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
-	// sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom);
-	// sceGuDisable(GU_ALPHA_TEST);
+	/* ps2_screenshot derives BITBLTBUF.SBW from its Width argument, so the
+	 * transfer width must match the complete GS source pitch (640 for screen
+	 * buffers, 512 for our render textures).  Crop into the caller's buffer
+	 * afterwards rather than programming an incorrect source stride. */
+	if ((source.Width & 63) != 0)
+		return 0;
 
-	// sceGuTexMode(pixel_format, 0, 0, GU_FALSE);
-	// sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, GU_FRAME_ADDR(src));
-	// if (sw == dw && sh == dh)
-	// 	sceGuTexFilter(GU_NEAREST, GU_NEAREST);
-	// else
-	// 	sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+	readback_size = (size_t)source.Width * height * sizeof(uint16_t);
+	readback = (uint16_t *)memalign(64, readback_size);
+	if (!readback)
+		return 0;
 
-	// for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
-	// {
-	// 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+	/* ps2_screenshot() temporarily masks Path3 and reverses GS BUSDIR.  A GIF
+	 * queue still in flight would deadlock that transition.  gsKit appends a
+	 * FINISH token to non-empty queues but queue_exec() returns as soon as the
+	 * DMA is launched for one-shot queues, so explicitly wait for both the DMA
+	 * and that FINISH before starting the local-to-host transfer. */
+	had_pending_queue = gsGlobal->Per_Queue->tag_size != 0 ||
+		gsGlobal->Os_Queue->tag_size != 0;
+	gsKit_queue_exec(gsGlobal);
+	if (had_pending_queue) {
+		dmaKit_wait_fast();
+		gsKit_finish();
+	}
 
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->left + j * dw / sw;
-	// 	vertices[0].y = dst_rect->top;
+	/* BITBLTBUF.SBP is expressed in 256-byte units. */
+	result = ps2_screenshot(readback, source.Vram / 256, 0, y,
+		source.Width, height, source.PSM);
 
-	// 	vertices[1].u = src_rect->left + j + SLICE_SIZE;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->left + (j + SLICE_SIZE) * dw / sw;
-	// 	vertices[1].y = dst_rect->bottom;
+	if (result) {
+		/* ps2_screenshot() synchronizes the GS and then acknowledges/clears the
+		 * FINISH bit.  Both our flip path and gsKit_queue_exec_real() normally
+		 * expect that bit to describe an asynchronous previous frame.  There is
+		 * no previous frame left after this synchronous readback, so reset the
+		 * queue state to the same one-shot state used before an initial submit.
+		 * The next queue execution automatically switches FirstFrame back off. */
+		if (finish_sema_id >= 0)
+			while (PollSema(finish_sema_id) >= 0);
+		gsGlobal->FirstFrame = GS_SETTING_ON;
+	}
 
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
+	if (result) {
+		for (int row = 0; row < height; row++) {
+			memcpy(dst + ((size_t)row * dst_pitch),
+				readback + ((size_t)row * source.Width) + x,
+				(size_t)width * sizeof(uint16_t));
+		}
+	}
 
-	// if (j < sw)
-	// {
-	// 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+	free(readback);
+	return result;
+}
 
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->left + j * dw / sw;
-	// 	vertices[0].y = dst_rect->top;
+/* Set the GS render target to the buffer identified by index. */
+static bool ps2_setDestination(ps2_video_t *ps2, int index) {
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	switch (index) {
+	case COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER:
+		gsKit_setRegFrame(gsGlobal,
+			gsGlobal->ScreenBuffer[!(gsGlobal->ActiveBuffer & 1)],
+			gsGlobal->Width, gsGlobal->Height, gsGlobal->PSM);
+		break;
+	case COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER:
+		gsKit_setRegFrame(gsGlobal,
+			gsGlobal->ScreenBuffer[gsGlobal->ActiveBuffer & 1],
+			gsGlobal->Width, gsGlobal->Height, gsGlobal->PSM);
+		break;
+	case COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP:
+		gsKit_renderToTexture(gsGlobal, ps2->scrbitmap);
+		break;
+	case COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER:
+#if defined(GUI)
+		/* Preserve any CPU-written part of the scratch surface before a partial
+		 * GPU render modifies it.  After this point VRAM is authoritative. */
+		ps2_syncUiScratchToVram(ps2);
+		gsKit_renderToTexture(gsGlobal, ps2->ui_scratch);
+#else
+		gsKit_renderToTexture(gsGlobal, ps2->tex_layers[0].texture);
+#endif
+		break;
+	default: {
+		int layer_index = index - COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER;
+		if (layer_index < 0 || layer_index >= ps2->tex_layers_count)
+			return false;
+		GSTEXTURE *layerTex = ps2->tex_layers[layer_index].texture;
+		gsKit_renderToTexture(gsGlobal, layerTex);
+		break;
+	}
+	}
+	return true;
+}
 
-	// 	vertices[1].u = src_rect->right;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->right;
-	// 	vertices[1].y = dst_rect->bottom;
+static void ps2_copyRect(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect)
+{
+	ps2_video_t *ps2 = (ps2_video_t*)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int prev_alpha = gsGlobal->PrimAlphaEnable;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	GSTEXTURE srcTex;
+	if (!ps2_resolveSourceTexture(ps2, srcIndex, &srcTex))
+		return;
 
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
+	int sw = src_rect->right - src_rect->left;
+	int dw = dst_rect->right - dst_rect->left;
+	int sh = src_rect->bottom - src_rect->top;
+	int dh = dst_rect->bottom - dst_rect->top;
 
-	// sceGuFinish();
-	// sceGuSync(0, GU_SYNC_FINISH);
+	srcTex.Filter = (sw == dw && sh == dh) ? GS_FILTER_NEAREST : GS_FILTER_LINEAR;
+
+	if (!ps2_setDestination(ps2, dstIndex))
+		return;
+
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	ps2_flushTextureCache(gsGlobal);
+	gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
+
+	u64 color = GS_SETREG_RGBA(0x80, 0x80, 0x80, 0x80);
+	gsKit_prim_sprite_texture(gsGlobal, &srcTex,
+		dst_rect->left, dst_rect->top, src_rect->left, src_rect->top,
+		dst_rect->right, dst_rect->bottom, src_rect->right, src_rect->bottom,
+		0, color);
+	gsGlobal->PrimAlphaEnable = prev_alpha;
+
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
 
 /*--------------------------------------------------------
-	Copy Rectangular Area with Horizontal Flip
+	Copy Rectangular Area with 180-degree Flip
+
+	Despite the legacy interface name, the PSP implementation
+	flips both axes. CPS1/CPS2 use this path for the hardware
+	screen-flip bit, which is a 180-degree screen rotation.
 --------------------------------------------------------*/
 
-static void ps2_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect)
+static void ps2_copyRectFlip(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect)
 {
-	// TODO: FJTRUJY not used so far in MVS
+	ps2_video_t *ps2 = (ps2_video_t*)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int prev_alpha = gsGlobal->PrimAlphaEnable;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	GSTEXTURE srcTex;
+	if (!ps2_resolveSourceTexture(ps2, srcIndex, &srcTex))
+		return;
 
+	int sw = src_rect->right - src_rect->left;
+	int dw = dst_rect->right - dst_rect->left;
+	int sh = src_rect->bottom - src_rect->top;
+	int dh = dst_rect->bottom - dst_rect->top;
 
-	// int16_t j, sw, dw, sh, dh;
-	// struct Vertex *vertices;
+	srcTex.Filter = (sw == dw && sh == dh) ? GS_FILTER_NEAREST : GS_FILTER_LINEAR;
 
-	// sw = src_rect->right - src_rect->left;
-	// dw = dst_rect->right - dst_rect->left;
-	// sh = src_rect->bottom - src_rect->top;
-	// dh = dst_rect->bottom - dst_rect->top;
+	if (!ps2_setDestination(ps2, dstIndex))
+		return;
 
-	// sceGuStart(GU_DIRECT, gulist);
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	ps2_flushTextureCache(gsGlobal);
+	gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
 
-	// sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
-	// sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom);
-	// sceGuDisable(GU_ALPHA_TEST);
+	u64 color = GS_SETREG_RGBA(0x80, 0x80, 0x80, 0x80);
+	/* 180-degree flip: swap both U and V coordinates. */
+	gsKit_prim_quad_texture(gsGlobal, &srcTex,
+		dst_rect->left,  dst_rect->top,    src_rect->right, src_rect->bottom,
+		dst_rect->right, dst_rect->top,    src_rect->left,  src_rect->bottom,
+		dst_rect->left,  dst_rect->bottom, src_rect->right, src_rect->top,
+		dst_rect->right, dst_rect->bottom, src_rect->left,  src_rect->top,
+		0, color);
 
-	// sceGuTexMode(pixel_format, 0, 0, GU_FALSE);
-	// sceGuTexImage(0, 512, 512, BUF_WIDTH, GU_FRAME_ADDR(src));
-	// if (sw == dw && sh == dh)
-	// 	sceGuTexFilter(GU_NEAREST, GU_NEAREST);
-	// else
-	// 	sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-
-	// for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
-	// {
-    // 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
-
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->right - j * dw / sw;
-	// 	vertices[0].y = dst_rect->bottom;
-
-	// 	vertices[1].u = src_rect->left + j + SLICE_SIZE;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->right - (j + SLICE_SIZE) * dw / sw;
-	// 	vertices[1].y = dst_rect->top;
-
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
-
-	// if (j < sw)
-	// {
-	// 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
-
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->right - j * dw / sw;
-	// 	vertices[0].y = dst_rect->bottom;
-
-	// 	vertices[1].u = src_rect->right;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->left;
-	// 	vertices[1].y = dst_rect->top;
-
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
-
-	// sceGuFinish();
-	// sceGuSync(0, GU_SYNC_FINISH);
+	gsGlobal->PrimAlphaEnable = prev_alpha;
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
 
@@ -1231,53 +1244,44 @@ static void ps2_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect, R
 	Copy Rectangular Area with 270-degree Rotation
 --------------------------------------------------------*/
 
-static void ps2_copyRectRotate(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect)
+static void ps2_copyRectRotate(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect)
 {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
-	(void)src; (void)dst;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int prev_alpha = gsGlobal->PrimAlphaEnable;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	GSTEXTURE srcTex;
+	if (!ps2_resolveSourceTexture(ps2, srcIndex, &srcTex))
+		return;
 
-	/* 90-degree (counter-clockwise) rotation of the work-frame texture,
-	 * drawn as two textured triangles (a GS sprite is always
-	 * axis-aligned, so rotation requires triangles).  Used by "Rotate
-	 * Screen" for tate (vertical) CPS1 games like varth.
-	 *
-	 * Aspect: the unrotated 384x224 frame fills a 4:3 TV, so the rotated
-	 * frame must be a 3:4 PORTRAIT on screen - width = height * 3/4,
-	 * full height, centred.  Uniform pixel scaling (v28) ignored the
-	 * TV's 4:3 pixel aspect ratio and rendered the frame too narrow. */
-	float dw = (float)(dst_rect->right  - dst_rect->left);
-	float dh = (float)(dst_rect->bottom - dst_rect->top);
-	float out_h = dh;
-	float out_w = dh * 0.75f;
-	float dl = (float)dst_rect->left + (dw - out_w) * 0.5f;
-	float dt = (float)dst_rect->top;
-	float dr = dl + out_w;
-	float db = dt + out_h;
-	float sl = (float)src_rect->left,  st = (float)src_rect->top;
-	float sr = (float)src_rect->right, sb = (float)src_rect->bottom;
+	int sw = src_rect->right - src_rect->left;
+	int dw = dst_rect->right - dst_rect->left;
+	int sh = src_rect->bottom - src_rect->top;
+	int dh = dst_rect->bottom - dst_rect->top;
 
-	GSPRIMUVPOINTFLAT verts[6];
+	/* For 270-degree CCW rotation, source width maps to dest height and vice versa */
+	srcTex.Filter = (sw == dh && sh == dw) ? GS_FILTER_NEAREST : GS_FILTER_LINEAR;
 
-	/* Counter-clockwise 90: src TL->dst BL, src TR->dst TL,
-	 *                    src BR->dst TR, src BL->dst BR               */
-	/* Tri 1: (TL->BL, TR->TL, BR->TR) */
-	verts[0].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dl, db, 0);
-	verts[0].uv   = vertex_to_UV(ps2->scrbitmap, sl, st);
-	verts[1].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dl, dt, 0);
-	verts[1].uv   = vertex_to_UV(ps2->scrbitmap, sr, st);
-	verts[2].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dr, dt, 0);
-	verts[2].uv   = vertex_to_UV(ps2->scrbitmap, sr, sb);
-	/* Tri 2: (TL->BL, BR->TR, BL->BR) */
-	verts[3].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dl, db, 0);
-	verts[3].uv   = vertex_to_UV(ps2->scrbitmap, sl, st);
-	verts[4].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dr, dt, 0);
-	verts[4].uv   = vertex_to_UV(ps2->scrbitmap, sr, sb);
-	verts[5].xyz2 = vertex_to_XYZ2(ps2->gsGlobal, dr, db, 0);
-	verts[5].uv   = vertex_to_UV(ps2->scrbitmap, sl, sb);
+	if (!ps2_setDestination(ps2, dstIndex))
+		return;
 
-	gsKit_renderToScreen(ps2->gsGlobal);
-	gsKit_set_texfilter(ps2->gsGlobal, ps2->scrbitmap->Filter);
-	gskit_prim_list_triangle_texture_uv_flat(ps2->gsGlobal, ps2->scrbitmap, ps2->vertexColor, 6, verts);
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	ps2_flushTextureCache(gsGlobal);
+	gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
+
+	u64 color = GS_SETREG_RGBA(0x80, 0x80, 0x80, 0x80);
+	/* 270-degree CCW (= 90-degree CW) rotation UV mapping:
+	   Dest TL <- Source BL, Dest TR <- Source TL,
+	   Dest BL <- Source BR, Dest BR <- Source TR */
+	gsKit_prim_quad_texture(gsGlobal, &srcTex,
+		dst_rect->left,  dst_rect->top,    src_rect->left,  src_rect->bottom,
+		dst_rect->right, dst_rect->top,    src_rect->left,  src_rect->top,
+		dst_rect->left,  dst_rect->bottom, src_rect->right, src_rect->bottom,
+		dst_rect->right, dst_rect->bottom, src_rect->right, src_rect->top,
+		0, color);
+
+	gsGlobal->PrimAlphaEnable = prev_alpha;
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
 
@@ -1285,191 +1289,240 @@ static void ps2_copyRectRotate(void *data, void *src, void *dst, RECT *src_rect,
 	Draw Texture with Specified Rectangular Area
 --------------------------------------------------------*/
 
-static void ps2_drawTexture(void *data, uint32_t src_fmt, uint32_t dst_fmt, void *src, void *dst, RECT *src_rect, RECT *dst_rect)
+static void ps2_drawTexture(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect)
 {
-	// TODO: FJTRUJY so far just used by the menu
-
-	// int j, sw, dw, sh, dh;
-	// struct Vertex *vertices;
-
-	// sw = src_rect->right - src_rect->left;
-	// dw = dst_rect->right - dst_rect->left;
-	// sh = src_rect->bottom - src_rect->top;
-	// dh = dst_rect->bottom - dst_rect->top;
-
-	// sceGuStart(GU_DIRECT, gulist);
-	// sceGuDrawBufferList(dst_fmt, dst, BUF_WIDTH);
-	// sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom);
-
-	// sceGuTexMode(src_fmt, 0, 0, GU_FALSE);
-	// sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, GU_FRAME_ADDR(src));
-	// if (sw == dw && sh == dh)
-	// 	sceGuTexFilter(GU_NEAREST, GU_NEAREST);
-	// else
-	// 	sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-
-	// for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
-	// {
-    // 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
-
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->left + j * dw / sw;
-	// 	vertices[0].y = dst_rect->top;
-
-	// 	vertices[1].u = src_rect->left + j + SLICE_SIZE;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->left + (j + SLICE_SIZE) * dw / sw;
-	// 	vertices[1].y = dst_rect->bottom;
-
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
-
-	// if (j < sw)
-	// {
-	// 	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
-
-	// 	vertices[0].u = src_rect->left + j;
-	// 	vertices[0].v = src_rect->top;
-	// 	vertices[0].x = dst_rect->left + j * dw / sw;
-	// 	vertices[0].y = dst_rect->top;
-
-	// 	vertices[1].u = src_rect->right;
-	// 	vertices[1].v = src_rect->bottom;
-	// 	vertices[1].x = dst_rect->right;
-	// 	vertices[1].y = dst_rect->bottom;
-
-	// 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
-	// }
-
-	// sceGuFinish();
-	// sceGuSync(0, GU_SYNC_FINISH);
-}
-
-/******************************************************************************
-	Present a full-screen texture (used by the PS2 menu in ps2_gui.c).
-
-	Mirrors the draw path of ps2_transferWorkFrame but for an arbitrary
-	texture (the menu's CPU framebuffer uploaded as a CT16 texture). Sets
-	the FRAME register to the active screen buffer and blits the texture
-	stretched to fill, so callers only need to upload + flip afterwards.
-******************************************************************************/
-void ps2_present_texture_region(GSGLOBAL *gsGlobal, GSTEXTURE *tex,
-	gs_rgbaq color, float uw, float vh)
-{
-	gsKit_setRegFrame(gsGlobal, gsGlobal->ScreenBuffer[gsGlobal->ActiveBuffer & 1],
-		gsGlobal->Width, gsGlobal->Height, gsGlobal->PSM);
-
-	/* Draw through the SAME custom UV sprite path as ps2_transferWorkFrame
-	 * (the game frame). gsKit_prim_sprite_texture showed a clipped right
-	 * edge / missing right border on the 224P/240P builds, while the game
-	 * frame (this exact path) renders correctly at 384x224.
-	 * uw/vh = UV extent in texel units: pass the view size for a 1:1 blit,
-	 * or tex->Width/Height for a fullscreen stretch. */
-	gsKit_set_texfilter(gsGlobal, tex->Filter);
-	GSPRIMUVPOINTFLAT verts[2];
-	verts[0].xyz2 = vertex_to_XYZ2(gsGlobal, -0.5f, -0.5f, 0);
-	verts[0].uv = vertex_to_UV(tex, 0, 0);
-	/* Destination size = the requested UV extent (uw x vh), NOT the
-	 * framebuffer size. The menu layout is authored in MENU_W x MENU_H
-	 * coordinates, so drawing uw x vh keeps it exactly 1:1 and keeps the
-	 * right-hand border of the panel inside the framebuffer. */
-	verts[1].xyz2 = vertex_to_XYZ2(gsGlobal, uw - 0.5f, vh - 0.5f, 0);
-	verts[1].uv = vertex_to_UV(tex, uw, vh);
-	gskit_prim_list_sprite_texture_uv_flat_color2(gsGlobal, tex, color, 2, verts);
-}
-
-void ps2_present_texture(GSGLOBAL *gsGlobal, GSTEXTURE *tex, gs_rgbaq color)
-{
-	ps2_present_texture_region(gsGlobal, tex, color,
-		(float)tex->Width, (float)tex->Height);
-}
-
-/*--------------------------------------------------------
-	Blit a texture region at an arbitrary screen position
-
-	Used by the FPS overlay (small_font_print): renders a small
-	texture (e.g. 256x16 with an FPS string) over the game frame
-	at (dx, dy).
---------------------------------------------------------*/
-void ps2_draw_texture_at(GSGLOBAL *gsGlobal, GSTEXTURE *tex, gs_rgbaq color,
-                         float dx, float dy, float uw, float vh)
-{
-	gsKit_setRegFrame(gsGlobal,
-		gsGlobal->ScreenBuffer[gsGlobal->ActiveBuffer & 1],
-		gsGlobal->Width, gsGlobal->Height, gsGlobal->PSM);
-	gsKit_set_texfilter(gsGlobal, tex->Filter);
-	GSPRIMUVPOINTFLAT verts[2];
-	verts[0].xyz2 = vertex_to_XYZ2(gsGlobal, dx - 0.5f, dy - 0.5f, 0);
-	verts[0].uv = vertex_to_UV(tex, 0, 0);
-	verts[1].xyz2 = vertex_to_XYZ2(gsGlobal, dx + uw - 0.5f, dy + vh - 0.5f, 0);
-	verts[1].uv = vertex_to_UV(tex, uw, vh);
-	gskit_prim_list_sprite_texture_uv_flat_color2(gsGlobal, tex, color, 2, verts);
-}
-
-static void *ps2_getNativeObjects(void *data, int index) {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
-	switch (index) {
-	case COMMON_GRAPHIC_OBJECTS_GLOBAL_CONTEXT:
-		return ps2->gsGlobal;
-	case COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER:
-		return (void *)ps2->gsGlobal->ScreenBuffer[!(ps2->gsGlobal->ActiveBuffer & 1)];
-	case COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER:
-		return (void *)ps2->gsGlobal->ScreenBuffer[ps2->gsGlobal->ActiveBuffer & 1];
-	case COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP:
-		return ps2->scrbitmap;
-	default:
-		return ps2->tex_layers[index - COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER].texture;
-	}
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int prev_alpha = gsGlobal->PrimAlphaEnable;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	GSTEXTURE srcTex;
+	if (!ps2_resolveSourceTexture(ps2, srcIndex, &srcTex))
+		return;
+
+	int sw = src_rect->right - src_rect->left;
+	int dw = dst_rect->right - dst_rect->left;
+	int sh = src_rect->bottom - src_rect->top;
+	int dh = dst_rect->bottom - dst_rect->top;
+
+	srcTex.Filter = (sw == dw && sh == dh) ? GS_FILTER_NEAREST : GS_FILTER_LINEAR;
+
+	if (!ps2_setDestination(ps2, dstIndex))
+		return;
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	ps2_flushTextureCache(gsGlobal);
+	gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
+
+	u64 color = GS_SETREG_RGBA(0x80, 0x80, 0x80, 0x80);
+	gsKit_prim_sprite_texture(gsGlobal, &srcTex,
+		dst_rect->left, dst_rect->top, src_rect->left, src_rect->top,
+		dst_rect->right, dst_rect->bottom, src_rect->right, src_rect->bottom,
+		0, color);
+
+	gsGlobal->PrimAlphaEnable = prev_alpha;
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
 static void ps2_uploadMem(void *data, uint8_t textureIndex) {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
+	if (!ps2 || (int)textureIndex >= ps2->tex_layers_count)
+		return;
+
 	GSTEXTURE *tex = ps2->tex_layers[textureIndex].texture;
-	/* GS_CLUT_NONE != GS_CLUT_TEXTURE: gsKit_texture_send_inline appends
-	 * GS_TEXFLUSH, flushing the GS texture cache. With GS_CLUT_TEXTURE the
-	 * cache was never invalidated after tile uploads, so sampling could
-	 * return stale/black tile data (black blocks on 224P builds). */
-   	gsKit_texture_send_inline(ps2->gsGlobal, tex->Mem, tex->Width, tex->Height, tex->Vram, tex->PSM, tex->TBW, GS_CLUT_NONE);
+	if (!tex || !tex->Mem || tex->Vram == GSKIT_ALLOC_ERROR)
+		return;
+
+	size_t size = gsKit_texture_size_ee(tex->Width, tex->Height, tex->PSM);
+	SyncDCache(tex->Mem, (uint8_t *)tex->Mem + size);
+	gsKit_texture_send_inline(ps2->gsGlobal, tex->Mem, tex->Width, tex->Height,
+		tex->Vram, tex->PSM, tex->TBW, GS_CLUT_TEXTURE);
 }
 
 static void ps2_uploadClut(void *data, uint16_t *clut, uint8_t bank_index) {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
+	if (!ps2 || !clut || bank_index >= ps2->clut_bank_count)
+		return;
+
+	ptrdiff_t offset = clut - ps2->clut_base;
+	ptrdiff_t total_entries =
+		(ptrdiff_t)ps2->clut_entries_per_bank * ps2->clut_bank_count;
+	if (offset < 0 || offset >= total_entries)
+		return;
+
 	void *vram = ps2_vramClutForBankIndex(data, bank_index);
 	/* Upload CLUT using target-specific dimensions */
-   	gsKit_texture_send_inline(ps2->gsGlobal, (u32 *)clut, CLUT_WIDTH, CLUT_HEIGHT * ps2->clut_bank_height, (u32)vram, GS_PSM_CT16, 1, GS_CLUT_PALLETE);
+	size_t size = (size_t)CLUT_WIDTH * ps2->clut_bank_height * sizeof(uint16_t);
+	SyncDCache(clut, (uint8_t *)clut + size);
+	gsKit_texture_send_inline(ps2->gsGlobal, (u32 *)clut, CLUT_WIDTH,
+		CLUT_HEIGHT * ps2->clut_bank_height, (u32)vram, GS_PSM_CT16, 1,
+		GS_CLUT_PALLETE);
 }
 
-static void ps2_blitTexture(void *data, uint8_t textureIndex, void *clut, uint8_t bank_index, uint32_t vertices_count, void *vertices) {
-	ps2_video_t *ps2 = (ps2_video_t*)data;
-	texture_layer_t *layer = &ps2->tex_layers[textureIndex];
-	GSTEXTURE *tex = layer->texture;
-	bool is_indexed = (tex->PSM == GS_PSM_T8);
+static void ps2_writeIndexedTextureRect(void *data, uint8_t textureIndex,
+	int x, int y, int width, int height, const uint8_t *pixels, int srcPitch)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSTEXTURE *tex;
+	uint8_t *dst;
+	int row;
 
-	/* Only set CLUT for indexed (8-bit) textures */
+	if (!ps2 || (int)textureIndex >= ps2->tex_layers_count || !pixels ||
+	    width <= 0 || height <= 0 || srcPitch < width)
+		return;
+	tex = ps2->tex_layers[textureIndex].texture;
+	if (!tex || !tex->Mem || tex->PSM != GS_PSM_T8 ||
+	    x < 0 || y < 0 || (u32)(x + width) > tex->Width || (u32)(y + height) > tex->Height)
+		return;
+	dst = (uint8_t *)tex->Mem;
+	for (row = 0; row < height; row++)
+		memcpy(dst + (size_t)(y + row) * tex->Width + x,
+			pixels + row * srcPitch, (size_t)width);
+}
+
+static void ps2_writeDirectTextureRect(void *data, uint8_t textureIndex,
+	int x, int y, int width, int height, const uint16_t *pixels, int srcPitch)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSTEXTURE *tex;
+	uint16_t *dst;
+	int row;
+
+	if (!ps2 || (int)textureIndex >= ps2->tex_layers_count || !pixels ||
+	    width <= 0 || height <= 0 || srcPitch < width)
+		return;
+	tex = ps2->tex_layers[textureIndex].texture;
+	if (!tex || !tex->Mem || tex->PSM != GS_PSM_CT16 ||
+	    x < 0 || y < 0 || (u32)(x + width) > tex->Width || (u32)(y + height) > tex->Height)
+		return;
+	dst = (uint16_t *)tex->Mem;
+	for (row = 0; row < height; row++)
+		memcpy(dst + (size_t)(y + row) * tex->Width + x,
+			pixels + row * srcPitch, (size_t)width * sizeof(uint16_t));
+}
+
+static GSTEXTURE *ps2_prepareSpriteTexture(ps2_video_t *ps2,
+	uint8_t textureIndex, const uint16_t *clut, uint8_t bank_index)
+{
+	GSTEXTURE *tex;
+	bool is_indexed;
+
+	if (!ps2 || (int)textureIndex >= ps2->tex_layers_count)
+		return NULL;
+	tex = ps2->tex_layers[textureIndex].texture;
+	if (!tex || tex->Vram == GSKIT_ALLOC_ERROR)
+		return NULL;
+	is_indexed = (tex->PSM == GS_PSM_T8);
+
 	if (is_indexed && clut != NULL) {
-		tex->VramClut = (u32)ps2_vramClutForBankIndex(data, bank_index);
-		gs_texclut texclut = ps2_textclutForParameters(data, clut, bank_index);
+		ptrdiff_t offset = clut - ps2->clut_base;
+		ptrdiff_t total_entries =
+			(ptrdiff_t)ps2->clut_entries_per_bank * ps2->clut_bank_count;
+		gs_texclut texclut;
 
+		if (bank_index >= ps2->clut_bank_count ||
+		    offset < 0 || offset >= total_entries)
+			return NULL;
+
+		tex->VramClut = (u32)ps2_vramClutForBankIndex(ps2, bank_index);
+		texclut = ps2_textclutForParameters(ps2, (uint16_t *)clut, bank_index);
 		if (ps2->currentTexclut.specification.cov != texclut.specification.cov) {
 			ps2->currentTexclut = texclut;
 			gsKit_set_texclut(ps2->gsGlobal, texclut);
 		}
 	} else {
-		/* For non-indexed textures, clear CLUT usage */
 		tex->VramClut = 0;
 	}
-
-	gskit_prim_list_sprite_texture_uv_flat_color2(ps2->gsGlobal, tex, ps2->vertexColor, vertices_count, vertices);
+	return tex;
 }
 
-static void ps2_blitPoints(void *data, uint32_t points_count, void *vertices) {
+static inline uint16_t ps2_spriteGsXY(int16_t coordinate, int offset)
+{
+	int value = (int)coordinate * 16 - 8 + offset;
+	if (value < 0)
+		value = 0;
+	else if (value >= 4096 * 16)
+		value = 4096 * 16 - 1;
+	return (uint16_t)value;
+}
+
+static inline uint16_t ps2_spriteGsUV(uint16_t coordinate, int extent)
+{
+	int value = (int)coordinate * 16;
+	int maximum = extent * 16;
+	if (value > maximum)
+		value = maximum;
+	if (value >= 1024 * 16)
+		value = 1024 * 16 - 1;
+	return (uint16_t)value;
+}
+
+static inline gs_xyz2 ps2_spriteXYZ2(const GSGLOBAL *gsGlobal,
+	int16_t x, int16_t y, int16_t z)
+{
+	gs_xyz2 result;
+	result.xyz.x = ps2_spriteGsXY(x, gsGlobal->OffsetX);
+	result.xyz.y = ps2_spriteGsXY(y, gsGlobal->OffsetY);
+	result.xyz.z = z;
+	result.tag = GS_XYZ2;
+	return result;
+}
+
+static inline gs_uv ps2_spriteUV(const GSTEXTURE *texture,
+	uint16_t u, uint16_t v)
+{
+	gs_uv result;
+	result.coord.u = ps2_spriteGsUV(u, texture->Width);
+	result.coord.v = ps2_spriteGsUV(v, texture->Height);
+	result.tag = GS_UV;
+	return result;
+}
+
+static void ps2_blitSpriteVertices(void *data, uint8_t textureIndex,
+	const uint16_t *clut, uint8_t bank_index,
+	uint32_t vertices_count, const video_sprite_vertex_t *vertices)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSTEXTURE *tex = ps2_prepareSpriteTexture(ps2, textureIndex, clut, bank_index);
+	GSPRIMUVPOINTFLAT *native_vertices;
+	uint32_t i;
+
+	if (!tex || !vertices || vertices_count == 0)
+		return;
+
+	/* Materialize the compact portable vertices directly into gsKit's command
+	 * queue. This preserves the retained-memory saving of the portable arrays
+	 * without an 8 KiB native stack buffer or a second memcpy into the queue. */
+	native_vertices = ps2_beginSpriteTextureList(ps2->gsGlobal, tex,
+		ps2->vertexColor, (int)vertices_count);
+	for (i = 0; i < vertices_count; i++) {
+		const video_sprite_vertex_t *src = &vertices[i];
+		native_vertices[i].xyz2 = ps2_spriteXYZ2(ps2->gsGlobal,
+			src->x, src->y, src->z);
+		native_vertices[i].uv = ps2_spriteUV(tex, src->u, src->v);
+	}
+}
+
+static void ps2_blitPointVertices(void *data, uint32_t points_count,
+	const video_point_vertex_t *vertices) {
 	ps2_video_t *ps2 = (ps2_video_t*)data;
-	gsKit_prim_list_points(ps2->gsGlobal, points_count, (GSPRIMPOINT *)vertices);
-}
+	int prev_alpha_test;
+	GSPRIMPOINT *native_vertices;
+	uint32_t i;
 
-static void ps2_flushCache(void *data, void *addr, size_t size) {
-	// No cache to flush on PS2
+	if (!ps2 || !vertices || points_count == 0)
+		return;
+
+	prev_alpha_test = ps2->gsGlobal->Test->ATE;
+	/* Disable alpha test for point drawing (matches PSP behavior). */
+	gsKit_set_test(ps2->gsGlobal, GS_ATEST_OFF);
+	native_vertices = ps2_beginPointList(ps2->gsGlobal, (int)points_count);
+	for (i = 0; i < points_count; i++) {
+		const video_point_vertex_t *src = &vertices[i];
+		native_vertices[i].xyz2 = ps2_spriteXYZ2(ps2->gsGlobal,
+			src->x, src->y, src->z);
+		native_vertices[i].rgbaq = color_to_RGBAQ(GETR15(src->color),
+			GETG15(src->color), GETB15(src->color), 0x80, 0);
+	}
+	gsKit_set_test(ps2->gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
 }
 
 /*--------------------------------------------------------
@@ -1481,6 +1534,21 @@ static void ps2_flushCache(void *data, void *addr, size_t size) {
 	2=GEQUAL). Default state is depth-off (ZTST=1, zmsk=1).
 --------------------------------------------------------*/
 
+static inline void ps2_setZBufMask(GSGLOBAL *gsGlobal, uint8_t zmsk) {
+	u64 *p_data;
+	u64 *p_store;
+	int qsize = 1;
+
+	p_store = p_data = gsKit_heap_alloc(gsGlobal, qsize, (qsize * 16), GIF_AD);
+
+	if (p_store == gsGlobal->CurQueue->last_tag) {
+		*p_data++ = GIF_TAG_AD(qsize);
+		*p_data++ = GIF_AD;
+	}
+
+	*p_data++ = GS_SETREG_ZBUF(gsGlobal->ZBuffer / 8192, gsGlobal->PSMZ, zmsk);
+	*p_data++ = GS_ZBUF_1 + gsGlobal->PrimContext;
+}
 
 static void ps2_enableDepthTest(void *data) {
 	ps2_video_t *ps2 = (ps2_video_t *)data;
@@ -1537,15 +1605,363 @@ static void ps2_clearColorBuffer(void *data) {
 					   RENDER_SCREEN_WIDTH, RENDER_SCREEN_HEIGHT);
 }
 
+/*------------------------------------------------------
+	UI Drawing Functions (for menu/GUI)
+------------------------------------------------------*/
+
+/* UI colors use the common 0xAABBGGRR layout.  RGB values are ordinary
+ * 8-bit GS color components; only alpha needs conversion because the GS uses
+ * 0x80 as 1.0 for the ALPHA blend equation. */
+static inline uint8_t ps2_ui_alpha_to_gs(uint8_t alpha)
+{
+	return (uint8_t)(((uint32_t)alpha * 0x80 + 0x7f) / 0xff);
+}
+
+static inline gs_rgbaq ps2_ui_color_to_rgbaq(uint32_t color)
+{
+	return color_to_RGBAQ(
+		(uint8_t)(color & 0xff),
+		(uint8_t)((color >> 8) & 0xff),
+		(uint8_t)((color >> 16) & 0xff),
+		ps2_ui_alpha_to_gs((uint8_t)(color >> 24)),
+		0);
+}
+
+typedef struct ps2_ui_alpha_state {
+	int enabled;
+	u64 mode;
+	u8 pabe;
+} ps2_ui_alpha_state_t;
+
+static inline ps2_ui_alpha_state_t ps2_ui_set_alpha_blend(GSGLOBAL *gsGlobal, int enabled)
+{
+	ps2_ui_alpha_state_t previous = {
+		gsGlobal->PrimAlphaEnable,
+		gsGlobal->PrimAlpha,
+		gsGlobal->PABE
+	};
+
+	gsGlobal->PrimAlphaEnable = enabled ? GS_SETTING_ON : GS_SETTING_OFF;
+	if (enabled)
+		gsKit_set_primalpha(gsGlobal, GS_ALPHA_BLEND, 0);
+
+	return previous;
+}
+
+static inline void ps2_ui_restore_alpha_blend(GSGLOBAL *gsGlobal, ps2_ui_alpha_state_t previous)
+{
+	gsGlobal->PrimAlphaEnable = previous.enabled;
+	if (gsGlobal->PrimAlpha != previous.mode || gsGlobal->PABE != previous.pabe)
+		gsKit_set_primalpha(gsGlobal, previous.mode, previous.pabe);
+}
+
+static void ps2_drawUISprite(void *data, void *tex, int tex_format, int tex_swizzled,
+	int tex_width, int tex_height, int tex_stride,
+	int su, int sv, int sw, int sh,
+	int dx, int dy, int dw, int dh, int blend)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	GSTEXTURE *texture = (GSTEXTURE *)tex;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	(void)tex_format;
+	(void)tex_swizzled;
+	(void)tex_width;
+	(void)tex_height;
+	(void)tex_stride;
+	if (!texture || !texture->Vram)
+		return;
+
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, blend);
+	/* UI CT32 textures carry their own alpha convention; keep the game's
+	 * indexed-texture alpha test out of this draw. */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+
+	gsKit_prim_sprite_texture(gsGlobal, texture,
+		(float)dx - 0.5f, (float)dy - 0.5f, (float)su, (float)sv,
+		(float)(dx + dw) - 0.5f, (float)(dy + dh) - 0.5f,
+		(float)(su + sw), (float)(sv + sh),
+		0, GS_SETREG_RGBA(0x80, 0x80, 0x80, 0x80));
+
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_drawUILine(void *data,
+	int x1, int y1, int x2, int y2, uint32_t color)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	gs_rgbaq rgbaq = ps2_ui_color_to_rgbaq(color);
+	uint8_t a = (uint8_t)(color >> 24);
+	int has_alpha = a != 0xFF;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	/* Disable alpha test for non-textured UI drawing */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, has_alpha);
+
+	gsKit_prim_line(gsGlobal, x1, y1, x2, y2, 0, rgbaq.color.rgbaq);
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_drawUILineGradient(void *data,
+	int x1, int y1, int x2, int y2,
+	uint32_t color1, uint32_t color2)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int steps, i;
+	int dx, dy;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	/* Disable alpha test for non-textured UI drawing */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, 1);
+
+	dx = x2 - x1;
+	dy = y2 - y1;
+	steps = (dx > 0 ? dx : -dx) > (dy > 0 ? dy : -dy) ? 
+	        (dx > 0 ? dx : -dx) : (dy > 0 ? dy : -dy);
+
+	if (steps == 0) {
+		gs_rgbaq rgbaq = ps2_ui_color_to_rgbaq(color1);
+		gsKit_prim_point(gsGlobal, x1, y1, 0, rgbaq.color.rgbaq);
+		ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+		gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+		return;
+	}
+
+	uint8_t a1 = (uint8_t)(color1 >> 24);
+	uint8_t r1 = (uint8_t)(color1 & 0xFF);
+	uint8_t g1 = (uint8_t)((color1 >> 8) & 0xFF);
+	uint8_t b1 = (uint8_t)((color1 >> 16) & 0xFF);
+
+	uint8_t a2 = (uint8_t)(color2 >> 24);
+	uint8_t r2 = (uint8_t)(color2 & 0xFF);
+	uint8_t g2 = (uint8_t)((color2 >> 8) & 0xFF);
+	uint8_t b2 = (uint8_t)((color2 >> 16) & 0xFF);
+
+	for (i = 0; i <= steps; i++) {
+		float t = (float)i / steps;
+		int x = x1 + (int)(dx * t);
+		int y = y1 + (int)(dy * t);
+		
+		uint8_t r = (uint8_t)(r1 + (r2 - r1) * t);
+		uint8_t g = (uint8_t)(g1 + (g2 - g1) * t);
+		uint8_t b = (uint8_t)(b1 + (b2 - b1) * t);
+		uint8_t a = ps2_ui_alpha_to_gs((uint8_t)(a1 + (a2 - a1) * t));
+
+		gsKit_prim_point(gsGlobal, x, y, 0, GS_SETREG_RGBA(r, g, b, a));
+	}
+
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_drawUIRect(void *data,
+	int x, int y, int w, int h, uint32_t color)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+
+	gs_rgbaq rgbaq = ps2_ui_color_to_rgbaq(color);
+	uint8_t a = (uint8_t)(color >> 24);
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	/* Disable alpha test for non-textured UI drawing */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, a != 0xFF);
+
+	int sx = x;
+	int sy = y;
+	int ex = x + w;
+	int ey = y + h;
+
+	/* 4 lines = 8 vertices (line list: each pair is a segment) */
+	GSPRIMPOINT vertices[8];
+
+	/* top */
+	vertices[0].xyz2 = vertex_to_XYZ2(gsGlobal, sx, sy, 0);
+	vertices[0].rgbaq = rgbaq;
+	vertices[1].xyz2 = vertex_to_XYZ2(gsGlobal, ex, sy, 0);
+	vertices[1].rgbaq = rgbaq;
+
+	/* right */
+	vertices[2].xyz2 = vertex_to_XYZ2(gsGlobal, ex, sy, 0);
+	vertices[2].rgbaq = rgbaq;
+	vertices[3].xyz2 = vertex_to_XYZ2(gsGlobal, ex, ey, 0);
+	vertices[3].rgbaq = rgbaq;
+
+	/* bottom */
+	vertices[4].xyz2 = vertex_to_XYZ2(gsGlobal, ex, ey, 0);
+	vertices[4].rgbaq = rgbaq;
+	vertices[5].xyz2 = vertex_to_XYZ2(gsGlobal, sx, ey, 0);
+	vertices[5].rgbaq = rgbaq;
+
+	/* left */
+	vertices[6].xyz2 = vertex_to_XYZ2(gsGlobal, sx, ey, 0);
+	vertices[6].rgbaq = rgbaq;
+	vertices[7].xyz2 = vertex_to_XYZ2(gsGlobal, sx, sy, 0);
+	vertices[7].rgbaq = rgbaq;
+
+	gsKit_prim_list_line_goraud_3d(gsGlobal, 8, vertices);
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_fillUIRect(void *data,
+	int x, int y, int w, int h, uint32_t color)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+
+	uint8_t a = (uint8_t)(color >> 24);
+	gs_rgbaq rgbaq = ps2_ui_color_to_rgbaq(color);
+	int has_alpha = a != 0xFF;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	/* Disable alpha test for non-textured UI drawing */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, has_alpha);
+
+	int sx = x;
+	int sy = y;
+	int ex = x + w;
+	int ey = y + h;
+
+	gs_xyz2 vertices[2];
+	vertices[0] = vertex_to_XYZ2(gsGlobal, sx, sy, 0);
+	vertices[1] = vertex_to_XYZ2(gsGlobal, ex, ey, 0);
+
+	gsKit_prim_list_sprite_flat_color(gsGlobal, rgbaq, 2, vertices);
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_fillUIRectGradient(void *data,
+	int x, int y, int w, int h,
+	uint32_t color1, uint32_t color2, int direction)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2->gsGlobal;
+	int prev_alpha_test = gsGlobal->Test->ATE;
+	ps2_ui_alpha_state_t alpha_state;
+
+	uint8_t a1 = (uint8_t)(color1 >> 24);
+	uint8_t r1 = (uint8_t)(color1 & 0xFF);
+	uint8_t g1 = (uint8_t)((color1 >> 8) & 0xFF);
+	uint8_t b1 = (uint8_t)((color1 >> 16) & 0xFF);
+
+	uint8_t a2 = (uint8_t)(color2 >> 24);
+	uint8_t r2 = (uint8_t)(color2 & 0xFF);
+	uint8_t g2 = (uint8_t)((color2 >> 8) & 0xFF);
+	uint8_t b2 = (uint8_t)((color2 >> 16) & 0xFF);
+
+	if (w <= 0 || h <= 0)
+		return;
+
+	if ((direction == 0 && w == 1) || (direction != 0 && h == 1)) {
+		ps2_fillUIRect(data, x, y, w, h, color1);
+		return;
+	}
+
+	/* Disable alpha test for non-textured UI drawing */
+	gsKit_set_test(gsGlobal, GS_ATEST_OFF);
+	alpha_state = ps2_ui_set_alpha_blend(gsGlobal, 1);
+
+	int sx = x;
+	int sy = y;
+	int ex = x + w;
+	int ey = y + h;
+	int i;
+	int lines = direction == 0 ? w : h;
+	int count = lines * 2;
+	GSPRIMPOINT vertices[count];
+
+	if (direction == 0) {
+		/* Horizontal gradient: w vertical lines */
+		for (i = 0; i < lines; i++) {
+			float t = (float)i / (lines - 1);
+			gs_rgbaq rgbaq = color_to_RGBAQ(
+				(uint8_t)(r1 + (r2 - r1) * t),
+				(uint8_t)(g1 + (g2 - g1) * t),
+				(uint8_t)(b1 + (b2 - b1) * t),
+					ps2_ui_alpha_to_gs((uint8_t)(a1 + (a2 - a1) * t)), 0);
+
+			vertices[i * 2].xyz2 = vertex_to_XYZ2(gsGlobal, sx + i, sy, 0);
+			vertices[i * 2].rgbaq = rgbaq;
+			vertices[i * 2 + 1].xyz2 = vertex_to_XYZ2(gsGlobal, sx + i, ey, 0);
+			vertices[i * 2 + 1].rgbaq = rgbaq;
+		}
+	} else {
+		/* Vertical gradient: h horizontal lines */
+		for (i = 0; i < lines; i++) {
+			float t = (float)i / (lines - 1);
+			gs_rgbaq rgbaq = color_to_RGBAQ(
+				(uint8_t)(r1 + (r2 - r1) * t),
+				(uint8_t)(g1 + (g2 - g1) * t),
+				(uint8_t)(b1 + (b2 - b1) * t),
+					ps2_ui_alpha_to_gs((uint8_t)(a1 + (a2 - a1) * t)), 0);
+
+			vertices[i * 2].xyz2 = vertex_to_XYZ2(gsGlobal, sx, sy + i, 0);
+			vertices[i * 2].rgbaq = rgbaq;
+			vertices[i * 2 + 1].xyz2 = vertex_to_XYZ2(gsGlobal, ex, sy + i, 0);
+			vertices[i * 2 + 1].rgbaq = rgbaq;
+		}
+	}
+
+	gsKit_prim_list_line_goraud_3d(gsGlobal, count, vertices);
+
+	ps2_ui_restore_alpha_blend(gsGlobal, alpha_state);
+	gsKit_set_test(gsGlobal, prev_alpha_test ? GS_ATEST_ON : GS_ATEST_OFF);
+}
+
+static void ps2_setUIScissor(void *data, int x, int y, int w, int h)
+{
+	ps2_video_t *ps2 = (ps2_video_t *)data;
+	GSGLOBAL *gsGlobal = ps2 ? ps2->gsGlobal : NULL;
+	int left, top, right, bottom;
+
+	if (!gsGlobal || w <= 0 || h <= 0)
+		return;
+
+	left = x < 0 ? 0 : x;
+	top = y < 0 ? 0 : y;
+	right = x + w - 1;
+	bottom = y + h - 1;
+	if (right >= gsGlobal->Width)
+		right = gsGlobal->Width - 1;
+	if (bottom >= gsGlobal->Height)
+		bottom = gsGlobal->Height - 1;
+	if (left > right || top > bottom)
+		return;
+
+	gsKit_set_scissor(gsGlobal,
+		GS_SETREG_SCISSOR(left, right, top, bottom));
+}
+
 video_driver_t video_ps2 = {
 	"ps2",
 	ps2_init,
 	ps2_free,
 	ps2_waitVsync,
 	ps2_flipScreen,
+	ps2_beginFrame,
+	ps2_endFrame,
 	ps2_frameAddr,
-	ps2_workFrame,
-	ps2_textureLayer,
+	ps2_video_read_frame,
+	ps2_getOutputSize,
 	ps2_scissor,
 	ps2_clearScreen,
 	ps2_clearFrame,
@@ -1556,14 +1972,22 @@ video_driver_t video_ps2 = {
 	ps2_copyRectFlip,
 	ps2_copyRectRotate,
 	ps2_drawTexture,
-	ps2_getNativeObjects,
 	ps2_uploadMem,
 	ps2_uploadClut,
-	ps2_blitTexture,
-	ps2_blitPoints,
-	ps2_flushCache,
+	ps2_writeIndexedTextureRect,
+	ps2_writeDirectTextureRect,
+	ps2_blitSpriteVertices,
+	ps2_blitPointVertices,
 	ps2_enableDepthTest,
 	ps2_disableDepthTest,
 	ps2_clearDepthBuffer,
 	ps2_clearColorBuffer,
+	ps2_drawUISprite,
+	ps2_drawUILine,
+	ps2_drawUILineGradient,
+	ps2_drawUIRect,
+	ps2_fillUIRect,
+	ps2_fillUIRectGradient,
+	ps2_setUIScissor,
+	NULL,
 };

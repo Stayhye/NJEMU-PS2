@@ -6,8 +6,22 @@
 
 ******************************************************************************/
 
+#include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include "cps1.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/capcom_driver_info.h"
+#include "common/coin.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "cps1/sound_io.h"
 
 
 /******************************************************************************
@@ -94,8 +108,10 @@ struct driver_t CPS1_driver[] =
 	{"daimakai",   CPS_B_01, CPS1_KLUDGE_GHOULS,   GFX_GHOULS   },
 	{"daimakair",  CPS_B_01, CPS1_KLUDGE_GHOULS,   GFX_GHOULS   },
 	{"strider",    CPS_B_01, 0,                    GFX_STRIDER  },
+	{"stridrua",   CPS_B_01, 0,                    GFX_STRIDER  },
 	{"striderua",  CPS_B_01, 0,                    GFX_STRIDER  },
 	{"striderj",   CPS_B_01, 0,                    GFX_STRIDER  },
+	{"stridrja",   CPS_B_01, 0,                    GFX_STRIDER  },
 	{"striderjr",  CPS_B_01, 0,                    GFX_STRIDER  },
 	{"dynwar",     CPS_B_02, 0,                    GFX_DYNWAR   },
 	{"dynwara",    CPS_B_02, 0,                    GFX_DYNWAR   },
@@ -104,6 +120,7 @@ struct driver_t CPS1_driver[] =
 	{"willow",     CPS_B_03, 0,                    GFX_WILLOW   },
 	{"willowo",    CPS_B_03, 0,                    GFX_WILLOW   },
 	{"willowj",    CPS_B_03, 0,                    GFX_WILLOW   },
+	{"willowje",   CPS_B_03, 0,                    GFX_WILLOW   },
 	{"unsquad",    CPS_B_11, 0,                    GFX_UNSQUAD  },
 	{"area88",     CPS_B_11, 0,                    GFX_UNSQUAD  },
 	{"area88r",    CPS_B_01, 0,                    GFX_UNSQUAD  },
@@ -128,6 +145,7 @@ struct driver_t CPS1_driver[] =
 	{"1941j",      CPS_B_05, 0,                    GFX_1941     },
 	{"mercs",      CPS_B_12, CPS1_KLUDGE_MERCS,    GFX_MERCS    },
 	{"mercsu",     CPS_B_12, CPS1_KLUDGE_MERCS,    GFX_MERCS    },
+	{"mercsua",    CPS_B_12, CPS1_KLUDGE_MERCS,    GFX_MERCS    },
 	{"mercsur1",   CPS_B_12, CPS1_KLUDGE_MERCS,    GFX_MERCS    },
 	{"mercsj",     CPS_B_12, CPS1_KLUDGE_MERCS,    GFX_MERCS    },
 	{"msword",     CPS_B_13, 0,                    GFX_MSWORD   },
@@ -173,6 +191,7 @@ struct driver_t CPS1_driver[] =
 	{"3wonders",   BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
 	{"3wondersr1", BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
 	{"3wondersu",  BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
+	{"3wonderu",   BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
 	{"wonder3",    BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
 	{"3wondersb",  BATTRY_1, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
 	{"3wondersh",  CPS_B_02, CPS1_KLUDGE_3WONDERS, GFX_3WONDERS },
@@ -188,7 +207,9 @@ struct driver_t CPS1_driver[] =
 	{"captcomm",   BATTRY_3, 0,                    GFX_CAPTCOMM },
 	{"captcommr1", BATTRY_3, 0,                    GFX_CAPTCOMM },
 	{"captcommu",  BATTRY_3, 0,                    GFX_CAPTCOMM },
+	{"captcomu",   BATTRY_3, 0,                    GFX_CAPTCOMM },
 	{"captcommj",  BATTRY_3, 0,                    GFX_CAPTCOMM },
+	{"captcomj",   BATTRY_3, 0,                    GFX_CAPTCOMM },
 	{"captcommjr1",BATTRY_3, 0,                    GFX_CAPTCOMM },
 #if !RELEASE
 	{"captcommb",  BATTRY_3, 0,                    GFX_CAPTCOMM },
@@ -210,6 +231,7 @@ struct driver_t CPS1_driver[] =
 	{"sf2ceua",    NOBATTRY, 0,                    GFX_SF2      },
 	{"sf2ceub",    NOBATTRY, 0,                    GFX_SF2      },
 	{"sf2ceuc",    NOBATTRY, 0,                    GFX_SF2      },
+	{"sf2cej",     NOBATTRY, 0,                    GFX_SF2      },
 	{"sf2ceja",    NOBATTRY, 0,                    GFX_SF2      },
 	{"sf2cejb",    NOBATTRY, 0,                    GFX_SF2      },
 	{"sf2cejc",    NOBATTRY, 0,                    GFX_SF2      },
@@ -289,8 +311,10 @@ struct driver_t CPS1_driver[] =
 #endif
 	{"punisher",   QSOUND_3, 0,                    GFX_PUNISHER },
 	{"punisheru",  QSOUND_3, 0,                    GFX_PUNISHER },
+	{"punishru",   QSOUND_3, 0,                    GFX_PUNISHER },
 	{"punisherh",  QSOUND_3, 0,                    GFX_PUNISHER },
 	{"punisherj",  QSOUND_3, 0,                    GFX_PUNISHER },
+	{"punishrj",   QSOUND_3, 0,                    GFX_PUNISHER },
 #if !RELEASE
 	{"punisherbz", NOBATTRY, 0,                    GFX_PUNISHER },
 	{"punisherjd", QSOUND_3, 0,                    GFX_PUNISHER },
@@ -298,6 +322,7 @@ struct driver_t CPS1_driver[] =
 #endif
 	{"slammast",   QSOUND_4, 0,                    GFX_SLAMMAST },
 	{"slammastu",  QSOUND_4, 0,                    GFX_SLAMMAST },
+	{"slammasu",   QSOUND_4, 0,                    GFX_SLAMMAST },
 #if !RELEASE
 //	{"slammasa",   QSOUND_4, 0,                    GFX_SLAMMAST },
 //	{"slammash",   QSOUND_4, 0,                    GFX_SLAMMAST },
@@ -307,10 +332,12 @@ struct driver_t CPS1_driver[] =
 	{"mbombrdj",   QSOUND_5, 0,                    GFX_SLAMMAST },
 	{"sf2hf",      NOBATTRY, 0,                    GFX_SF2HF    },
 	{"sf2hfu",     NOBATTRY, 0,                    GFX_SF2HF    },
+	{"sf2t",       NOBATTRY, 0,                    GFX_SF2HF    },
 	{"sf2hfj",     NOBATTRY, 0,                    GFX_SF2HF    },
+	{"sf2tj",      NOBATTRY, 0,                    GFX_SF2HF    },
 	{"qad",        BATTRY_7, 0,                    GFX_QAD      },
-	{"qadjr",      NOBATTRY, 0,                    GFX_QADJ     },
-	{"qtono2j",    NOBATTRY, 0,                    GFX_QTONO2   },
+	{"qadj",        NOBATTRY, 0,                    GFX_QADJ     },
+	{"qtono2",      NOBATTRY, 0,                    GFX_QTONO2   },
 	{"megaman",    NOBATTRY, 0,                    GFX_MEGAMAN  },
 	{"megamana",   NOBATTRY, 0,                    GFX_MEGAMAN  },
 	{"rockmanj",   NOBATTRY, 0,                    GFX_MEGAMAN  },
@@ -325,10 +352,15 @@ struct driver_t CPS1_driver[] =
 	{"sfzbch",     NOBATTRY, 0,                    GFX_SFZCH    },
 	{"wofch",      NOBATTRY, 0,                    GFX_WOF      },
 	{"ganbare",    NOBATTRY, 0,                    GFX_SFZCH    },
-	{NULL}
+	{0}
 };
 
 struct driver_t *driver;
+
+const char *capcom_driver_name(void)
+{
+	return driver != NULL ? driver->name : NULL;
+}
 
 
 /******************************************************************************
@@ -615,7 +647,11 @@ static struct EEPROM_interface qsound_eeprom_interface =
 	8,		/* data bits */
 	"0110",	/*  read command */
 	"0101",	/* write command */
-	"0111"	/* erase command */
+	"0111",	/* erase command */
+	NULL,	/* lock command */
+	NULL,	/* unlock command */
+	0,		/* multi-read */
+	0		/* reset delay */
 };
 
 static struct EEPROM_interface pang3_eeprom_interface =
@@ -624,30 +660,36 @@ static struct EEPROM_interface pang3_eeprom_interface =
 	16,		/* data bits */
 	"0110",	/*  read command */
 	"0101",	/* write command */
-	"0111"	/* erase command */
+	"0111",	/* erase command */
+	NULL,	/* lock command */
+	NULL,	/* unlock command */
+	0,		/* multi-read */
+	0		/* reset delay */
 };
 
 static void cps1_nvram_read_write(int read_or_write)
 {
 	char path[PATH_MAX];
-	FILE *fp;
+	int fd;
 
-	sprintf(path, "%snvram/%s.nv", launchDir, game_name);
+	if (!path_format(path, sizeof(path), "%snvram/%s.nv", launchDir, game_name)) return;
 
 	if (read_or_write)
 	{
-		if ((fp = fopen(path, "wb")) != NULL)
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd >= 0)
 		{
-			EEPROM_save(fp);
-			fclose(fp);
+			EEPROM_save(fd);
+			close(fd);
 		}
 	}
 	else
 	{
-		if ((fp = fopen(path, "rb")) != NULL)
+		fd = open(path, O_RDONLY);
+		if (fd >= 0)
 		{
-			EEPROM_load(fp);
-			fclose(fp);
+			EEPROM_load(fd);
+			close(fd);
 		}
 	}
 }

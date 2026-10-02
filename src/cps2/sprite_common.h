@@ -10,6 +10,7 @@
 #define CPS2_SPRITE_COMMON_H
 
 #include "cps2.h"
+#include "common/video_geometry.h"
 
 /******************************************************************************
 	Constants/Macros
@@ -63,28 +64,24 @@ struct sprite_t
 extern SPRITE ALIGN16_DATA *object_head[OBJECT_HASH_SIZE];
 extern SPRITE ALIGN16_DATA object_data[OBJECT_TEXTURE_SIZE];
 extern SPRITE ALIGN16_DATA *object_free_head;
-extern uint8_t *tex_object;
 extern uint16_t object_texture_num;
 
 /* SCROLL1 */
 extern SPRITE ALIGN16_DATA *scroll1_head[SCROLL1_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll1_data[SCROLL1_TEXTURE_SIZE];
 extern SPRITE ALIGN16_DATA *scroll1_free_head;
-extern uint8_t *tex_scroll1;
 extern uint16_t scroll1_texture_num;
 
 /* SCROLL2 */
 extern SPRITE ALIGN16_DATA *scroll2_head[SCROLL2_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll2_data[SCROLL2_TEXTURE_SIZE];
 extern SPRITE ALIGN16_DATA *scroll2_free_head;
-extern uint8_t *tex_scroll2;
 extern uint16_t scroll2_texture_num;
 
 /* SCROLL3 */
 extern SPRITE ALIGN16_DATA *scroll3_head[SCROLL3_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll3_data[SCROLL3_TEXTURE_SIZE];
 extern SPRITE ALIGN16_DATA *scroll3_free_head;
-extern uint8_t *tex_scroll3;
 extern uint16_t scroll3_texture_num;
 
 /* Scroll2 clipping */
@@ -101,31 +98,11 @@ extern int16_t object_min_y;
 /* Pen usage */
 extern uint8_t *pen_usage;
 
-/* Screen bitmap */
-extern uint16_t *scrbitmap;
-
 /* Color table for palette index encoding */
-extern const uint32_t ALIGN16_DATA color_table[16];
-
-/* Swizzle table (8-bit color) */
-extern const int ALIGN16_DATA swizzle_table_8bit[32];
+extern const uint32_t ALIGN16_DATA sprite_color_table[16];
 
 /* Frame counter (from vidhrdw.c) */
 extern uint32_t frames_displayed;
-
-/* Software rendering functions for SCROLL2 */
-void drawgfx16_16x16(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipx(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipxy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-
-void drawgfx16_16x16_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipx_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipxy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-
-/* Function pointer array for software rendering */
-extern void ALIGN16_DATA (*drawgfx16[8])(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
 
 /******************************************************************************
 	Common function declarations

@@ -13,43 +13,143 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.target }} LARGE_MEMORY=${{ matrix.large_memory }} COMMAND_LIST=${{ matrix.command_list }} ADHOC=${{ matrix.adhoc }} SAVE_STATE=${{ matrix.save_state }}
+    name: ${{ matrix.target }} COMMAND_LIST=${{ matrix.command_list }} ADHOC=${{ matrix.adhoc }} SAVE_STATE=${{ matrix.save_state }} GUI=${{ matrix.gui }} IRXIMG=${{ matrix.external_irx }} FAST_CACHE=${{ matrix.fast_cache }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [MVS, NCDZ, CPS1, CPS2]
-        large_memory: [OFF] #TODO: ON
+        target: [MVS, NCDZ, CPS1, CPS2] 
         command_list: [OFF] #TODO: ON
         adhoc: [OFF] #TODO: ON
         save_state: [OFF] #TODO: OFF
-        # Always the GUI build (NO_GUI=OFF); the no-GUI build was dropped.
+        gui: [OFF, ON]
+        external_irx: [OFF]
+        fast_cache: [OFF]
         exclude:
           - target: NCDZ
             adhoc: ON
           - adhoc: ON
             save_state: FALSE
+        include:
+          - target: CPS1
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: OFF
+          - target: CPS2
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: OFF
+            fast_cache: ON
+          - target: CPS2
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: ON
+            fast_cache: ON
+          - target: MVS
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: OFF
+            fast_cache: ON
+          - target: MVS
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: ON
+            fast_cache: ON
+          - target: NCDZ
+            command_list: ON
+            adhoc: OFF
+            save_state: ON
+            gui: ON
+            external_irx: OFF
+          - target: MVS
+            command_list: OFF
+            adhoc: OFF
+            save_state: OFF
+            gui: OFF
+            external_irx: ON
+            fast_cache: OFF
+          - target: CPS2
+            command_list: OFF
+            adhoc: OFF
+            save_state: OFF
+            gui: OFF
+            external_irx: ON
+            fast_cache: OFF
       fail-fast: false
 
     container: ps2dev/ps2dev:latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install dependencies
       run: |
-        apk add build-base git bash cmake
+        apk add build-base git bash cmake python3
 
-    - name: Compile project (GUI build)
+    # libbdm correctness fix intended for a future upstream PS2SDK PR.
+    # cacheio itself is owned and built by ps2_drivers.
+    - name: Checkout PS2SDK BDM cache fix
+      uses: actions/checkout@v7
+      with:
+        repository: fjtrujy/ps2sdk
+        ref: bdm-cache-read-ahead-fix
+        path: .ci-deps/ps2sdk
+        persist-credentials: false
+
+    - name: Build and install PS2SDK
+      working-directory: .ci-deps/ps2sdk
+      run: |
+        export PS2SDKSRC="$PWD"
+        git rev-parse HEAD
+        make -j "$(getconf _NPROCESSORS_ONLN)"
+        make install
+
+    - name: Checkout ps2_drivers njemu
+      uses: actions/checkout@v7
+      with:
+        repository: fjtrujy/ps2_drivers
+        ref: njemu
+        path: .ci-deps/ps2_drivers
+        persist-credentials: false
+
+    - name: Build, validate and install ps2_drivers
+      run: |
+        git -C .ci-deps/ps2_drivers rev-parse HEAD
+        cmake -S .ci-deps/ps2_drivers -B .ci-deps/ps2_drivers/build \
+          -DCMAKE_TOOLCHAIN_FILE="$PS2DEV/share/ps2dev.cmake" \
+          -DBUILD_SAMPLES=OFF
+        cmake --build .ci-deps/ps2_drivers/build \
+          --parallel "$(getconf _NPROCESSORS_ONLN)"
+        cmake --build .ci-deps/ps2_drivers/build --target \
+          ps2_drivers_irximg_check ps2_drivers_irximg_stage_check \
+          ps2_drivers_img_payload_check
+        cmake --install .ci-deps/ps2_drivers/build
+        test -s "$PS2SDK/ports/lib/libps2_drivers_img.a"
+        test -s "$PS2SDK/ports/include/cacheio.h"
+        test -s "$PS2SDK/ports/share/ps2_drivers/ps2_drivers.irximg"
+        test -s "$PS2SDK/ports/share/ps2_drivers/ps2_drivers_irximg_bootstrap.elf"
+
+    - name: Compile project
       run: |
         mkdir build
         cd build
         cmake -DPLATFORM="PS2" \
           -DCMAKE_TOOLCHAIN_FILE=$PS2DEV/share/ps2dev.cmake \
           -DTARGET="${{ matrix.target }}" \
-          -DNO_GUI=OFF \
-          -DLARGE_MEMORY=${{ matrix.large_memory }} \
           -DCOMMAND_LIST=${{ matrix.command_list }} \
           -DADHOC=${{ matrix.adhoc }} \
           -DSAVE_STATE=${{ matrix.save_state }} \
+          -DGUI=${{ matrix.gui }} \
+          -DPS2_EXTERNAL_IRX_IMAGE=${{ matrix.external_irx }} \
+          -DPS2_FAST_CACHE=${{ matrix.fast_cache }} \
           ..
         make -j $(getconf _NPROCESSORS_ONLN)
         cmake --install .
@@ -60,7 +160,7 @@ jobs:
 
     - name: Upload artifacts
       if: ${{ success() }}
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
-        name: NJEMU-${{ steps.slug.outputs.sha8 }}-${{ matrix.target }}-large_memory_${{ matrix.large_memory }}-command_list_${{ matrix.command_list }}-adhoc_${{ matrix.adhoc }}-save_state${{ matrix.save_state }}
+        name: NJEMU-${{ steps.slug.outputs.sha8 }}-${{ matrix.target }}-command_list_${{ matrix.command_list }}-adhoc_${{ matrix.adhoc }}-save_state${{ matrix.save_state }}-gui_${{ matrix.gui }}-irximg_${{ matrix.external_irx }}-fast_cache_${{ matrix.fast_cache }}
         path: build/install/

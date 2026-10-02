@@ -7,7 +7,66 @@
 ******************************************************************************/
 
 #include <limits.h>
-#include "emumain.h"
+#include <stdarg.h>
+#include "emucfg.h"
+#include "common/cmdlist.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/sound.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+
+#if (EMU_SYSTEM == NCDZ)
+#include "common/mp3.h"
+#include "ncdz/driver.h"
+#endif
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include "common/ui.h"
+#include "common/ui_draw.h"
+#include "common/ui_layout.h"
+
+#if (EMU_SYSTEM == CPS1)
+#include "cps1/sprite.h"
+#elif (EMU_SYSTEM == CPS2)
+#include "cps2/sprite.h"
+#elif (EMU_SYSTEM == MVS)
+#include "mvs/sprite.h"
+#elif (EMU_SYSTEM == NCDZ)
+#include "ncdz/sprite.h"
+#endif
+
+static void fd_printf(int fd, const char *fmt, ...)
+{
+	char buf[512];
+	va_list args;
+	int n;
+	va_start(args, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	if (n > 0) { ssize_t io_result = write(fd, buf, (size_t)n); (void)io_result; }
+}
+
+static ssize_t fd_readline(int fd, char *buf, size_t size)
+{
+	size_t i = 0;
+	char c;
+	while (i < size - 1) {
+		if (read(fd, &c, 1) <= 0) break;
+		buf[i++] = c;
+		if (c == '\n') break;
+	}
+	buf[i] = '\0';
+	return (ssize_t)i;
+}
 
 
 /******************************************************************************
@@ -173,7 +232,8 @@ static int check_text_encode(char *buf, int size)
 
 void load_commandlist(const char *game_name, const char *parent_name)
 {
-	FILE *fp;
+	int fd;
+	off_t file_size;
 	char path[PATH_MAX];
 	char lf, *p, *buf, linebuf[512];//256
 	const char *name = game_name;
@@ -187,23 +247,24 @@ void load_commandlist(const char *game_name, const char *parent_name)
 	num_lines = 0;
 	num_items = 0;
 
-	sprintf(path, "%scommand.dat", launchDir);
+	if (!path_format(path, sizeof(path), "%scommand.dat", launchDir)) return;
 
-	if ((fp = fopen(path, "rb")) == NULL)
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
 		return;
 
-	fseek(fp, 0, SEEK_END);
-	size = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
+	file_size = lseek(fd, 0, SEEK_END);
+	lseek(fd, 0, SEEK_SET);
 
-	if (size == 0 || (buf = (char *)malloc(size)) == NULL)
+	if (file_size <= 0 || (buf = (char *)malloc((size_t)file_size)) == NULL)
 	{
-		fclose(fp);
+		close(fd);
 		return;
 	}
+	size = (int)file_size;
 
-	fread(buf, 1, size, fp);
-	fclose(fp);
+	{ ssize_t io_result = read(fd, buf, (size_t)size); (void)io_result; }
+	close(fd);
 
 	// Line feed code check
 	lf_code = check_linefeed_code(linebuf);
@@ -330,10 +391,10 @@ retry:
 	if ((cmdbuf = calloc(1, size)) == NULL)
 		return;
 
-	fp = fopen(path, "rb");
-	fseek(fp, start, SEEK_SET);
-	fread(cmdbuf, 1, size, fp);
-	fclose(fp);
+	fd = open(path, O_RDONLY);
+	lseek(fd, start, SEEK_SET);
+	{ ssize_t io_result = read(fd, cmdbuf, size); (void)io_result; }
+	close(fd);
 
 	// Character code check
 	if (charset == CHARSET_DEFAULT)
@@ -433,7 +494,10 @@ retry:
 	// Initialize display information
 	sel_line   = 0;
 	prev_line  = 0;
-	rows_line  = (charset & CHARSET_GBK) ? 16 : 14;
+	rows_line  = (ui_layout_get()->logical_height - 48) /
+		((charset & CHARSET_GBK) ? 14 : 16);
+	if (rows_line < 1)
+		rows_line = 1;
 	show_lines = rows_line;
 	num_lines  = cmd[0]->lines;
 	if (num_lines < show_lines) show_lines = num_lines;
@@ -441,17 +505,20 @@ retry:
 	top_item   = 0;
 	sel_item   = 0;
 	prev_item  = 0;
-	rows_item  = 13;
+	rows_item  = (ui_layout_get()->logical_height - 64) / 16;
+	if (rows_item < 1)
+		rows_item = 1;
 	show_items = rows_item;
 	if (num_items < show_items) show_items = num_items;
 
 	// Calculate item menu width
-	item_sx = 480;
+	item_sx = ui_layout_get()->logical_width;
 	for (item = 0; item < num_items; item++)
 	{
 		int x;
 
-		x = 480 - (strlen(cmd[item]->line[0]) * 7 + 16);
+		x = ui_layout_get()->logical_width -
+			(strlen(cmd[item]->line[0]) * 7 + 16);
 		if (item_sx > x) item_sx = x;
 	}
 
@@ -506,7 +573,7 @@ void free_commandlist(void)
 
 void commandlist(int flag)
 {
-	int x, y, alpha;
+	int x, y, alpha = 0;
 	int update = 1, menu_counter = 0;
 #if (EMU_SYSTEM == NCDZ)
 	int mp3_paused = 0;
@@ -528,8 +595,9 @@ void commandlist(int flag)
 			mp3_paused = 1;
 		}
 #endif
+		sound_thread_pause(1);
 		sound_thread_enable(0);
-		power_driver->setLowestCpuClock(power_data);
+		power_set_lowest_performance_level();
 	}
 
 	pad_wait_clear();
@@ -544,6 +612,7 @@ void commandlist(int flag)
 		{
 			update = 0;
 
+			video_driver->beginFrame(video_data);
 			show_background();
 
 			small_icon_shadow(8, 3, UI_COLOR(UI_PAL_TITLE), ICON_CMDLIST);
@@ -561,7 +630,7 @@ void commandlist(int flag)
 					textfont_print(6, 37 + 16 * y, UI_COLOR(UI_PAL_SELECT), cmd[sel_item]->line[y + sel_line], charset);
 			}
 
-			x = 480;
+			x = ui_layout_get()->logical_width;
 			if (menu_open)
 			{
 				alpha = 14;
@@ -570,11 +639,14 @@ void commandlist(int flag)
 			else if (menu_counter > 0)
 			{
 				alpha = 14 - ((4 - menu_counter) << 1);
-				x = item_sx + ((480 - item_sx) >> 2) * (4 - menu_counter);
+				x = item_sx +
+					((ui_layout_get()->logical_width - item_sx) >> 2) *
+					(4 - menu_counter);
 			}
-			if (x < 480)
+			if (x < ui_layout_get()->logical_width)
 			{
-				boxfill_alpha(x, 25, 479, 271, UI_COLOR(UI_PAL_BG1), alpha);
+				boxfill_alpha(x, 25, ui_layout_right(0), ui_layout_bottom(0),
+					UI_COLOR(UI_PAL_BG1), alpha);
 
 				for (y = 0; y < rows_item; y++)
 				{
@@ -591,15 +663,18 @@ void commandlist(int flag)
 
 				sprintf(temp, TEXT(COMMAND_LIST_ITEMS), sel_item + 1, num_items);
 				x = uifont_get_string_width(temp);
-				uifont_print(475 - x, 250, UI_COLOR(UI_PAL_SELECT), temp);
+				uifont_print(ui_layout_right(4) - x, ui_layout_bottom(21),
+					UI_COLOR(UI_PAL_SELECT), temp);
 			}
 			else
 			{
 				if (num_lines > rows_line)
-					draw_scrollbar(469, 26, 479, 270, 0, num_lines - rows_line + 1, sel_line);
+					draw_scrollbar(ui_layout_right(10), 26, ui_layout_right(0),
+						ui_layout_bottom(1), 0, num_lines - rows_line + 1, sel_line);
 			}
 
 			update |= ui_show_popup(1);
+			video_driver->endFrame(video_data);
 			video_driver->flipScreen(video_data, 1);
 		}
 		else
@@ -607,6 +682,8 @@ void commandlist(int flag)
 			update = ui_show_popup(0);
 			video_driver->waitVsync(video_data);
 		}
+
+		update |= ui_output_update();
 
 		if (menu_counter)
 		{
@@ -762,13 +839,14 @@ void commandlist(int flag)
 	{
 		ui_popup_reset();
 
-		power_driver->setCpuClock(power_data, platform_cpuclock);
+		power_set_performance_level(platform_performance_level);
 
 		autoframeskip_reset();
 		blit_clear_all_sprite();
 
 		sound_thread_set_volume();
 		sound_thread_enable(1);
+		sound_thread_pause(0);
 
 #if (EMU_SYSTEM == NCDZ)
 		mp3_set_volume();
@@ -801,13 +879,16 @@ void commandlist(int flag)
 
 int commandlist_size_reduction(void)
 {
-	FILE *fp;
+#if (EMU_SYSTEM != NCDZ)
+	int fd_zip;
+#endif
+	int fd_cmd, fd_out;
 	char path[PATH_MAX], path2[PATH_MAX];
 	char *p, linebuf[512], rom_name[512][16];//256
 	int i, j, l, found = 0, total_roms = 0;
-	int num_games, charset, progress;
+	int charset, progress;
 	int header_end, body_start, body_end;
-	int line = 0, line2 = 0, num_cmd;
+	int line = 0;
 	int org_size, new_size;
 	char *textbuf = NULL, **line_ptr = NULL;
 
@@ -818,33 +899,35 @@ int commandlist_size_reduction(void)
 	}
 	total_roms = 97;
 #else
-	sprintf(path, "%szipname." EXT, launchDir);
-	if ((fp = fopen(path, "r")) == NULL)
+	if (!path_format(path, sizeof(path), "%szipname." EXT, launchDir)) return 0;
+	fd_zip = open(path, O_RDONLY);
+	if (fd_zip < 0)
 	{
-		sprintf(path, "%szipnamej." EXT, launchDir);
-		if ((fp = fopen(path, "r")) == NULL)
+		if (!path_format(path, sizeof(path), "%szipnamej." EXT, launchDir)) return 0;
+		fd_zip = open(path, O_RDONLY);
+		if (fd_zip < 0)
 		{
 			return 0;
 		}
 	}
 
-	while (fgets(linebuf, 511, fp))//255
+	while (fd_readline(fd_zip, linebuf, 512) > 0)
 	{
 		char *name = strtok(linebuf, ",");
 		strcpy(rom_name[total_roms++], name);
 	}
-	fclose(fp);
+	close(fd_zip);
 #endif
 
-	sprintf(path, "%scommand.dat", launchDir);
-	if ((fp = fopen(path, "rb")) == NULL)
+	if (!path_format(path, sizeof(path), "%scommand.dat", launchDir)) return 0;
+	fd_cmd = open(path, O_RDONLY);
+	if (fd_cmd < 0)
 		return 0;
 
 	pad_wait_clear();
 	ui_popup_reset();
 	msg_screen_init(WP_CMDLIST, ICON_COMMANDDAT, TEXT(COMMAND_DAT_SIZE_REDUCTION));
 
-	num_games  = 0;
 	header_end = -1;
 	body_start = -1;
 	body_end   = -1;
@@ -875,19 +958,18 @@ int commandlist_size_reduction(void)
 
 	if (!i)
 	{
-		fclose(fp);
+		close(fd_cmd);
 		goto cancel;
 	}
 
-	fseek(fp, 0, SEEK_END);
-	org_size = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
+	org_size = (int)lseek(fd_cmd, 0, SEEK_END);
+	lseek(fd_cmd, 0, SEEK_SET);
 
 	msg_printf("\n");
 	msg_printf(TEXT(CHECKING_COMMAND_DAT_FORMAT));
 
 	// Check number of registered games
-	while (fgets(linebuf, 511, fp) != NULL)//255
+	while (fd_readline(fd_cmd, linebuf, 512) > 0)
 	{
 		if (strrchr(linebuf, '\r') == NULL)
 		{
@@ -935,7 +1017,6 @@ int commandlist_size_reduction(void)
 							// Record first $info
 							body_start = line;
 						}
-						num_games++;
 						found = 1;
 					}
 				}
@@ -957,13 +1038,13 @@ int commandlist_size_reduction(void)
 	if (!found)
 	{
 		msg_printf(TEXT(UNKNOWN_FORMAT));
-		fclose(fp);
+		close(fd_cmd);
 		goto error;
 	}
 	if (line == 0)
 	{
 		msg_printf(TEXT(EMPTY_FILE));
-		fclose(fp);
+		close(fd_cmd);
 		goto error;
 	}
 
@@ -979,9 +1060,9 @@ int commandlist_size_reduction(void)
 	}
 	memset(textbuf, 0, org_size + 1);
 
-	fseek(fp, 0, SEEK_SET);
-	fread(textbuf, 1, org_size, fp);
-	fclose(fp);
+	lseek(fd_cmd, 0, SEEK_SET);
+	{ ssize_t io_result = read(fd_cmd, textbuf, org_size); (void)io_result; }
+	close(fd_cmd);
 
 	if (charset == CHARSET_DEFAULT)
 	{
@@ -1005,7 +1086,7 @@ int commandlist_size_reduction(void)
 	}
 
 	// Create backup filename
-	sprintf(path2, "%scommand.org", launchDir);
+	if (!path_format(path2, sizeof(path2), "%scommand.org", launchDir)) return 0;
 
 	remove(path2);
 
@@ -1019,15 +1100,14 @@ int commandlist_size_reduction(void)
 	//------------------------------------------------------------------
 	// Start reduction process
 	//------------------------------------------------------------------
-	if ((fp = fopen(path, "w")) == NULL)
+	fd_out = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fd_out < 0)
 	{
 		msg_printf(TEXT(COULD_NOT_CREATE_OUTPUT_FILE));
 		goto error;
 	}
 
 	l = 0;
-	line2 = 0;
-	num_cmd = 0;
 	progress = INFO_SEEK;
 
 	msg_printf("\n");
@@ -1035,13 +1115,12 @@ int commandlist_size_reduction(void)
 	if (charset != CHARSET_DEFAULT)
 	{
 		if (charset == CHARSET_GBK)
-			fprintf(fp, "$charset=gbk\r\n");
+			fd_printf(fd_out, "$charset=gbk\r\n");
 		else if (charset == CHARSET_SHIFTJIS)
-			fprintf(fp, "$charset=shift_jis\r\n");
+			fd_printf(fd_out, "$charset=shift_jis\r\n");
 		else
-			fprintf(fp, "$charset=latin1\r\n");
+			fd_printf(fd_out, "$charset=latin1\r\n");
 
-		line2++;
 	}
 
 	// Copy header
@@ -1053,9 +1132,8 @@ int commandlist_size_reduction(void)
 
 			if (strncasecmp(linebuf, "$charset", 8) != 0)
 			{
-				fprintf(fp, "%s\r\n", linebuf);
-				line2++;
-			}
+				fd_printf(fd_out, "%s\r\n", linebuf);
+					}
 		}
 	}
 
@@ -1130,17 +1208,15 @@ int commandlist_size_reduction(void)
 
 								while (j < l)
 								{
-									fprintf(fp, "%s\r\n", line_ptr[j]);
+									fd_printf(fd_out, "%s\r\n", line_ptr[j]);
 									j++;
 								}
 							}
 
 							msg_printf(TEXT(COPYING_x), rom_name[i]);
-							fprintf(fp, "$info=%s\r\n", name);
+							fd_printf(fd_out, "$info=%s\r\n", name);
 							progress = CMD_SEEK;
-							num_cmd++;
-							line2++;
-						}
+											}
 					}
 				}
 			}
@@ -1151,13 +1227,12 @@ int commandlist_size_reduction(void)
 			{
 				// Command start
 				progress = END_SEEK;
-				fprintf(fp, "$cmd\r\n");
-				line2++;
-			}
+				fd_printf(fd_out, "$cmd\r\n");
+					}
 			else if (!strncasecmp(linebuf, "$info", 5))
 			{
 				// Next command - go back 1 line
-				fprintf(fp, "\r\n");
+				fd_printf(fd_out, "\r\n");
 				progress = INFO_SEEK;
 				l--;
 			}
@@ -1168,15 +1243,13 @@ int commandlist_size_reduction(void)
 			{
 				// Command end
 				progress = CMD_SEEK;
-				fprintf(fp, "$end\r\n");
-				line2++;
-			}
+				fd_printf(fd_out, "$end\r\n");
+					}
 			else
 			{
 				// Command list contents - output as-is
-				fprintf(fp, "%s\r\n", linebuf);
-				line2++;
-			}
+				fd_printf(fd_out, "%s\r\n", linebuf);
+					}
 			break;
 		}
 	}
@@ -1189,17 +1262,17 @@ int commandlist_size_reduction(void)
 		for (; l < line; l++)
 		{
 			strcpy(linebuf, line_ptr[l]);
-			fprintf(fp, "%s\r\n", linebuf);
-			line2++;
-		}
+			fd_printf(fd_out, "%s\r\n", linebuf);
+			}
 	}
 
-	fclose(fp);
+	close(fd_out);
 
-	fp = fopen(path, "rb");
-	fseek(fp, 0, SEEK_END);
-	new_size = ftell(fp);
-	fclose(fp);
+	{
+		int tmp_fd = open(path, O_RDONLY);
+		new_size = (int)lseek(tmp_fd, 0, SEEK_END);
+		close(tmp_fd);
+	}
 
 	msg_printf("\n");
 	msg_printf(TEXT(REDUCTION_RESULT), org_size, new_size, 100.0 - ((float)new_size / (float)org_size) * 100.0);

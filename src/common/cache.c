@@ -8,33 +8,48 @@
 
 #include <limits.h>
 #include <sys/param.h>
-#include "emumain.h"
+#include "emucfg.h"
+#include "common/cache.h"
+#include "common/cache_storage_driver.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ticker_driver.h"
+#include "common/ui_text_driver.h"
+#include "common/ui.h"
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "common/memory_sizes.h"
+#include "common/zip_archive.h"
+
+#if (EMU_SYSTEM == CPS2)
+#include "cps2/memintrf.h"
+#include "cps2/vidhrdw.h"
+#elif (EMU_SYSTEM == MVS)
+#include "mvs/memintrf.h"
+#include "mvs/vidhrdw.h"
+#endif
 
 #if USE_CACHE
-#ifdef LARGE_MEMORY
-#define MIN_CACHE_SIZE		0x40		// Lower limit, original 0x40, 4MB
-#else
-#define MIN_CACHE_SIZE		0x20		// Lower limit, original 0x40, 4MB
-#endif
-/*
-32MB 0x200 660CFW exit pspfiler and tempgba,crash.
-26MB 0x1a0 620CFW push vol and screen button crash.
-*/
-#ifdef LARGE_MEMORY
-#define MAX_CACHE_SIZE		0x200		// Upper limit 32MB 0x200  
-#else
-#define MAX_CACHE_SIZE		0x140		// Upper limit 20MB 0x140
-#endif
-#define CACHE_SAFETY		0x20000		// Free memory size after cache allocation 128KB
-#define BLOCK_SIZE			0x10000		// Size of 1 block = 64KB 0x10000 (related to images)
+static inline void cache_read_legacy(int fd, void *buffer, size_t size)
+{
+	ssize_t bytes_read = read(fd, buffer, size);
+	(void)bytes_read;
+}
+
 #define BLOCK_MASK			0xffff
 #define BLOCK_SHIFT			16			// 16
 #define BLOCK_NOT_CACHED	0xffff
 #define BLOCK_EMPTY			0xffffffff
+#define MIN_RUNTIME_CACHE_BLOCKS ((2u * 1024u * 1024u) / CACHE_BLOCK_SIZE)
 
 #if (EMU_SYSTEM == MVS)
 #define MAX_PCM_BLOCKS		0x140		// 0x100 PCM for 3xx
-#define MAX_PCM_SIZE		0x30		// 0x30 smaller value = more remaining memory
 #endif
 
 
@@ -64,28 +79,459 @@ typedef struct cache_s
 } cache_t;
 
 
-static cache_t ALIGN16_DATA cache_data[MAX_CACHE_SIZE];
+static cache_t *cache_data;
 static cache_t *head;
 static cache_t *tail;
 
 static int num_cache;
 static uint16_t ALIGN16_DATA blocks[MAX_CACHE_BLOCKS];
-static int64_t cache_fd;
+static int32_t cache_fd;
+static zip_archive_t cache_zip_archive;
+static zip_entry_t cache_zip_entry;
 
 int cache_type;
 static char spr_cache_name[PATH_MAX];
 
+static void cache_list_init(cache_t *data, int count, cache_t **list_head, cache_t **list_tail)
+{
+	int i;
+
+	*list_head = NULL;
+	*list_tail = NULL;
+	if (data == NULL || count <= 0)
+		return;
+
+	memset(data, 0, sizeof(*data) * (size_t)count);
+	for (i = 0; i < count; i++)
+	{
+		data[i].idx = i;
+		data[i].block = -1;
+		data[i].prev = i > 0 ? &data[i - 1] : NULL;
+		data[i].next = i + 1 < count ? &data[i + 1] : NULL;
+	}
+
+	*list_head = &data[0];
+	*list_tail = &data[count - 1];
+}
+
+static void cache_rotate_head_to_tail(cache_t **list_head, cache_t **list_tail)
+{
+	cache_t *p = *list_head;
+
+	if (p == NULL || p == *list_tail)
+		return;
+
+	*list_head = p->next;
+	(*list_head)->prev = NULL;
+	p->prev = *list_tail;
+	p->next = NULL;
+	(*list_tail)->next = p;
+	*list_tail = p;
+}
+
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
+/* PCM cache infrastructure is always compiled; pcm_cache_enable is the
+ * runtime gate selected by the game-specific memory plan. */
 int pcm_cache_enable;
 
-static cache_t ALIGN16_DATA pcm_data[MAX_PCM_SIZE];
+static cache_t *pcm_data;
 static cache_t *pcm_head;
 static cache_t *pcm_tail;
+static int num_pcm_cache;
 
 static uint16_t ALIGN16_DATA pcm_blocks[MAX_PCM_BLOCKS];
 static int32_t pcm_fd;
+static int64_t cache_file_pos;
+static int64_t pcm_file_pos;
+static int cache_storage_handle = -1;
+static int pcm_storage_handle = -1;
+#ifdef CACHE_IO_VALIDATE_ACCELERATED
+static uint8_t ALIGN16_DATA cache_validation_buffer[CACHE_BLOCK_SIZE];
 #endif
+
+static int cachefile_open_resolved(int type, char *resolved_path, size_t resolved_size)
+{
+	int32_t fd = -1;
+	char path[PATH_MAX];
+
+	switch (type)
+	{
+	case CACHE_INFO:
+		if (use_parent_crom && use_parent_srom && use_parent_vrom)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/cache_info", cache_dir, parent_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		else
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/cache_info", cache_dir, game_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		break;
+
+	case CACHE_CROM:
+		if (use_parent_crom)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/crom", cache_dir, parent_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		if (fd < 0)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/crom", cache_dir, game_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		break;
+
+	case CACHE_SROM:
+		if (use_parent_srom)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/srom", cache_dir, parent_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		if (fd < 0)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/srom", cache_dir, game_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		break;
+
+	case CACHE_VROM:
+		if (use_parent_vrom)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/vrom", cache_dir, parent_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		if (fd < 0)
+		{
+			if (!path_format(path, sizeof(path), "%s/%s_cache/vrom", cache_dir, game_name)) break;
+			fd = open(path, O_RDONLY, 0777);
+		}
+		break;
+	}
+
+	if (fd >= 0 && resolved_path != NULL && resolved_size > 0)
+		snprintf(resolved_path, resolved_size, "%s", path);
+
+	return fd;
+}
+
+int cachefile_open(int type)
+{
+	return cachefile_open_resolved(type, NULL, 0);
+}
+
+static int cache_storage_open_optional(const char *path, const char *name)
+{
+	int handle;
+
+	if (cache_storage_driver == NULL || cache_storage_driver->open == NULL ||
+		cache_storage_driver->readAt == NULL || cache_storage_driver->close == NULL)
+		return -1;
+
+	handle = cache_storage_driver->open(path);
+	if (handle >= 0)
+		printf("[cache-io] %s extent reader enabled\n", name);
+	return handle;
+}
+
+static void cache_storage_close_optional(int *handle)
+{
+	if (handle == NULL || *handle < 0)
+		return;
+
+	if (cache_storage_driver != NULL && cache_storage_driver->close != NULL)
+		cache_storage_driver->close(*handle);
+	*handle = -1;
+}
+
+size_t cachefile_zip_read(int type, const char *name, void *buf, size_t size)
+{
+	zip_archive_t archive = {0};
+	zip_entry_t entry = {0};
+	int use_parent = 0;
+	char path[PATH_MAX];
+	size_t bytes = 0;
+
+	switch (type)
+	{
+	case CACHE_CROM: use_parent = use_parent_crom; break;
+	case CACHE_SROM: use_parent = use_parent_srom; break;
+	case CACHE_VROM: use_parent = use_parent_vrom; break;
+	default: break;
+	}
+
+	if (use_parent && parent_name[0])
+	{
+		if (!path_format(path, sizeof(path), "%s/%s_cache.zip", cache_dir, parent_name)) return 0;
+		if (zip_archive_open(&archive, path))
+		{
+			if (zip_entry_open(&archive, name, &entry))
+			{
+				bytes = zip_entry_read(&entry, buf, size);
+				if (!zip_entry_close(&entry))
+					bytes = 0;
+				zip_archive_close(&archive);
+				return bytes;
+			}
+			zip_archive_close(&archive);
+		}
+	}
+
+	if (!path_format(path, sizeof(path), "%s/%s_cache.zip", cache_dir, game_name)) return 0;
+	if (!zip_archive_open(&archive, path))
+		return 0;
+
+	if (zip_entry_open(&archive, name, &entry))
+	{
+		bytes = zip_entry_read(&entry, buf, size);
+		if (!zip_entry_close(&entry))
+			bytes = 0;
+	}
+	zip_archive_close(&archive);
+	return bytes;
+}
+
+#ifdef CACHE_IO_PROFILE
+typedef struct cache_io_profile_s
+{
+	uint64_t preload_reads;
+	uint64_t preload_seeks;
+	uint64_t preload_seek_skips;
+	uint64_t preload_accelerated_reads;
+	uint64_t preload_bytes;
+	uint64_t preload_time_us;
+	uint64_t hits;
+	uint64_t misses;
+	uint64_t sequential_misses;
+	uint64_t seeks;
+	uint64_t seek_skips;
+	uint64_t accelerated_reads;
+	uint64_t accelerated_fallbacks;
+	uint64_t bytes_read;
+	uint64_t miss_time_us;
+	uint64_t max_miss_time_us;
+	int32_t last_miss_block;
+} cache_io_profile_t;
+
+static cache_io_profile_t crom_io_profile;
+static cache_io_profile_t pcm_io_profile;
+
+static uint64_t cache_io_now_us(void)
+{
+	if (ticker_data && ticker_driver && ticker_driver->currentUs)
+		return ticker_driver->currentUs(ticker_data);
+	return 0;
+}
+
+static void cache_io_profile_reset(cache_io_profile_t *profile)
+{
+	memset(profile, 0, sizeof(*profile));
+	profile->last_miss_block = -1;
+}
+
+static void cache_io_profile_miss(cache_io_profile_t *profile, int block)
+{
+	profile->misses++;
+	if (profile->last_miss_block >= 0 && block == profile->last_miss_block + 1)
+		profile->sequential_misses++;
+	profile->last_miss_block = block;
+}
+
+static void cache_io_profile_time(cache_io_profile_t *profile, uint64_t start)
+{
+	uint64_t elapsed;
+
+	if (!start)
+		return;
+
+	elapsed = cache_io_now_us() - start;
+	profile->miss_time_us += elapsed;
+	if (elapsed > profile->max_miss_time_us)
+		profile->max_miss_time_us = elapsed;
+}
+
+static void cache_io_profile_print(const char *name, const cache_io_profile_t *profile)
+{
+	uint64_t accesses = profile->hits + profile->misses;
+	uint64_t avg_us = profile->misses ? profile->miss_time_us / profile->misses : 0;
+	uint64_t rate_x100 = accesses ? (profile->hits * 10000) / accesses : 0;
+
+	printf("[cache-io] %s preload_reads=%llu preload_seeks=%llu "
+		"preload_seek_skips=%llu preload_accelerated_reads=%llu "
+		"preload_bytes=%llu preload_time_us=%llu "
+		"hits=%llu misses=%llu hit_rate=%llu.%02llu%% "
+		"sequential_misses=%llu seeks=%llu seek_skips=%llu "
+		"accelerated_reads=%llu accelerated_fallbacks=%llu bytes=%llu "
+		"avg_miss_us=%llu max_miss_us=%llu\n",
+		name,
+		(unsigned long long)profile->preload_reads,
+		(unsigned long long)profile->preload_seeks,
+		(unsigned long long)profile->preload_seek_skips,
+		(unsigned long long)profile->preload_accelerated_reads,
+		(unsigned long long)profile->preload_bytes,
+		(unsigned long long)profile->preload_time_us,
+		(unsigned long long)profile->hits,
+		(unsigned long long)profile->misses,
+		(unsigned long long)(rate_x100 / 100),
+		(unsigned long long)(rate_x100 % 100),
+		(unsigned long long)profile->sequential_misses,
+		(unsigned long long)profile->seeks,
+		(unsigned long long)profile->seek_skips,
+		(unsigned long long)profile->accelerated_reads,
+		(unsigned long long)profile->accelerated_fallbacks,
+		(unsigned long long)profile->bytes_read,
+		(unsigned long long)avg_us,
+		(unsigned long long)profile->max_miss_time_us);
+}
+
+static void cache_io_profile_snapshot(const cache_io_profile_t *profile)
+{
+	if (profile->misses == 0 || (profile->misses & 15) != 0)
+		return;
+
+	cache_io_profile_print(profile == &pcm_io_profile ? "pcm" : "crom", profile);
+}
+#endif
+
+static int mvs_cache_read_block(int fd, int *storage_handle, int64_t *known_pos,
+	uint16_t block, uint8_t *dst, const char *name
+#ifdef CACHE_IO_PROFILE
+	, cache_io_profile_t *profile, int runtime_miss
+#endif
+)
+{
+	const int64_t offset = (int64_t)block << BLOCK_SHIFT;
+	ssize_t bytes;
+#ifdef CACHE_IO_PROFILE
+	uint64_t start = cache_io_now_us();
+#endif
+
+	if (storage_handle != NULL && *storage_handle >= 0 &&
+		cache_storage_driver != NULL && cache_storage_driver->readAt != NULL)
+	{
+		bytes = cache_storage_driver->readAt(*storage_handle, (uint64_t)offset,
+			dst, CACHE_BLOCK_SIZE);
+		if (bytes == CACHE_BLOCK_SIZE)
+		{
+#ifdef CACHE_IO_VALIDATE_ACCELERATED
+			ssize_t reference_bytes;
+			size_t mismatch;
+
+			memcpy(cache_validation_buffer, dst, CACHE_BLOCK_SIZE);
+			if (lseek(fd, offset, SEEK_SET) < 0)
+			{
+				printf("[cache-io-validate] %s block=%u offset=%lld reference seek failed\n",
+					name, (unsigned int)block, (long long)offset);
+				*known_pos = -1;
+				return 0;
+			}
+			reference_bytes = read(fd, dst, CACHE_BLOCK_SIZE);
+			if (reference_bytes != CACHE_BLOCK_SIZE)
+			{
+				printf("[cache-io-validate] %s block=%u offset=%lld reference read=%d\n",
+					name, (unsigned int)block, (long long)offset, (int)reference_bytes);
+				*known_pos = -1;
+				return 0;
+			}
+			*known_pos = offset + CACHE_BLOCK_SIZE;
+
+			for (mismatch = 0; mismatch < CACHE_BLOCK_SIZE; ++mismatch)
+			{
+				if (cache_validation_buffer[mismatch] != dst[mismatch])
+					break;
+			}
+			if (mismatch != CACHE_BLOCK_SIZE)
+			{
+				printf("[cache-io-validate] MISMATCH %s block=%u offset=%lld byte=%u accelerated=%02x posix=%02x\n",
+					name, (unsigned int)block, (long long)offset,
+					(unsigned int)mismatch, cache_validation_buffer[mismatch], dst[mismatch]);
+			}
+#endif
+#ifdef CACHE_IO_PROFILE
+			if (runtime_miss)
+			{
+				profile->accelerated_reads++;
+				profile->bytes_read += CACHE_BLOCK_SIZE;
+				cache_io_profile_time(profile, start);
+				cache_io_profile_snapshot(profile);
+			}
+			else
+			{
+				uint64_t elapsed = start ? cache_io_now_us() - start : 0;
+				profile->preload_reads++;
+				profile->preload_accelerated_reads++;
+				profile->preload_bytes += CACHE_BLOCK_SIZE;
+				profile->preload_time_us += elapsed;
+			}
+#endif
+			return 1;
+		}
+
+#ifdef CACHE_IO_PROFILE
+		profile->accelerated_fallbacks++;
+#endif
+		printf("[cache-io] %s extent read failed (%d); disabling accelerator\n",
+			name, (int)bytes);
+		cache_storage_close_optional(storage_handle);
+	}
+
+	if (
+#ifdef CACHE_IO_FORCE_SEEK
+		1
+#else
+		*known_pos != offset
+#endif
+	)
+	{
+		if (lseek(fd, offset, SEEK_SET) < 0)
+		{
+			*known_pos = -1;
+			return 0;
+		}
+#ifdef CACHE_IO_PROFILE
+		if (runtime_miss)
+			profile->seeks++;
+		else
+			profile->preload_seeks++;
+#endif
+	}
+#ifdef CACHE_IO_PROFILE
+	else if (runtime_miss)
+	{
+		profile->seek_skips++;
+	}
+	else
+	{
+		profile->preload_seek_skips++;
+	}
+#endif
+
+	bytes = read(fd, dst, CACHE_BLOCK_SIZE);
+	if (bytes == CACHE_BLOCK_SIZE)
+		*known_pos = offset + CACHE_BLOCK_SIZE;
+	else
+		*known_pos = -1;
+
+#ifdef CACHE_IO_PROFILE
+	if (runtime_miss)
+	{
+		if (bytes > 0)
+			profile->bytes_read += (uint64_t)bytes;
+		cache_io_profile_time(profile, start);
+		cache_io_profile_snapshot(profile);
+	}
+	else
+	{
+		uint64_t elapsed = start ? cache_io_now_us() - start : 0;
+		profile->preload_reads++;
+		if (bytes > 0)
+			profile->preload_bytes += (uint64_t)bytes;
+		profile->preload_time_us += elapsed;
+	}
+#endif
+
+	return bytes == CACHE_BLOCK_SIZE;
+}
 #endif
 
 
@@ -94,7 +540,7 @@ static int32_t pcm_fd;
 ******************************************************************************/
 
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
+
 
 /*------------------------------------------------------
 	Read PCM Cache
@@ -107,16 +553,29 @@ uint8_t *pcm_cache_read(uint16_t new_block)
 
 	if (idx == BLOCK_NOT_CACHED)
 	{
+#ifdef CACHE_IO_PROFILE
+		cache_io_profile_miss(&pcm_io_profile, new_block);
+#endif
 		p = pcm_head;
 		pcm_blocks[p->block] = BLOCK_NOT_CACHED;
 
 		p->block = new_block;
 		pcm_blocks[new_block] = p->idx;
 
-		lseek(pcm_fd, new_block << BLOCK_SHIFT, SEEK_SET);
-		read(pcm_fd, &memory_region_sound1[p->idx << BLOCK_SHIFT], BLOCK_SIZE);
+		mvs_cache_read_block(pcm_fd, &pcm_storage_handle, &pcm_file_pos,
+			new_block, &memory_region_sound1[p->idx << BLOCK_SHIFT], "pcm"
+#ifdef CACHE_IO_PROFILE
+			, &pcm_io_profile, 1
+#endif
+		);
 	}
-	else p = &pcm_data[idx];
+	else
+	{
+#ifdef CACHE_IO_PROFILE
+		pcm_io_profile.hits++;
+#endif
+		p = &pcm_data[idx];
+	}
 
 	if (p->frame != frames_displayed)
 	{
@@ -147,7 +606,6 @@ uint8_t *pcm_cache_read(uint16_t new_block)
 }
 
 #endif
-#endif
 
 /*------------------------------------------------------
 	Open Data File in ZIP Cache File
@@ -167,9 +625,8 @@ static int zip_cache_open(int number)
 	fname[2] = cnv_table[ number       & 0x0f];
 	fname[3] = '\0';
 
-	cache_fd = zopen(fname);
-
-	return cache_fd != -1;
+	zip_entry_close(&cache_zip_entry);
+	return zip_entry_open(&cache_zip_archive, fname, &cache_zip_entry);
 }
 
 
@@ -177,10 +634,14 @@ static int zip_cache_open(int number)
 	Read Data File from ZIP Cache File
 ------------------------------------------------------*/
 
-#define zip_cache_load(offs)							\
-	zread(cache_fd, &GFX_MEMORY[offs << 16], 0x10000);	\
-	zclose(cache_fd);									\
-	cache_fd = -1;
+static int zip_cache_load(int offs)
+{
+	size_t bytes = zip_entry_read(&cache_zip_entry,
+		&GFX_MEMORY[offs << 16], CACHE_BLOCK_SIZE);
+	int close_ok = zip_entry_close(&cache_zip_entry);
+
+	return bytes == CACHE_BLOCK_SIZE && close_ok;
+}
 
 
 /*------------------------------------------------------
@@ -196,10 +657,11 @@ static int folder_cache_open(int number)
 	};
 	char fname[PATH_MAX];
 
-	sprintf(fname, "%s/%c%c%c", spr_cache_name,
+	if (!path_format(fname, sizeof(fname), "%s/%c%c%c", spr_cache_name,
 		cnv_table[(number >> 8) & 0x0f],
 		cnv_table[(number >> 4) & 0x0f],
-		cnv_table[ number       & 0x0f]);
+		cnv_table[ number       & 0x0f]))
+		return 0;
 
 	cache_fd = open(fname, O_RDONLY, 0777);
 
@@ -211,9 +673,9 @@ static int folder_cache_open(int number)
 	Read Data File from Folder Cache
 ------------------------------------------------------*/
 
-#define folder_cache_load(offs)							\
-	read(cache_fd, &GFX_MEMORY[offs << 16], 0x10000);	\
-	close(cache_fd);									\
+#define folder_cache_load(offs)									\
+	cache_read_legacy(cache_fd, &GFX_MEMORY[offs << 16], CACHE_BLOCK_SIZE);	\
+	close(cache_fd);											\
 	cache_fd = -1;
 
 /*------------------------------------------------------
@@ -238,20 +700,18 @@ static int fill_cache(void)
 		while (i < num_cache)
 		{
 			p = head;
+			if (!mvs_cache_read_block((int32_t)cache_fd, &cache_storage_handle,
+				&cache_file_pos, block, &GFX_MEMORY[p->idx << BLOCK_SHIFT], "crom"
+#ifdef CACHE_IO_PROFILE
+				, &crom_io_profile, 0
+#endif
+			))
+				return 0;
+
 			p->block = block;
 			blocks[block] = p->idx;
 
-			lseek((int32_t)cache_fd, block << BLOCK_SHIFT, SEEK_SET);
-			read((int32_t)cache_fd, &GFX_MEMORY[p->idx << BLOCK_SHIFT], BLOCK_SIZE);
-
-			head = p->next;
-			head->prev = NULL;
-
-			p->prev = tail;
-			p->next = NULL;
-
-			tail->next = p;
-			tail = p;
+				cache_rotate_head_to_tail(&head, &tail);
 			i++;
 
 			if (++block >= MAX_CACHE_BLOCKS)
@@ -280,52 +740,43 @@ static int fill_cache(void)
 			}
 
 			if (cache_type == CACHE_ZIPFILE) {
-				zip_cache_load(p->idx)
+				if (!zip_cache_load(p->idx))
+					return 0;
 			} else {
 				folder_cache_load(p->idx)
 			}
 
-			head = p->next;
-			head->prev = NULL;
-
-			p->prev = tail;
-			p->next = NULL;
-
-			tail->next = p;
-			tail = p;
+				cache_rotate_head_to_tail(&head, &tail);
 			i++;
 
 			if (++block >= MAX_CACHE_BLOCKS)
 				break;
 		}
 	}
-#ifndef LARGE_MEMORY
 	if (pcm_cache_enable)
 	{
 		i = 0;
 		block = 0;
 
-		while (i < MAX_PCM_SIZE)
-		{
-			p = pcm_head;
-			p->block = block;
-			pcm_blocks[block] = p->idx;
+			while (i < num_pcm_cache)
+			{
+				p = pcm_head;
+				if (!mvs_cache_read_block(pcm_fd, &pcm_storage_handle, &pcm_file_pos,
+					block, &memory_region_sound1[p->idx << BLOCK_SHIFT], "pcm"
+#ifdef CACHE_IO_PROFILE
+					, &pcm_io_profile, 0
+#endif
+				))
+					return 0;
 
-			lseek(pcm_fd, block << BLOCK_SHIFT, SEEK_SET);
-			read(pcm_fd, &memory_region_sound1[p->idx << BLOCK_SHIFT], BLOCK_SIZE);
+				p->block = block;
+				pcm_blocks[block] = p->idx;
 
-			pcm_head = p->next;
-			pcm_head->prev = NULL;
-
-			p->prev = pcm_tail;
-			p->next = NULL;
-
-			pcm_tail->next = p;
-			pcm_tail = p;
+				cache_rotate_head_to_tail(&pcm_head, &pcm_tail);
 			i++;
+			block++;
 		}
 	}
-#endif
 #else
 	if (cache_type == CACHE_RAWFILE)
 	{
@@ -338,16 +789,9 @@ static int fill_cache(void)
 				blocks[block] = p->idx;
 
 				lseek(cache_fd, block_offset[block], SEEK_SET);
-				read(cache_fd, &GFX_MEMORY[p->idx << BLOCK_SHIFT], BLOCK_SIZE);
+				cache_read_legacy(cache_fd, &GFX_MEMORY[p->idx << BLOCK_SHIFT], CACHE_BLOCK_SIZE);
 
-				head = p->next;
-				head->prev = NULL;
-
-				p->prev = tail;
-				p->next = NULL;
-
-				tail->next = p;
-				tail = p;
+				cache_rotate_head_to_tail(&head, &tail);
 				i++;
 			}
 
@@ -379,19 +823,13 @@ static int fill_cache(void)
 				}
 
 				if (cache_type == CACHE_ZIPFILE) {
-					zip_cache_load(p->idx)
+					if (!zip_cache_load(p->idx))
+						return 0;
 				} else {
 					folder_cache_load(p->idx)
 				}
 
-				head = p->next;
-				head->prev = NULL;
-
-				p->prev = tail;
-				p->next = NULL;
-
-				tail->next = p;
-				tail = p;
+				cache_rotate_head_to_tail(&head, &tail);
 				i++;
 			}
 
@@ -411,6 +849,11 @@ static int fill_cache(void)
 ------------------------------------------------------*/
 
 #if (EMU_SYSTEM == CPS2)
+static uint32_t read_cache_direct(uint32_t offset)
+{
+	return offset;
+}
+
 static uint32_t read_cache_static(uint32_t offset)
 {
 	int idx = blocks[offset >> BLOCK_SHIFT];
@@ -441,13 +884,27 @@ static uint32_t read_cache_rawfile(uint32_t offset)
 		blocks[new_block] = p->idx;
 
 #if (EMU_SYSTEM == MVS)
-		lseek((int32_t)cache_fd, new_block << BLOCK_SHIFT, SEEK_SET);
+	#ifdef CACHE_IO_PROFILE
+		cache_io_profile_miss(&crom_io_profile, new_block);
+	#endif
+		mvs_cache_read_block((int32_t)cache_fd, &cache_storage_handle,
+			&cache_file_pos, new_block, &GFX_MEMORY[p->idx << BLOCK_SHIFT], "crom"
+	#ifdef CACHE_IO_PROFILE
+			, &crom_io_profile, 1
+	#endif
+		);
 #else
 		lseek((int32_t)cache_fd, block_offset[new_block], SEEK_SET);
-#endif
-		read((int32_t)cache_fd, &GFX_MEMORY[p->idx << BLOCK_SHIFT], BLOCK_SIZE);
+		cache_read_legacy((int32_t)cache_fd, &GFX_MEMORY[p->idx << BLOCK_SHIFT], CACHE_BLOCK_SIZE);
+	#endif
 	}
-	else p = &cache_data[idx];
+	else
+	{
+	#if (EMU_SYSTEM == MVS) && defined(CACHE_IO_PROFILE)
+		crom_io_profile.hits++;
+	#endif
+		p = &cache_data[idx];
+	}
 
 	if (p->next)
 	{
@@ -496,7 +953,8 @@ static uint32_t read_cache_zipfile(uint32_t offset)
 		p->block = new_block;
 		blocks[new_block] = p->idx;
 
-		zip_cache_load(p->idx);
+		if (!zip_cache_load(p->idx))
+			return 0;
 	}
 	else p = &cache_data[idx];
 
@@ -626,15 +1084,27 @@ void cache_init(void)
 {
 	int i;
 
+	zip_entry_close(&cache_zip_entry);
+	zip_archive_close(&cache_zip_archive);
+
+	if (cache_data)
+	{
+		free(cache_data);
+		cache_data = NULL;
+	}
+	head = NULL;
+	tail = NULL;
 	num_cache = 0;
 	cache_fd = -1;
 
 #if (EMU_SYSTEM == MVS)
+	cache_storage_close_optional(&cache_storage_handle);
+	cache_storage_close_optional(&pcm_storage_handle);
 	cache_type = CACHE_NOTFOUND;
 	read_cache = NULL;
 #else
 	cache_type = CACHE_NOTFOUND;
-	read_cache = read_cache_static;
+	read_cache = read_cache_direct;
 #endif
 	update_cache = NULL;
 
@@ -642,13 +1112,26 @@ void cache_init(void)
 		blocks[i] = BLOCK_NOT_CACHED;
 
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
+	if (pcm_data)
+	{
+		free(pcm_data);
+		pcm_data = NULL;
+	}
+	pcm_head = NULL;
+	pcm_tail = NULL;
+	num_pcm_cache = 0;
 	pcm_cache_enable = 0;
 	pcm_fd = -1;
+	cache_file_pos = -1;
+	pcm_file_pos = -1;
+
+#ifdef CACHE_IO_PROFILE
+	cache_io_profile_reset(&crom_io_profile);
+	cache_io_profile_reset(&pcm_io_profile);
+#endif
 
 	for (i = 0; i < MAX_PCM_BLOCKS; i++)
 		pcm_blocks[i] = BLOCK_NOT_CACHED;
-#endif
 #endif
 }
 
@@ -657,16 +1140,62 @@ void cache_init(void)
 	Start Cache Processing
 ------------------------------------------------------*/
 
-int cache_start(void)
+int cache_start(const memory_plan_t *plan, void *preallocated_gfx, void *preallocated_pcm)
 {
 	int i, found;
+	int requested_cache_blocks;
+	int minimum_cache_blocks;
+	int source_cache_blocks;
 	uint32_t size = 0;
 	char version_str[8] = {0};
 #if (EMU_SYSTEM == MVS)
 	int32_t fd;
+	int requested_pcm_blocks;
+	char crom_path[PATH_MAX];
+	char pcm_path[PATH_MAX];
 #endif
 
-	zip_close();
+	if (plan == NULL)
+	{
+		msg_printf(TEXT(MEMORY_NOT_ENOUGH));
+		return 0;
+	}
+
+	/* R10 allocation-shape probes retain the buffers that proved the requested
+	 * shape is feasible. Adopt them here instead of freeing and reallocating the
+	 * same sizes. Ownership transfers to the normal memory-region shutdown path. */
+	GFX_MEMORY = (uint8_t *)preallocated_gfx;
+#if (EMU_SYSTEM == MVS)
+	if (preallocated_pcm != NULL)
+		memory_region_sound1 = preallocated_pcm;
+#else
+	(void)preallocated_pcm;
+#endif
+
+	source_cache_blocks = (int)(((uint64_t)GFX_SIZE + CACHE_BLOCK_SIZE - 1) >> BLOCK_SHIFT);
+	requested_cache_blocks = (int)(plan->gfx_cache_bytes >> BLOCK_SHIFT);
+	if (requested_cache_blocks > source_cache_blocks)
+		requested_cache_blocks = source_cache_blocks;
+	if (requested_cache_blocks > MAX_CACHE_BLOCKS)
+		requested_cache_blocks = MAX_CACHE_BLOCKS;
+	if (requested_cache_blocks <= 0)
+	{
+		msg_printf(TEXT(MEMORY_NOT_ENOUGH));
+		return 0;
+	}
+	minimum_cache_blocks = requested_cache_blocks < (int)MIN_RUNTIME_CACHE_BLOCKS ?
+		requested_cache_blocks : (int)MIN_RUNTIME_CACHE_BLOCKS;
+
+#if (EMU_SYSTEM == MVS)
+	requested_pcm_blocks = (int)(plan->pcm_cache_bytes >> BLOCK_SHIFT);
+	if (requested_pcm_blocks > MAX_PCM_BLOCKS)
+		requested_pcm_blocks = MAX_PCM_BLOCKS;
+	if (requested_pcm_blocks > (int)(((uint64_t)memory_length_sound1 + CACHE_BLOCK_SIZE - 1) >> BLOCK_SHIFT))
+		requested_pcm_blocks = (int)(((uint64_t)memory_length_sound1 + CACHE_BLOCK_SIZE - 1) >> BLOCK_SHIFT);
+#endif
+
+	zip_entry_close(&cache_zip_entry);
+	zip_archive_close(&cache_zip_archive);
 
 #if (EMU_SYSTEM == MVS)
 
@@ -678,11 +1207,11 @@ int cache_start(void)
 	if ((fd = cachefile_open(CACHE_INFO)) >= 0)
 	{
 		cache_type = CACHE_RAWFILE;
-		read(fd, version_str, 8);
+		cache_read_legacy(fd, version_str, 8);
 
 		if (strcmp(version_str, "MVS_" CACHE_VERSION) == 0)
 		{
-			read(fd, gfx_pen_usage[2], memory_length_gfx3 / 128);
+			cache_read_legacy(fd, gfx_pen_usage[2], memory_length_gfx3 / 128);
 			found = 1;
 		}
 		close(fd);
@@ -701,38 +1230,40 @@ int cache_start(void)
 	{
 		cache_type = CACHE_ZIPFILE;
 
-		sprintf(spr_cache_name, "%s/%s_cache.zip", cache_dir, game_name);
-		if (zip_open(spr_cache_name) == -1)
+		if (use_parent_crom && parent_name[0])
 		{
-			if (strlen(parent_name))
-			{
-				sprintf(spr_cache_name, "%s/%s_cache.zip", cache_dir, parent_name);
-				if (zip_open(spr_cache_name) == -1)
-				{
-					zip_close();
-				}
-				else found = 1;
-			}
+			if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache.zip", cache_dir, parent_name)) return 0;
+			if (zip_archive_open(&cache_zip_archive, spr_cache_name))
+				found = 1;
 		}
-		else found = 1;
+
+		if (!found)
+		{
+			if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache.zip", cache_dir, game_name)) { found = 0; }
+			if (zip_archive_open(&cache_zip_archive, spr_cache_name))
+				found = 1;
+		}
 
 		if (found)
 		{
-			if ((cache_fd = zopen("cache_info")) != -1)
+			if (zip_entry_open(&cache_zip_archive, "cache_info", &cache_zip_entry))
 			{
 				memset(version_str, 0, 8);
-				zread(cache_fd, version_str, 8);
+				if (zip_entry_read(&cache_zip_entry, version_str, 8) != 8)
+					found = 0;
 
-				if (strcmp(version_str, "MVS_" CACHE_VERSION) == 0)
+				if (found && strcmp(version_str, "MVS_" CACHE_VERSION) == 0)
 				{
-					zread(cache_fd, gfx_pen_usage[2], memory_length_gfx3 / 128);
-					zclose(cache_fd);
+					if (zip_entry_read(&cache_zip_entry, gfx_pen_usage[2],
+						memory_length_gfx3 / 128) != memory_length_gfx3 / 128)
+						found = 0;
 				}
 				else
 				{
-					zclose(cache_fd);
 					found = 0;
 				}
+				if (!zip_entry_close(&cache_zip_entry))
+					found = 0;
 			}
 			else
 			{
@@ -740,7 +1271,7 @@ int cache_start(void)
 			}
 			if (!found)
 			{
-				zip_close();
+				zip_archive_close(&cache_zip_archive);
 				msg_printf(TEXT(UNSUPPORTED_VERSION_OF_CACHE_FILE), version_str[5], version_str[6]);
 				msg_printf(TEXT(CURRENT_REQUIRED_VERSION_IS_x));
 				msg_printf(TEXT(PLEASE_REBUILD_CACHE_FILE));
@@ -756,41 +1287,36 @@ int cache_start(void)
 		return 0;
 	}
 
-#ifndef LARGE_MEMORY
 	if (cache_type == CACHE_RAWFILE)
 	{
-		if (option_sound_enable && disable_sound)
+		if (option_sound_enable && disable_sound && requested_pcm_blocks > 0)
 		{
-			if ((pcm_fd = cachefile_open(CACHE_VROM)) >= 0)
+			pcm_fd = cachefile_open_resolved(CACHE_VROM, pcm_path, sizeof(pcm_path));
+			if (pcm_fd >= 0)
 			{
-				if ((memory_region_sound1 = malloc(MAX_PCM_SIZE * BLOCK_SIZE)) != NULL)
-				{
-					pcm_cache_enable = 1;
-					disable_sound = 0;
-					msg_printf(TEXT(PCM_CACHE_ENABLED));
-				}
-			}
-			if (!pcm_cache_enable)
-			{
-				if (pcm_fd >= 0)
-				{
-					close(pcm_fd);
-					pcm_fd = -1;
-				}
-				memory_length_sound1 = 0;
+				pcm_file_pos = 0;
+				pcm_storage_handle = cache_storage_open_optional(pcm_path, "pcm");
 			}
 		}
 	}
-#endif
 
 	/* Open crom for block access (folder format only) */
 	if (cache_type == CACHE_RAWFILE)
 	{
-		if ((cache_fd = cachefile_open(CACHE_CROM)) < 0)
+		if ((cache_fd = cachefile_open_resolved(CACHE_CROM, crom_path,
+			sizeof(crom_path))) < 0)
 		{
+			if (pcm_fd >= 0)
+			{
+				close(pcm_fd);
+				pcm_fd = -1;
+			}
+			cache_storage_close_optional(&pcm_storage_handle);
 			msg_printf(TEXT(COULD_NOT_OPEN_CACHE_FILE));
 			return 0;
 		}
+		cache_file_pos = 0;
+		cache_storage_handle = cache_storage_open_optional(crom_path, "crom");
 	}
 	/* For zip format, blocks will be accessed via zip_cache_open on demand */
 
@@ -799,10 +1325,10 @@ int cache_start(void)
 	cache_type = CACHE_RAWFILE;
 
 	/* Try raw file format: {game}.cache */
-	sprintf(spr_cache_name, "%s/%s.cache", cache_dir, game_name);
+	if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s.cache", cache_dir, game_name)) { found = 0; }
 	if ((cache_fd = open(spr_cache_name, O_RDONLY, 0777)) < 0)
 	{
-		sprintf(spr_cache_name, "%s/%s.cache", cache_dir, cache_parent_name);
+		if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s.cache", cache_dir, cache_parent_name)) { found = 0; }
 		if ((cache_fd = open(spr_cache_name, O_RDONLY, 0777)) < 0)
 		{
 			found = 0;
@@ -815,14 +1341,14 @@ int cache_start(void)
 		found = 1;
 		cache_type = CACHE_ZIPFILE;
 
-		sprintf(spr_cache_name, "%s/%s_cache.zip", cache_dir, game_name);
-		if (zip_open(spr_cache_name) == -1)
+		if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache.zip", cache_dir, game_name)) found = 0;
+		if (!zip_archive_open(&cache_zip_archive, spr_cache_name))
 		{
-			sprintf(spr_cache_name, "%s/%s_cache.zip", cache_dir, cache_parent_name);
-			if (zip_open(spr_cache_name) == -1)
+			if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache.zip", cache_dir, cache_parent_name)) { found = 0; }
+			if (!zip_archive_open(&cache_zip_archive, spr_cache_name))
 			{
 				found = 0;
-				zip_close();
+				zip_archive_close(&cache_zip_archive);
 			}
 		}
 	}
@@ -834,12 +1360,12 @@ int cache_start(void)
 		found = 1;
 		cache_type = CACHE_FOLDER;
 
-		sprintf(spr_cache_name, "%s/%s_cache", cache_dir, game_name);
-		sprintf(path, "%s/cache_info", spr_cache_name);
+		if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache", cache_dir, game_name)) { found = 0; }
+		if (!path_format(path, sizeof(path), "%s/cache_info", spr_cache_name)) { found = 0; }
 		if ((cache_fd = open(path, O_RDONLY, 0777)) < 0)
 		{
-			sprintf(spr_cache_name, "%s/%s_cache", cache_dir, cache_parent_name);
-			sprintf(path, "%s/cache_info", spr_cache_name);
+			if (!path_format(spr_cache_name, sizeof(spr_cache_name), "%s/%s_cache", cache_dir, cache_parent_name)) { found = 0; }
+			if (!path_format(path, sizeof(path), "%s/cache_info", spr_cache_name)) { found = 0; }
 			if ((cache_fd = open(path, O_RDONLY, 0777)) < 0)
 			{
 				found = 0;
@@ -858,14 +1384,14 @@ int cache_start(void)
 
 	if (cache_type == CACHE_RAWFILE)
 	{
-		read(cache_fd, version_str, 8);
+		cache_read_legacy(cache_fd, version_str, 8);
 
 		if (strcmp(version_str, "CPS2" CACHE_VERSION) == 0)
 		{
-			read(cache_fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
-			read(cache_fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
-			read(cache_fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
-			read(cache_fd, block_offset, MAX_CACHE_BLOCKS * sizeof(uint32_t));
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
+			cache_read_legacy(cache_fd, block_offset, MAX_CACHE_BLOCKS * sizeof(uint32_t));
 		}
 		else
 		{
@@ -875,41 +1401,48 @@ int cache_start(void)
 	}
 	else if (cache_type == CACHE_ZIPFILE)
 	{
-		if ((cache_fd = zopen("cache_info")) != -1)
+		if (zip_entry_open(&cache_zip_archive, "cache_info", &cache_zip_entry))
 		{
-			zread(cache_fd, version_str, 8);
+			if (zip_entry_read(&cache_zip_entry, version_str, 8) != 8)
+				found = 0;
 
-			if (strcmp(version_str, "CPS2" CACHE_VERSION) == 0)
+			if (found && strcmp(version_str, "CPS2" CACHE_VERSION) == 0)
 			{
-				zread(cache_fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
-				zread(cache_fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
-				zread(cache_fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
-				zread(cache_fd, block_empty, MAX_CACHE_BLOCKS);
-				zclose(cache_fd);
+				if (zip_entry_read(&cache_zip_entry, gfx_pen_usage[TILE08],
+					gfx_total_elements[TILE08]) != gfx_total_elements[TILE08] ||
+					zip_entry_read(&cache_zip_entry, gfx_pen_usage[TILE16],
+					gfx_total_elements[TILE16]) != gfx_total_elements[TILE16] ||
+					zip_entry_read(&cache_zip_entry, gfx_pen_usage[TILE32],
+					gfx_total_elements[TILE32]) != gfx_total_elements[TILE32] ||
+					zip_entry_read(&cache_zip_entry, block_empty,
+					MAX_CACHE_BLOCKS) != MAX_CACHE_BLOCKS)
+					found = 0;
 			}
 			else
 			{
-				zclose(cache_fd);
 				found = 0;
 			}
+			if (!zip_entry_close(&cache_zip_entry))
+				found = 0;
 		}
 		else
 		{
 			found = 0;
 		}
-		if (!found) zip_close();
+		if (!found)
+			zip_archive_close(&cache_zip_archive);
 	}
 	else /* CACHE_FOLDER */
 	{
 		/* cache_fd is already open from the folder detection above */
-		read(cache_fd, version_str, 8);
+		cache_read_legacy(cache_fd, version_str, 8);
 
 		if (strcmp(version_str, "CPS2" CACHE_VERSION) == 0)
 		{
-			read(cache_fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
-			read(cache_fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
-			read(cache_fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
-			read(cache_fd, block_empty, MAX_CACHE_BLOCKS);
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
+			cache_read_legacy(cache_fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
+			cache_read_legacy(cache_fd, block_empty, MAX_CACHE_BLOCKS);
 			close(cache_fd);
 			cache_fd = -1;
 		}
@@ -928,13 +1461,39 @@ int cache_start(void)
 		return 0;
 	}
 
-	if ((GFX_MEMORY = (uint8_t *)malloc(GFX_SIZE + CACHE_SAFETY)) != NULL)
-	{
-		free(GFX_MEMORY);
-		GFX_MEMORY = (uint8_t *)malloc(GFX_SIZE);
-		memset(GFX_MEMORY, 0, GFX_SIZE);
+#endif
 
-		num_cache = GFX_SIZE >> 16;
+	i = requested_cache_blocks;
+
+	if (GFX_MEMORY == NULL)
+	{
+		for (; i >= minimum_cache_blocks; --i)
+		{
+			size = (uint32_t)i << BLOCK_SHIFT;
+			GFX_MEMORY = (uint8_t *)malloc(size);
+			if (GFX_MEMORY != NULL)
+				break;
+		}
+
+		if (GFX_MEMORY == NULL)
+		{
+			msg_printf(TEXT(COULD_NOT_ALLOCATE_CACHE_MEMORY));
+			return 0;
+		}
+	}
+	else
+	{
+		size = (uint32_t)i << BLOCK_SHIFT;
+	}
+
+	num_cache = i;
+	memset(GFX_MEMORY, 0, size);
+
+#if (EMU_SYSTEM == CPS2)
+	if (num_cache >= source_cache_blocks)
+	{
+		read_cache = read_cache_static;
+		update_cache = NULL;
 	}
 	else
 #endif
@@ -945,85 +1504,106 @@ int cache_start(void)
 			read_cache = read_cache_zipfile;
 		else
 			read_cache = read_cache_folder;
-
 		update_cache = update_cache_dynamic;
-
-		// Check allocatable size
-
-#ifdef LARGE_MEMORY
-		if (psp2k_mem_left == PSP2K_MEM_SIZE)//ui32 bug
-		{
-			GFX_MEMORY = (uint8_t *)PSP2K_MEM_TOP;
-			i = MAX_CACHE_SIZE;
-			size = i << BLOCK_SHIFT;
-		}
-		else
-#endif
-
-		{
-			for (i = MIN(GFX_SIZE >> BLOCK_SHIFT, MAX_CACHE_SIZE); i >= MIN_CACHE_SIZE; i--)
-			{
-				if ((GFX_MEMORY = (uint8_t *)malloc((i << BLOCK_SHIFT) + CACHE_SAFETY)) != NULL)
-				{
-					size = i << BLOCK_SHIFT;
-					free(GFX_MEMORY);
-					GFX_MEMORY = NULL;
-					break;
-				}
-			}
-
-			if (i < MIN_CACHE_SIZE)
-			{
-				msg_printf(TEXT(MEMORY_NOT_ENOUGH));
-				return 0;
-			}
-
-			if ((GFX_MEMORY = (uint8_t *)malloc(size)) == NULL)
-			{
-				msg_printf(TEXT(COULD_NOT_ALLOCATE_CACHE_MEMORY));
-				return 0;
-			}
-		}
-
-		memset(GFX_MEMORY, 0, size);
-
-		num_cache = i;
 	}
 
-	msg_printf(TEXT(xKB_CACHE_ALLOCATED), (num_cache << BLOCK_SHIFT) / 1024);
-
-	for (i = 0; i < num_cache; i++)
-		cache_data[i].idx = i;
-
-	for (i = 1; i < num_cache; i++)
-		cache_data[i].prev = &cache_data[i - 1];
-
-	for (i = 0; i < num_cache - 1; i++)
-		cache_data[i].next = &cache_data[i + 1];
-
-	cache_data[0].prev = NULL;
-	cache_data[num_cache - 1].next = NULL;
-
-	head = &cache_data[0];
-	tail = &cache_data[num_cache - 1];
+	cache_data = (cache_t *)malloc(sizeof(*cache_data) * (size_t)num_cache);
+	if (cache_data == NULL)
+	{
+	#if (EMU_SYSTEM == MVS)
+		cache_storage_close_optional(&cache_storage_handle);
+		cache_storage_close_optional(&pcm_storage_handle);
+	#endif
+		msg_printf(TEXT(COULD_NOT_ALLOCATE_CACHE_MEMORY));
+		return 0;
+	}
+	cache_list_init(cache_data, num_cache, &head, &tail);
 
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
-	for (i = 0; i < MAX_PCM_SIZE; i++)
-		pcm_data[i].idx = i;
+	/* GFX/C-ROM is the primary cache target. Only after it has been secured do
+	 * we consume the PCM target, retrying down in cache-block increments when
+	 * fragmentation prevents the planned contiguous allocation. */
+	if (option_sound_enable && disable_sound)
+	{
+		if (requested_pcm_blocks > 0 && pcm_fd >= 0)
+		{
+			if (memory_region_sound1 != NULL)
+			{
+				num_pcm_cache = requested_pcm_blocks;
+			}
+			else
+			{
+				for (i = requested_pcm_blocks; i > 0; --i)
+				{
+					memory_region_sound1 = malloc((size_t)i << BLOCK_SHIFT);
+					if (memory_region_sound1 != NULL)
+					{
+						num_pcm_cache = i;
+						break;
+					}
+				}
+			}
+		}
 
-	for (i = 1; i < MAX_PCM_SIZE; i++)
-		pcm_data[i].prev = &pcm_data[i - 1];
+		if (num_pcm_cache > 0)
+		{
+			pcm_cache_enable = 1;
+			disable_sound = 0;
+		}
+		else
+		{
+			/* An empirical R10 shape may have retained a PCM buffer before the
+			 * cache file was opened. If PCM streaming is unavailable, release
+			 * that otherwise-unused allocation immediately. */
+			if (preallocated_pcm != NULL && memory_region_sound1 != NULL)
+			{
+				free(memory_region_sound1);
+				memory_region_sound1 = NULL;
+			}
+			if (pcm_fd >= 0)
+			{
+				close(pcm_fd);
+				pcm_fd = -1;
+			}
+			cache_storage_close_optional(&pcm_storage_handle);
+			memory_length_sound1 = 0;
+		}
+	}
 
-	for (i = 0; i < MAX_PCM_SIZE - 1; i++)
-		pcm_data[i].next = &pcm_data[i + 1];
-
-	pcm_data[0].prev = NULL;
-	pcm_data[MAX_PCM_SIZE - 1].next = NULL;
-
-	pcm_head = &pcm_data[0];
-	pcm_tail = &pcm_data[MAX_PCM_SIZE - 1];
+	if (pcm_cache_enable)
+	{
+		pcm_data = (cache_t *)malloc(sizeof(*pcm_data) * (size_t)num_pcm_cache);
+		if (pcm_data == NULL)
+		{
+			free(memory_region_sound1);
+			memory_region_sound1 = NULL;
+			close(pcm_fd);
+			pcm_fd = -1;
+			cache_storage_close_optional(&pcm_storage_handle);
+			pcm_cache_enable = 0;
+			num_pcm_cache = 0;
+			disable_sound = 1;
+			memory_length_sound1 = 0;
+		}
+		else
+		{
+			cache_list_init(pcm_data, num_pcm_cache, &pcm_head, &pcm_tail);
+			msg_printf(TEXT(PCM_CACHE_ENABLED));
+			msg_printf(TEXT(CACHE_USAGE_PCM),
+				(num_pcm_cache << BLOCK_SHIFT) / 1024,
+				memory_length_sound1 / 1024);
+		}
+	}
 #endif
+
+#if (EMU_SYSTEM == CPS2)
+	msg_printf(TEXT(CACHE_USAGE_GFX),
+		(num_cache << BLOCK_SHIFT) / 1024,
+		(source_cache_blocks << BLOCK_SHIFT) / 1024);
+#elif (EMU_SYSTEM == MVS)
+	msg_printf(TEXT(CACHE_USAGE_CROM),
+		(num_cache << BLOCK_SHIFT) / 1024,
+		(source_cache_blocks << BLOCK_SHIFT) / 1024);
 #endif
 
 	if (!fill_cache())
@@ -1033,8 +1613,6 @@ int cache_start(void)
 		Loop = LOOP_BROWSER;
 		return 0;
 	}
-
-	if (size == 0) cache_shutdown();
 
 	return 1;
 }
@@ -1047,17 +1625,32 @@ int cache_start(void)
 void cache_shutdown(void)
 {
 #if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
+	#ifdef CACHE_IO_PROFILE
+	cache_io_profile_print("crom", &crom_io_profile);
+	if (pcm_cache_enable || pcm_io_profile.hits || pcm_io_profile.misses)
+		cache_io_profile_print("pcm", &pcm_io_profile);
+	#endif
+	cache_storage_close_optional(&pcm_storage_handle);
+	cache_storage_close_optional(&cache_storage_handle);
 	if (pcm_cache_enable)
 	{
 		if (pcm_fd != -1)
 		{
 			close(pcm_fd);
+			pcm_fd = -1;
+			}
+			pcm_cache_enable = 0;
 		}
-		pcm_cache_enable = 0;
-	}
-#endif
-#endif
+		pcm_file_pos = -1;
+		if (pcm_data)
+		{
+			free(pcm_data);
+			pcm_data = NULL;
+		}
+		pcm_head = NULL;
+		pcm_tail = NULL;
+		num_pcm_cache = 0;
+	#endif
 	if (cache_type == CACHE_RAWFILE)
 	{
 		if (cache_fd != -1)
@@ -1065,14 +1658,25 @@ void cache_shutdown(void)
 			close((int32_t)cache_fd);
 			cache_fd = -1;
 		}
+#if (EMU_SYSTEM == MVS)
+		cache_file_pos = -1;
+#endif
 	}
 	else if (cache_type == CACHE_ZIPFILE)
 	{
-		zip_close();
+		zip_entry_close(&cache_zip_entry);
+		zip_archive_close(&cache_zip_archive);
 	}
-	/* CACHE_FOLDER: nothing to close (blocks opened/closed on demand) */
+		/* CACHE_FOLDER: nothing to close (blocks opened/closed on demand) */
 
-	num_cache = 0;
+		if (cache_data)
+		{
+			free(cache_data);
+			cache_data = NULL;
+		}
+		head = NULL;
+		tail = NULL;
+		num_cache = 0;
 }
 
 
@@ -1088,82 +1692,84 @@ void cache_sleep(int flag)
 		{
 			if (cache_type == CACHE_RAWFILE)
 			{
+	#if (EMU_SYSTEM == MVS)
+				cache_storage_close_optional(&cache_storage_handle);
+	#endif
 				close((int32_t)cache_fd);
+#if (EMU_SYSTEM == MVS)
+				cache_fd = -1;
+				cache_file_pos = -1;
+#endif
 			}
 			else if (cache_type == CACHE_ZIPFILE)
 			{
-				zip_close();
+				zip_entry_close(&cache_zip_entry);
+				zip_archive_close(&cache_zip_archive);
 			}
-#if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
-			if (pcm_cache_enable) close(pcm_fd);
-#endif
+	#if (EMU_SYSTEM == MVS)
+			if (pcm_cache_enable)
+			{
+				cache_storage_close_optional(&pcm_storage_handle);
+				close(pcm_fd);
+				pcm_fd = -1;
+				pcm_file_pos = -1;
+			}
 #endif
 		}
 		else
 		{
 			if (cache_type == CACHE_RAWFILE)
 			{
-#if (EMU_SYSTEM == MVS)
-				cache_fd = cachefile_open(CACHE_CROM);
-#else
+	#if (EMU_SYSTEM == MVS)
+				char path[PATH_MAX];
+				cache_fd = cachefile_open_resolved(CACHE_CROM, path, sizeof(path));
+				cache_file_pos = cache_fd >= 0 ? 0 : -1;
+				if (cache_fd >= 0)
+					cache_storage_handle = cache_storage_open_optional(path, "crom");
+	#else
 				cache_fd = open(spr_cache_name, O_RDONLY, 0777);
 #endif
 			}
 			else if (cache_type == CACHE_ZIPFILE)
 			{
-				zip_open(spr_cache_name);
+				zip_archive_open(&cache_zip_archive, spr_cache_name);
 			}
 			/* CACHE_FOLDER: nothing to reopen */
-#if (EMU_SYSTEM == MVS)
-#ifndef LARGE_MEMORY
+	#if (EMU_SYSTEM == MVS)
 			if (pcm_cache_enable)
-				pcm_fd = cachefile_open(CACHE_VROM);
-#endif
+			{
+				char path[PATH_MAX];
+				pcm_fd = cachefile_open_resolved(CACHE_VROM, path, sizeof(path));
+				pcm_file_pos = pcm_fd >= 0 ? 0 : -1;
+				if (pcm_fd >= 0)
+					pcm_storage_handle = cache_storage_open_optional(path, "pcm");
+			}
 #endif
 		}
 	}
 }
 
 
-#ifdef STATE_SAVE
+#ifdef SAVE_STATE
 
 /*------------------------------------------------------
 	Temporarily Allocate State Save Area
 ------------------------------------------------------*/
 
-#ifdef LARGE_MEMORY
-static int cache_alloc_type = 0;
-#endif
-
 uint8_t *cache_alloc_state_buffer(int32_t size)
 {
-#ifdef LARGE_MEMORY
-	if (size < psp2k_mem_left)
+	int32_t fd;
+	char path[PATH_MAX];
+
+	if (!path_format(path, sizeof(path), "%sstate/cache.tmp", launchDir)) return NULL;
+
+	if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
 	{
-		cache_alloc_type = 1;
-		return (uint8_t *)psp2k_mem_offset;
+		{ ssize_t io_result = write(fd, GFX_MEMORY, size); (void)io_result; }
+		close(fd);
+		return GFX_MEMORY;
 	}
-	else
-#endif
-	{
-		int32_t fd;
-		char path[PATH_MAX];
-
-#ifdef LARGE_MEMORY
-		cache_alloc_type = 0;
-#endif
-
-		sprintf(path, "%sstate/cache.tmp", launchDir);
-
-		if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
-		{
-			write(fd, GFX_MEMORY, size);
-			close(fd);
-			return GFX_MEMORY;
-		}
-		return NULL;
-	}
+	return NULL;
 }
 
 /*------------------------------------------------------
@@ -1172,28 +1778,19 @@ uint8_t *cache_alloc_state_buffer(int32_t size)
 
 void cache_free_state_buffer(int32_t size)
 {
-#ifdef LARGE_MEMORY
-	if (!cache_alloc_type)
-#endif
+	int32_t fd;
+	char path[PATH_MAX];
+
+	if (!path_format(path, sizeof(path), "%sstate/cache.tmp", launchDir)) return;
+
+	if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 	{
-		uint32_t fd;
-		char path[PATH_MAX];
-
-		sprintf(path, "%sstate/cache.tmp", launchDir);
-
-		if ((fd = open(path, O_RDONLY, 0777)) >= 0)
-		{
-			read(fd, GFX_MEMORY, size);
-			close(fd);
-		}
-		remove(path);
+		cache_read_legacy(fd, GFX_MEMORY, size);
+		close(fd);
 	}
-
-#ifdef LARGE_MEMORY
-	cache_alloc_type = 0;
-#endif
+	remove(path);
 }
 
-#endif /* STATE_SAVE */
+#endif /* SAVE_STATE */
 
 #endif /* USE_CACHE */

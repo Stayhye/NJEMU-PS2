@@ -7,7 +7,9 @@
 ******************************************************************************/
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +17,7 @@
 #include <unistd.h>
 
 #include "romcnv.h"
-#include "zfile.h"
+#include "zip_writer.h"
 
 #define SPRITE_BLANK		0x00
 #define SPRITE_TRANSPARENT	0x02
@@ -52,6 +54,12 @@ static struct rom_t gfx1rom[MAX_GFX1ROM];
 static int num_gfx1rom;
 
 static uint8_t block_empty[0x200];
+
+static void change_directory(const char *path)
+{
+	if (chdir(path) != 0)
+		perror(path);
+}
 
 static uint8_t null_tile[128] =
 {
@@ -691,7 +699,8 @@ static int calc_pen_usage(void)
 
 static int load_rom_gfx1(void)
 {
-	int i, res;
+	int i;
+	rom_file_open_result_t res;
 	char fname[32], *parent;
 
 	if ((memory_region_gfx1 = calloc(1, memory_length_gfx1)) == NULL)
@@ -707,7 +716,7 @@ static int load_rom_gfx1(void)
 		strcpy(fname, gfx1rom[i].name);
 		if ((res = file_open(game_name, parent_name, gfx1rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -728,9 +737,22 @@ static int load_rom_gfx1(void)
 }
 
 
+static ssize_t fd_readline(int fd, char *buf, size_t size)
+{
+	size_t i = 0;
+	char c;
+	while (i < size - 1) {
+		if (read(fd, &c, 1) <= 0) break;
+		buf[i++] = c;
+		if (c == '\n') break;
+	}
+	buf[i] = '\0';
+	return (ssize_t)i;
+}
+
 static int load_rom_info(const char *game_name)
 {
-	FILE *fp;
+	int fp;
 	char path[PATH_MAX];
 	char buf[256];
 	int rom_start = 0;
@@ -740,9 +762,10 @@ static int load_rom_info(const char *game_name)
 
 	sprintf(path, "%srominfo.cps2", launchDir);
 
-	if ((fp = fopen(path, "r")) != NULL)
+	fp = open(path, O_RDONLY);
+	if (fp >= 0)
 	{
-		while (fgets(buf, 255, fp))
+		while (fd_readline(fp, buf, 255) > 0)
 		{
 			if (buf[0] == '/' && buf[1] == '/')
 				continue;
@@ -773,7 +796,7 @@ static int load_rom_info(const char *game_name)
 				}
 				else if (rom_start && str_cmp(buf, "END") == 0)
 				{
-					fclose(fp);
+					close(fp);
 					return 0;
 				}
 			}
@@ -858,7 +881,7 @@ static int load_rom_info(const char *game_name)
 				}
 			}
 		}
-		fclose(fp);
+		close(fp);
 		return 2;
 	}
 	return 3;
@@ -975,7 +998,7 @@ static int convert_rom(char *game_name)
 
 static int create_raw_cache(char *game_name)
 {
-	FILE *fp;
+	int fp;
 	int i, offset;
 	char version[8];
 	uint32_t header_size, aligned_size, block[0x200];
@@ -983,7 +1006,7 @@ static int create_raw_cache(char *game_name)
 
 	sprintf(version, "CPS2V%d%d\0", VERSION_MAJOR, VERSION_MINOR);
 
-	chdir("cache");
+	change_directory("cache");
 
 	header_size = 8;
 	header_size += gfx_total_elements[TILE08];
@@ -1018,9 +1041,10 @@ static int create_raw_cache(char *game_name)
 	}
 
 	sprintf(fname, "%s.cache", game_name);
-	if ((fp = fopen(fname, "wb")) == NULL)
+	fp = open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fp < 0)
 	{
-		chdir("..");
+		change_directory("..");
 #ifdef CHINESE
 		printf("错误: 无法创建文件.\n");
 #else
@@ -1037,25 +1061,28 @@ static int create_raw_cache(char *game_name)
 	printf("Create cache file...\n");
 #endif
 
-	fwrite(version, 1, sizeof(version), fp);
-	fwrite(gfx_pen_usage[TILE08], 1, gfx_total_elements[TILE08], fp);
-	fwrite(gfx_pen_usage[TILE16], 1, gfx_total_elements[TILE16], fp);
-	fwrite(gfx_pen_usage[TILE32], 1, gfx_total_elements[TILE32], fp);
-	fwrite(block, 1, 0x200 * sizeof(uint32_t), fp);
+	write(fp, version, sizeof(version));
+	write(fp, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
+	write(fp, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
+	write(fp, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
+	write(fp, block, 0x200 * sizeof(uint32_t));
 
-	for (i = header_size; i < aligned_size; i++)
-		fputc(0, fp);
+	{
+		static const char zero = 0;
+		for (i = header_size; i < (int)aligned_size; i++)
+			write(fp, &zero, 1);
+	}
 
 	for (i = 0; i < 0x200; i++)
 	{
 		if (block_empty[i]) continue;
 
-		fwrite(&memory_region_gfx1[i << 16], 1, 0x10000, fp);
+		write(fp, &memory_region_gfx1[i << 16], 0x10000);
 	}
 
-	fclose(fp);
+	close(fp);
 
-	chdir("..");
+	change_directory("..");
 
 	return 1;
 }
@@ -1074,13 +1101,14 @@ static void print_progress(int count, int total)
 
 static int create_zip_cache(char *game_name)
 {
-	int fd;
+	zip_writer_t writer = {0};
+	zip_writer_segment_t cache_info[5];
 	uint32_t block, res = 0, total = 0, count = 0;
 	char version[8], fname[PATH_MAX], zipname[PATH_MAX];
 
 	sprintf(version, "CPS2V%d%d\0", VERSION_MAJOR, VERSION_MINOR);
 
-	chdir("cache");
+	change_directory("cache");
 
 	sprintf(zipname, "%s%ccache%c%s_cache.zip", launchDir, delimiter, delimiter, game_name);
 	remove(zipname);
@@ -1092,7 +1120,7 @@ static int create_zip_cache(char *game_name)
 	printf("cache name: cache%c%s_cache.zip\n", delimiter, game_name);
 	printf("Create cache file...\n");
 #endif
-	if (zip_open(zipname, "wb") < 0)
+	if (!zip_writer_open(&writer, zipname))
 	{
 #ifdef CHINESE
 		printf("错误: 无法创建zip文件 \"cache%c%s_cache.zip\".\n", delimiter, game_name);
@@ -1119,27 +1147,38 @@ static int create_zip_cache(char *game_name)
 		if (block_empty[block]) continue;
 
 		sprintf(fname, "%03x", block);
-		if ((fd = zopen(fname)) < 0) goto error;
-		zwrite(fd, &memory_region_gfx1[block << 16], 0x10000);
-		zclose(fd);
+		if (!zip_writer_add_mem(&writer, fname,
+		                        &memory_region_gfx1[block << 16], 0x10000))
+			goto error;
 		print_progress(++count, total);
 	}
 
-	if ((fd = zopen("cache_info")) < 0) goto error;
-	zwrite(fd, version, 8);
-	zwrite(fd, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
-	zwrite(fd, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
-	zwrite(fd, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
-	zwrite(fd, block_empty, 0x200);
-	zclose(fd);
+	cache_info[0].data = version;
+	cache_info[0].size = 8;
+	cache_info[1].data = gfx_pen_usage[TILE08];
+	cache_info[1].size = gfx_total_elements[TILE08];
+	cache_info[2].data = gfx_pen_usage[TILE16];
+	cache_info[2].size = gfx_total_elements[TILE16];
+	cache_info[3].data = gfx_pen_usage[TILE32];
+	cache_info[3].size = gfx_total_elements[TILE32];
+	cache_info[4].data = block_empty;
+	cache_info[4].size = 0x200;
+	if (!zip_writer_add_segments(&writer, "cache_info", cache_info, 5))
+		goto error;
 
 	print_progress(++count, total);
 	printf("\n");
 
+	if (!zip_writer_close(&writer))
+		goto error;
 	res = 1;
+	goto done;
 
 error:
-	zip_close();
+	zip_writer_abort(&writer);
+	remove(zipname);
+
+done:
 
 #ifdef CHINESE
 	if (!res) printf("错误: 无法创建文件.\n");
@@ -1147,7 +1186,7 @@ error:
 	if (!res) printf("ERROR: Could not create file.\n");
 #endif
 
-	chdir("..");
+	change_directory("..");
 
 	return res;
 }
@@ -1155,13 +1194,13 @@ error:
 
 static int create_folder_cache(char *game_name)
 {
-	FILE *fp;
+	int fp;
 	uint32_t block, total = 0, count = 0;
 	char version[8], fname[PATH_MAX];
 
 	sprintf(version, "CPS2V%d%d\0", VERSION_MAJOR, VERSION_MINOR);
 
-	chdir("cache");
+	change_directory("cache");
 
 	sprintf(fname, "%s_cache", game_name);
 
@@ -1182,10 +1221,10 @@ static int create_folder_cache(char *game_name)
 #else
 			printf("ERROR: Could not create directory \"cache%c%s_cache\".\n", delimiter, game_name);
 #endif
-			chdir("..");
+			change_directory("..");
 			return 0;
 		}
-		chdir(fname);
+		change_directory(fname);
 	}
 
 	for (block = 0; block < 0x200; block++)
@@ -1200,26 +1239,28 @@ static int create_folder_cache(char *game_name)
 		if (block_empty[block]) continue;
 
 		sprintf(fname, "%03x", block);
-		if ((fp = fopen(fname, "wb")) == NULL) goto error;
-		fwrite(&memory_region_gfx1[block << 16], 1, 0x10000, fp);
-		fclose(fp);
+		fp = open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+		if (fp < 0) goto error;
+		write(fp, &memory_region_gfx1[block << 16], 0x10000);
+		close(fp);
 		print_progress(++count, total);
 	}
 
 	/* Write cache_info */
-	if ((fp = fopen("cache_info", "wb")) == NULL) goto error;
-	fwrite(version, 1, 8, fp);
-	fwrite(gfx_pen_usage[TILE08], 1, gfx_total_elements[TILE08], fp);
-	fwrite(gfx_pen_usage[TILE16], 1, gfx_total_elements[TILE16], fp);
-	fwrite(gfx_pen_usage[TILE32], 1, gfx_total_elements[TILE32], fp);
-	fwrite(block_empty, 1, 0x200, fp);
-	fclose(fp);
+	fp = open("cache_info", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fp < 0) goto error;
+	write(fp, version, 8);
+	write(fp, gfx_pen_usage[TILE08], gfx_total_elements[TILE08]);
+	write(fp, gfx_pen_usage[TILE16], gfx_total_elements[TILE16]);
+	write(fp, gfx_pen_usage[TILE32], gfx_total_elements[TILE32]);
+	write(fp, block_empty, 0x200);
+	close(fp);
 
 	print_progress(++count, total);
 	printf("\n");
 
-	chdir("..");
-	chdir("..");
+	change_directory("..");
+	change_directory("..");
 	return 1;
 
 error:
@@ -1228,8 +1269,8 @@ error:
 #else
 	printf("ERROR: Could not create file.\n");
 #endif
-	chdir("..");
-	chdir("..");
+	change_directory("..");
+	change_directory("..");
 	return 0;
 }
 
@@ -1296,7 +1337,7 @@ int main(int argc, char *argv[])
 			goto error;
 		}
 	}
-	else chdir("..");
+	else change_directory("..");
 
 	getcwd(launchDir, PATH_MAX);
 	strcat(launchDir, "/");
@@ -1323,7 +1364,7 @@ int main(int argc, char *argv[])
 			printf("-------------------------------------------\n\n");
 #endif
 
-			chdir(launchDir);
+			change_directory(launchDir);
 			if (!convert_rom(game_name))
 			{
 #ifdef CHINESE
@@ -1403,7 +1444,7 @@ int main(int argc, char *argv[])
 		}
 		*p = '\0';
 
-		chdir(launchDir);
+		change_directory(launchDir);
 		if (!convert_rom(game_name))
 		{
 			res = 0;

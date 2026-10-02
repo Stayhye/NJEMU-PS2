@@ -1,41 +1,28 @@
-#include "emumain.h"
+#include "emucfg.h"
+#include "common/platform_driver.h"
+#include "common/runtime_paths.h"
+
 #include <SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
+
+#define DESKTOP_RAM_CAP (256u * 1024u * 1024u)
 
 typedef struct desktop_platform {
 } desktop_platform_t;
 
-void dbg_printf(const char *fmt, ...)
-{
-	va_list args;
-	va_start(args, fmt);
-	vprintf(fmt, args);
-	va_end(args);
-}
-
-/* ---- DEBUG: 68000 PC + gfxram hash trace (desktop only) ---- */
-extern c68k_struc C68K;
-extern uint16_t cps1_gfxram[];
-static void *pc_trace_thread(void *arg)
-{
-	FILE *f = fopen("/tmp/pc_trace.txt", "w");
-	while (f)
-	{
-		uint32_t h = 0;
-		int i;
-		for (i = 0; i < 0x4000; i++)
-			h = (h * 31) + (uint32_t)cps1_gfxram[i];
-		fprintf(f, "%06x %08x\n", (unsigned)(C68K.PC - C68K.BasePC), h);
-		usleep(20000);
-	}
-	return NULL;
-}
-
 static void *desktop_init(void) {
-	{
-		static pthread_t pt;
-		pthread_create(&pt, NULL, pc_trace_thread, NULL);
-	}
-
 	desktop_platform_t *desktop = (desktop_platform_t*)calloc(1, sizeof(desktop_platform_t));
 
 	// Initialize SDL for video, audio, and controller subsystems
@@ -57,9 +44,12 @@ static void desktop_free(void *data) {
 }
 
 static void desktop_main(void *data, int argc, char *argv[]) {
-	desktop_platform_t *desktop = (desktop_platform_t*)data;
+	(void)data;
+	(void)argc;
+	(void)argv;
     
-	getcwd(screenshotDir, sizeof(screenshotDir));
+	if (getcwd(screenshotDir, sizeof(screenshotDir)) == NULL)
+		return;
     strcat(screenshotDir, "/PICTURE");
     mkdir(screenshotDir, 0777);
 #if	(EMU_SYSTEM == CPS1)
@@ -76,12 +66,67 @@ static void desktop_main(void *data, int argc, char *argv[]) {
 #endif
 }
 
-static bool desktop_startSystemButtons(void *data) {
-return false;
+static bool desktop_queryMemoryInfo(void *data, platform_memory_info_t *out) {
+	uint64_t total = 0;
+	uint64_t available = 0;
+	(void)data;
+
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+
+#if defined(__APPLE__)
+	int mib[2] = { CTL_HW, HW_MEMSIZE };
+	size_t len = sizeof(total);
+	if (sysctl(mib, 2, &total, &len, NULL, 0) != 0) {
+		total = 0;
+	}
+	{
+		mach_port_t host = mach_host_self();
+		vm_size_t page_size = 0;
+		vm_statistics64_data_t stats;
+		mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+		if (host_page_size(host, &page_size) == KERN_SUCCESS &&
+			host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS) {
+			available = ((uint64_t)stats.free_count + (uint64_t)stats.inactive_count) * (uint64_t)page_size;
+		}
+		mach_port_deallocate(mach_task_self(), host);
+	}
+#elif defined(__linux__)
+	long pages = sysconf(_SC_PHYS_PAGES);
+	long available_pages = sysconf(_SC_AVPHYS_PAGES);
+	long page_size = sysconf(_SC_PAGESIZE);
+	if (pages > 0 && page_size > 0) {
+		total = (uint64_t)pages * (uint64_t)page_size;
+	}
+	if (available_pages > 0 && page_size > 0) {
+		available = (uint64_t)available_pages * (uint64_t)page_size;
+	}
+#endif
+
+	if (total == 0) {
+		total = DESKTOP_RAM_CAP;
+	}
+	if (available == 0) {
+		available = total;
+		out->reliability_flags |= PLATFORM_MEMORY_FREE_IS_ESTIMATE;
+	}
+
+	out->physical_total_bytes = total;
+	out->budget_cap_bytes = DESKTOP_RAM_CAP;
+	out->free_bytes = available;
+	out->largest_free_block_bytes = available < DESKTOP_RAM_CAP ? available : DESKTOP_RAM_CAP;
+	out->capabilities = PLATFORM_MEMORY_CAP_QUERY_FREE | PLATFORM_MEMORY_CAP_QUERY_LARGEST_BLOCK;
+	out->reliability_flags |= PLATFORM_MEMORY_LARGEST_IS_ESTIMATE;
+	platform_memory_info_normalize(out);
+	return true;
 }
 
-static int32_t desktop_getDevkitVersion(void *data) {
-	return 0;
+static ui_language_t desktop_getSystemLanguage(void *data) {
+	(void)data;
+	/* Desktop historically always selected English. Keep that behaviour explicit. */
+	return UI_LANG_ENGLISH;
 }
 
 platform_driver_t platform_desktop = {
@@ -89,6 +134,6 @@ platform_driver_t platform_desktop = {
 	desktop_init,
 	desktop_free,
 	desktop_main,
-	desktop_startSystemButtons,
-	desktop_getDevkitVersion,
+	desktop_queryMemoryInfo,
+	desktop_getSystemLanguage,
 };

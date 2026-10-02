@@ -6,7 +6,21 @@
 
 ******************************************************************************/
 
-#include "emumain.h"
+#include "common/emulator_options.h"
+#include "common/sound.h"
+#include <string.h>
+#include "sound/sndintrf.h"
+
+#if (EMU_SYSTEM == CPS1)
+#include "sound/2151intf.h"
+#include "sound/ym2151.h"
+#include "sound/qsound.h"
+#elif (EMU_SYSTEM == CPS2)
+#include "sound/qsound.h"
+#elif (EMU_SYSTEM == MVS || EMU_SYSTEM == NCDZ)
+#include "sound/2610intf.h"
+#include "sound/ym2610.h"
+#endif
 
 
 #define FRAC_BITS	14
@@ -318,7 +332,13 @@ void sound_set_samplerate(void)
 void sound_mute(int mute)
 {
 	if (mute)
+	{
+		sound_thread_pause(1);
 		sound_thread_enable(0);
+	}
 	else
+	{
 		sound_thread_enable(option_sound_enable);
+		sound_thread_pause(0);
+	}
 }

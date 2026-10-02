@@ -7,6 +7,8 @@
 ******************************************************************************/
 
 #include "cps1.h"
+#include "common/emulator_options.h"
+#include "common/ui_text_driver.h"
 
 #define MENU_BLANK		{ "\n", 0, 0x00, 0, 0, { NULL } }
 
@@ -6329,7 +6331,7 @@ dipswitch_t *load_dipswitch(int *sx)
 {
 	dipswitch_t *dipswitch = NULL;
 
-	if (ui_text_driver->getLanguage(ui_text_data) == LANG_JAPANESE)
+	if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_JAPANESE)
 	{
 		switch (machine_input_type)
 		{
@@ -6370,7 +6372,7 @@ dipswitch_t *load_dipswitch(int *sx)
 #endif
 		}
 	}
-	else if (ui_text_driver->getLanguage(ui_text_data) == LANG_CHINESE_SIMPLIFIED)
+	else if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_CHINESE_SIMPLIFIED)
 	{
 		switch (machine_input_type)
 		{
@@ -6411,7 +6413,7 @@ dipswitch_t *load_dipswitch(int *sx)
 #endif
 		}
 	}
-	else if (ui_text_driver->getLanguage(ui_text_data) == LANG_CHINESE_TRADITIONAL)
+	else if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_CHINESE_TRADITIONAL)
 	{
 		switch (machine_input_type)
 		{
@@ -6499,7 +6501,7 @@ dipswitch_t *load_dipswitch(int *sx)
 
 void save_dipswitch(void)
 {
-	if (ui_text_driver->getLanguage(ui_text_data) == LANG_JAPANESE)
+	if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_JAPANESE)
 	{
 		switch (machine_input_type)
 		{
@@ -6540,7 +6542,7 @@ void save_dipswitch(void)
 #endif
 		}
 	}
-	else if (ui_text_driver->getLanguage(ui_text_data) == LANG_CHINESE_SIMPLIFIED)
+	else if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_CHINESE_SIMPLIFIED)
 	{
 		switch (machine_input_type)
 		{
@@ -6581,7 +6583,7 @@ void save_dipswitch(void)
 #endif
 		}
 	}
-	else if (ui_text_driver->getLanguage(ui_text_data) == LANG_CHINESE_TRADITIONAL)
+	else if (ui_text_driver->getLanguage(ui_text_data) == UI_LANG_CHINESE_TRADITIONAL)
 	{
 		switch (machine_input_type)
 		{

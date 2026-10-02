@@ -1,6 +1,6 @@
 /******************************************************************************
 
-	power_driver.h
+	video_driver.h
 
 ******************************************************************************/
 
@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define MAKECOL15(r, g, b)	(((b & 0xf8) << 7) | ((g & 0xf8) << 2) | ((r & 0xf8) >> 3))
 #define GETR15(col)			(((col << 3) & 0xf8) | ((col >>  2) & 0x07))
@@ -39,34 +40,20 @@
 #define COLOR_DARKCYAN		  0,127,127
 #define COLOR_DARKGRAY		 63, 63, 63
 
-#define GU_FRAME_ADDR(frame)		(uint16_t *)((uint32_t)frame | 0x44000000)
 #define CNVCOL15TO32(c)				(GETR15(c) | (GETG15(c) << 8) | (GETB15(c) << 16))
-#define CNVCOL32TO15(c)				(((GETR32(c) & 0xf8) >> 3) | ((GETG32(c) & 0xf8) << 2) | ((GETB32(src[x]) & 0xf8) << 7))
 
-#define SWIZZLED_8x8(tex, idx)		&tex[(idx) << 6]
-#define SWIZZLED_16x16(tex, idx)	&tex[((idx & ~31) << 8) | ((idx & 31) << 7)]
-#define SWIZZLED_32x32(tex, idx)	&tex[((idx & ~15) << 10) | ((idx & 15) << 8)]
-
-#define NONE_SWIZZLED_8x8(tex, idx)		&tex[((idx & ~63) << 6) | ((idx & 63) << 3)]
-#define NONE_SWIZZLED_16x16(tex, idx)	&tex[((idx & ~31) << 8) | ((idx & 31) << 4)]
-#define NONE_SWIZZLED_32x32(tex, idx)	&tex[((idx & ~15) << 10) | ((idx & 15) << 5)]
-
-#define SWIZZLED8_8x8(tex, idx)		&tex[((idx & ~1) << 6) | ((idx & 1) << 3)]
-#define SWIZZLED8_16x16(tex, idx)	&tex[((idx & ~31) << 8) | ((idx & 31) << 7)]
-#define SWIZZLED8_32x32(tex, idx)	&tex[((idx & ~15) << 10) | ((idx & 15) << 8)]
-
-struct Vertex
+typedef struct video_sprite_vertex
 {
 	uint16_t u, v;
 	uint16_t color;
 	int16_t x, y, z;
-};
+} video_sprite_vertex_t;
 
-struct PointVertex
+typedef struct video_point_vertex
 {
 	uint16_t color;
 	int16_t x, y, z;
-};
+} video_point_vertex_t;
 
 struct rectangle
 {
@@ -109,6 +96,11 @@ typedef struct clut_info {
 	uint8_t bank_count;          /* Number of banks (2 for Neo Geo, 1 for CPS) */
 } clut_info_t;
 
+enum {
+	UI_GRADIENT_HORIZONTAL = 0,
+	UI_GRADIENT_VERTICAL
+};
+
 typedef struct video_driver
 {
 	/* Human-readable identifier. */
@@ -125,27 +117,51 @@ typedef struct video_driver
 	void *(*init)(layer_texture_info_t *layer_textures, uint8_t layer_textures_count, clut_info_t *clut_info);
 	/* Stops and frees driver data. */
    	void (*free)(void *data);
+	/* Wait for one presentation refresh without swapping buffers. */
 	void (*waitVsync)(void *data);
+	/* Present the completed frame. When vsync is true, the backend must wait
+	 * for the next presentation boundary when that capability is available. */
 	void (*flipScreen)(void *data, bool vsync);
-	void *(*frameAddr)(void *data, void *frame, int x, int y);
-	void *(*workFrame)(void *data);
-	void *(*textureLayer)(void *data, uint8_t layerIndex);
+	/* Begin a new rendering frame (e.g. start GPU command list).
+	 * All draw calls between beginFrame/endFrame just enqueue commands. */
+	void (*beginFrame)(void *data);
+	/* End the current rendering frame (e.g. finish and sync GPU command list). */
+	void (*endFrame)(void *data);
+	void *(*frameAddr)(void *data, int frameIndex, int x, int y);
+	/* Optional CPU readback for surfaces that are not directly addressable. */
+	int (*readFrame)(void *data, int frameIndex,
+		int x, int y, int width, int height, uint16_t *dst, int dstPitch);
+	/* Physical presentation size owned by the backend. */
+	void (*getOutputSize)(void *data, int *width, int *height);
 	void (*scissor)(void *data, uint16_t left, uint16_t top, uint16_t right, uint16_t bottom);
 	void (*clearScreen)(void *data);
 	void (*clearFrame)(void *data, int index);
-	void (*fillFrame)(void *data, void *frame, uint32_t color);
+	void (*fillFrame)(void *data, int frameIndex, uint32_t color);
 	void (*startWorkFrame)(void *data, uint32_t color);
 	void (*transferWorkFrame)(void *data, RECT *src_rect, RECT *dst_rect);
-	void (*copyRect)(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect);
-	void (*copyRectFlip)(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect);
-	void (*copyRectRotate)(void *data, void *src, void *dst, RECT *src_rect, RECT *dst_rect);
-	void (*drawTexture)(void *data, uint32_t src_fmt, uint32_t dst_fmt, void *src, void *dst, RECT *src_rect, RECT *dst_rect);
-	void *(*getNativeObjects)(void *data, int index);
+	void (*copyRect)(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect);
+	void (*copyRectFlip)(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect);
+	void (*copyRectRotate)(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect);
+	void (*drawTexture)(void *data, int srcIndex, int dstIndex, RECT *src_rect, RECT *dst_rect);
 	void (*uploadMem)(void *data, uint8_t textureIndex);
 	void (*uploadClut)(void *data, uint16_t *bank, uint8_t bank_index);
-	void (*blitTexture)(void *data, uint8_t textureIndex, void *clut, uint8_t bank_index, uint32_t vertices_count, void *vertices);
-	void (*blitPoints)(void *data, uint32_t points_count, void *vertices);
-	void (*flushCache)(void *data, void *addr, size_t size);
+	/* Portable indexed-atlas update used by target-common renderers.  x/y/w/h
+	 * use logical texture coordinates; the backend owns native/swizzled layout. */
+	void (*writeIndexedTextureRect)(void *data, uint8_t textureIndex,
+		int x, int y, int width, int height,
+		const uint8_t *pixels, int srcPitch);
+	/* Portable direct-color texture update. Pixels and srcPitch use 16-bit
+	 * texel units; the backend owns native texture layout/upload details. */
+	void (*writeDirectTextureRect)(void *data, uint8_t textureIndex,
+		int x, int y, int width, int height,
+		const uint16_t *pixels, int srcPitch);
+	/* Portable sprite batch. Backends translate these stable common vertices
+	 * into native GPU commands/vertices where necessary. */
+	void (*blitSpriteVertices)(void *data, uint8_t textureIndex,
+		const uint16_t *clut, uint8_t bank_index,
+		uint32_t vertices_count, const video_sprite_vertex_t *vertices);
+	void (*blitPointVertices)(void *data, uint32_t points_count,
+		const video_point_vertex_t *vertices);
 
 	/* Depth-test support (used by CPS2 priority masking) */
 	void (*enableDepthTest)(void *data);
@@ -153,23 +169,33 @@ typedef struct video_driver
 	void (*clearDepthBuffer)(void *data);
 	void (*clearColorBuffer)(void *data);
 
+	/* Low-level 2D UI drawing primitives. Common ui_draw.c owns UI semantics and
+	 * the UI texture adapter resolves native texture storage for drawUISprite. */
+	void (*drawUISprite)(void *data, void *tex, int tex_format, int tex_swizzled,
+	                    int tex_width, int tex_height, int tex_stride,
+	                    int su, int sv, int sw, int sh,
+	                    int dx, int dy, int dw, int dh, int blend);
+	void (*drawUILine)(void *data, int x1, int y1, int x2, int y2, uint32_t color);
+	void (*drawUILineGradient)(void *data, int x1, int y1, int x2, int y2,
+	                          uint32_t color1, uint32_t color2);
+	void (*drawUIRect)(void *data, int x, int y, int w, int h, uint32_t color);
+	void (*fillUIRect)(void *data, int x, int y, int w, int h, uint32_t color);
+	void (*fillUIRectGradient)(void *data, int x, int y, int w, int h,
+	                          uint32_t color1, uint32_t color2, int direction);
+	/* UI clipping uses x/y/width/height semantics, unlike the emulator scissor
+	 * callback above which uses edge coordinates. */
+	void (*setUIScissor)(void *data, int x, int y, int w, int h);
+
+	/* Optional cache-coherency preparation for a contiguous sprite vertex array.
+	 * Backends that require CPU/GPU cache synchronization can flush once before
+	 * a renderer emits many sub-batches from the same array. */
+	void (*prepareSpriteVertices)(void *data, uint32_t vertices_count,
+		const video_sprite_vertex_t *vertices);
+
 } video_driver_t;
 
-extern int platform_cpuclock;
+extern video_driver_t *const video_driver;
 
-extern video_driver_t video_psp;
-extern video_driver_t video_ps2;
-extern video_driver_t video_desktop;
-extern video_driver_t video_null;
-
-extern video_driver_t *video_drivers[];
-
-#define video_driver video_drivers[0]
-
-extern int video_mode;
-extern void *show_frame;
-extern void *draw_frame;
-extern void *work_frame;
 extern RECT full_rect;
 
 extern void *video_data;

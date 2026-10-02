@@ -8,6 +8,9 @@
 
 #include "cps1.h"
 #include "common/memory_sizes.h"
+#include "common/palette_convert.h"
+#include "common/runtime_paths.h"
+#include <string.h>
 
 
 /******************************************************************************
@@ -80,7 +83,7 @@ struct cps_scroll2_t
 static struct cps_scroll2_t ALIGN16_DATA scroll2[224];
 static uint16_t cps_scroll2_blocks;
 
-static uint16_t __attribute__((aligned(64))) video_clut16[65536];
+static uint8_t ALIGN16_DATA cps_color_component_lut[16][16];
 uint16_t __attribute__((aligned(64))) video_palette[CPS1_PALETTE_ENTRIES];
 
 
@@ -173,41 +176,7 @@ WRITE16_HANDLER( cps1_output_w )
 
 static void cps1_init_tables(void)
 {
-	int r, g, b, bright;
-
-	for (bright = 0; bright < 16; bright++)
-	{
-		for (r = 0; r < 16; r++)
-		{
-			for (g = 0; g < 16; g++)
-			{
-				for (b = 0; b < 16; b++)
-				{
-					uint16_t pen;
-					int r2, g2, b2, bright2;
-					float fr, fg, fb;
-
-					pen = (bright << 12) | (r << 8) | (g << 4) | b;
-
-					bright2 = bright + 16;
-
-					fr = (float)(r * bright2) / (15.0 * 31.0);
-					fg = (float)(g * bright2) / (15.0 * 31.0);
-					fb = (float)(b * bright2) / (15.0 * 31.0);
-
-					r2 = (int)(fr * 255.0) - 15;
-					g2 = (int)(fg * 255.0) - 15;
-					b2 = (int)(fb * 255.0) - 15;
-
-					if (r2 < 0) r2 = 0;
-					if (g2 < 0) g2 = 0;
-					if (b2 < 0) b2 = 0;
-
-					video_clut16[pen] = MAKECOL15(r2, g2, b2);
-				}
-			}
-		}
-	}
+	cps_palette_component_lut_init(cps_color_component_lut);
 }
 
 
@@ -230,7 +199,10 @@ static int cps1_gfx_decode(void)
 
 	for (; i < size >> 2; i++)
 	{
-		uint32_t src = gfx[4 * i] + (gfx[4 * i + 1] << 8) + (gfx[4 * i + 2] << 16) + (gfx[4 * i + 3] << 24);
+		uint32_t src = (uint32_t)gfx[4 * i]
+		             | ((uint32_t)gfx[4 * i + 1] << 8)
+		             | ((uint32_t)gfx[4 * i + 2] << 16)
+		             | ((uint32_t)gfx[4 * i + 3] << 24);
 		uint32_t dw = 0;
 
 		for (j = 0; j < 8; j++)
@@ -243,7 +215,7 @@ static int cps1_gfx_decode(void)
 			if (mask & 0x00ff0000) n |= 4;
 			if (mask & 0xff000000) n |= 8;
 
-			dw |= n << (j * 4);
+			dw |= (uint32_t)n << (j * 4);
 		}
 
 		data = ((dw & 0x0000000f) >>  0) | ((dw & 0x000000f0) <<  4)
@@ -498,7 +470,16 @@ int cps1_video_init(void)
 
 	cps1_init_tables();
 
-	return cps1_gfx_decode();
+	if (!blit_stars_init(cps1_has_stars))
+		return 0;
+
+	if (!cps1_gfx_decode())
+	{
+		blit_stars_exit();
+		return 0;
+	}
+
+	return 1;
 }
 
 
@@ -508,9 +489,12 @@ int cps1_video_init(void)
 
 void cps1_video_exit(void)
 {
+	blit_stars_exit();
+
 	if (cps1_object_pen_usage)
 	{
 		free(cps1_object_pen_usage);
+		cps1_object_pen_usage = NULL;
 	}
 }
 
@@ -578,7 +562,7 @@ static void cps1_build_palette(void)
 			if (palette != cps1_old_palette[offset])
 			{
 				cps1_old_palette[offset] = palette;
-				video_palette[offset] = video_clut16[palette];
+					video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 			}
 		}
 	}
@@ -592,7 +576,7 @@ static void cps1_build_palette(void)
 			if (palette != cps1_old_palette[offset])
 			{
 				cps1_old_palette[offset] = palette;
-				video_palette[offset] = video_clut16[palette];
+					video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 				blit_palette_mark_dirty(offset >> 4);
 			}
 		}
@@ -604,7 +588,7 @@ static void cps1_build_palette(void)
 		{
 			palette = cps1_palette[offset];
 
-			video_palette[offset] = video_clut16[palette];
+				video_palette[offset] = cps_palette_to_555(cps_color_component_lut, palette);
 		}
 	}
 }
@@ -1357,8 +1341,6 @@ static void cps1_render_layer(int layer)
 
 void cps1_screenrefresh(void)
 {
-	extern uint32_t frames_displayed;
-	frames_displayed++; /* new frame: advance the tile-cache age counter */
 	int i, l0, l1, l2, l3;
 	uint16_t video_ctrl = cps1_port(CPS1_VIDEO_CONTROL);
 	uint16_t layer_ctrl = cps1_port(driver->layer_control);

@@ -11,8 +11,76 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <time.h>
-#include <zlib.h>
-#include "emumain.h"
+#include <miniz.h>
+#include "emucfg.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/state.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/video_geometry.h"
+
+#if USE_CACHE
+#include "common/cache.h"
+#endif
+#ifdef ADHOC
+#include "common/adhoc.h"
+#include "common/adhoc_transport.h"
+#endif
+#if (EMU_SYSTEM == NCDZ)
+#include "common/mp3.h"
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include "common/ui.h"
+#include "common/ui_draw_driver.h"
+#include "cpu/m68000/m68000.h"
+#include "cpu/z80/z80.h"
+
+#if (EMU_SYSTEM == CPS1)
+#include "common/coin.h"
+#include "cps1/eeprom.h"
+#include "cps1/inptport.h"
+#include "cps1/memintrf.h"
+#include "cps1/timer.h"
+#include "cps1/driver.h"
+#include "cps1/vidhrdw.h"
+#include "sound/2151intf.h"
+#include "sound/okim6295.h"
+#include "sound/qsound.h"
+#elif (EMU_SYSTEM == CPS2)
+#include "common/coin.h"
+#include "cps2/eeprom.h"
+#include "cps2/inptport.h"
+#include "cps2/memintrf.h"
+#include "cps2/timer.h"
+#include "cps2/driver.h"
+#include "cps2/vidhrdw.h"
+#include "sound/qsound.h"
+#elif (EMU_SYSTEM == MVS)
+#include "mvs/inptport.h"
+#include "mvs/memintrf.h"
+#include "mvs/pd4990a.h"
+#include "mvs/timer.h"
+#include "mvs/driver.h"
+#include "mvs/vidhrdw.h"
+#include "sound/ym2610.h"
+#elif (EMU_SYSTEM == NCDZ)
+#include "ncdz/cdda.h"
+#include "ncdz/cdrom.h"
+#include "ncdz/inptport.h"
+#include "ncdz/memintrf.h"
+#include "ncdz/timer.h"
+#include "ncdz/driver.h"
+#include "ncdz/vidhrdw.h"
+#include "sound/ym2610.h"
+#endif
 
 typedef struct {
 	uint16_t year;
@@ -66,10 +134,28 @@ static const char *current_version_str = "NCDZSV23";
 	Save Thumbnail from Work Area to File
 ------------------------------------------------------*/
 
+static uint16_t *state_thumbnail_addr(int x)
+{
+	uint16_t *base = NULL;
+
+	if (video_driver->frameAddr != NULL)
+	{
+		base = (uint16_t *)video_driver->frameAddr(video_data,
+			COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER, x, 0);
+		if (base != NULL)
+			return base;
+	}
+
+	base = ui_draw_driver->getTextureBasePtr(ui_draw_data, UI_TEXTURE_FONT);
+	return base ? base + x : NULL;
+}
+
 static void save_thumbnail(void)
 {
 	int x, y, w, h;
-	uint16_t *src = ((uint16_t *)UI_TEXTURE) + 152;
+	uint16_t *src;
+	uint16_t *readback = NULL;
+	int src_pitch = BUF_WIDTH;
 
 #if (EMU_SYSTEM == CPS1 || EMU_SYSTEM == CPS2)
 	if (machine_screen_type)
@@ -84,14 +170,40 @@ static void save_thumbnail(void)
 		h = 112;
 	}
 
+	if (video_driver->readFrame != NULL)
+	{
+		/* Backends with non-CPU-addressable thumbnail surfaces can provide
+		 * explicit readback without leaking their storage model here. */
+		readback = (uint16_t *)calloc((size_t)w * h, sizeof(uint16_t));
+		if (readback)
+		{
+			/* A failed readback leaves the zero-filled thumbnail in place.  Keeping
+			 * the fixed thumbnail payload is more important than the preview itself:
+			 * the rest of the state file uses fixed offsets past this block. */
+			video_driver->readFrame(video_data,
+				COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER,
+				152, 0, w, h, readback, w);
+		}
+		src = readback;
+		src_pitch = w;
+	}
+	else
+	{
+		src = state_thumbnail_addr(152);
+	}
+
 	for (y = 0; y < h; y++)
 	{
 		for (x = 0; x < w; x++)
 		{
-			state_save_word(&src[x], 1);
+			uint16_t empty = 0;
+			state_save_word(src ? &src[x] : &empty, 1);
 		}
-		src += BUF_WIDTH;
+		if (src)
+			src += src_pitch;
 	}
+
+	free(readback);
 }
 
 
@@ -99,10 +211,12 @@ static void save_thumbnail(void)
 	Load Thumbnail from File to Work Area
 ------------------------------------------------------*/
 
-static void load_thumbnail(FILE *fp)
+static void load_thumbnail(int fd)
 {
 	int x, y, w, h;
-	uint16_t *dst = (uint16_t *)UI_TEXTURE;
+	uint16_t *dst = state_thumbnail_addr(0);
+	if (!dst)
+		return;
 
 #if (EMU_SYSTEM == CPS1 || EMU_SYSTEM == CPS2)
 	if (machine_screen_type)
@@ -121,11 +235,7 @@ static void load_thumbnail(FILE *fp)
 	{
 		for (x = 0; x < w; x++)
 		{
-#if (EMU_SYSTEM == NCDZ) || defined(ADHOC)
-			fread(&dst[x], 1, 2, fp);
-#else
-			state_load_word(&dst[x], 1);
-#endif
+			{ ssize_t io_result = read(fd, &dst[x], 2); (void)io_result; }
 		}
 		dst += BUF_WIDTH;
 	}
@@ -139,7 +249,9 @@ static void load_thumbnail(FILE *fp)
 static void clear_thumbnail(void)
 {
 	int x, y, w, h;
-	uint16_t *dst = (uint16_t *)UI_TEXTURE;
+	uint16_t *dst = state_thumbnail_addr(0);
+	if (!dst)
+		return;
 
 #if (EMU_SYSTEM == CPS1 || EMU_SYSTEM == CPS2)
 	if (machine_screen_type)
@@ -201,7 +313,7 @@ int state_save(int slot)
 	uint32_t size;
 #endif
 
-	sprintf(path, "%sstate/%s.sv%d", launchDir, game_name, slot);
+	if (!path_format(path, sizeof(path), "%sstate/%s.sv%d", launchDir, game_name, slot)) return 0;
 	remove(path);
 
 	sprintf(buf, TEXT(STATE_SAVING), game_name, slot);
@@ -229,7 +341,7 @@ int state_save(int slot)
 		save_thumbnail();
 		update_progress();
 
-		write(fd, inbuf, (uint32_t)state_buffer - (uint32_t)inbuf);
+		{ ssize_t io_result = write(fd, inbuf, (size_t)(state_buffer - inbuf)); (void)io_result; }
 		update_progress();
 
 		memset(inbuf, 0, STATE_BUFFER_SIZE);
@@ -247,7 +359,7 @@ int state_save(int slot)
 		state_save_cdrom();
 		update_progress();
 
-		insize = (uint32_t)state_buffer - (uint32_t)inbuf;
+		insize = (unsigned long)(state_buffer - inbuf);
 		outsize = insize * 1.1 + 12;
 		if ((outbuf = malloc(outsize)) == NULL)
 		{
@@ -257,7 +369,7 @@ int state_save(int slot)
 		}
 		memset(outbuf, 0, outsize);
 
-		if (compress(outbuf, &outsize, inbuf, insize) != Z_OK)
+		if (mz_compress(outbuf, &outsize, inbuf, insize) != MZ_OK)
 		{
 			strcpy(error_mes, TEXT(COULD_NOT_COMPRESS_STATE_DATA));
 			free(inbuf);
@@ -267,8 +379,8 @@ int state_save(int slot)
 		free(inbuf);
 		update_progress();
 
-		write(fd, &outsize, 4);
-		write(fd, outbuf, outsize);
+		{ ssize_t io_result = write(fd, &outsize, 4); (void)io_result; }
+		{ ssize_t io_result = write(fd, outbuf, outsize); (void)io_result; }
 		close(fd);
 		free(outbuf);
 		update_progress();
@@ -278,13 +390,19 @@ int state_save(int slot)
 	}
 #else
 	{
+	#if !defined(ADHOC) && USE_CACHE
+		int state_buffer_uses_cache = 0;
+	#endif
 #ifdef ADHOC
 		state_buffer = state_buffer_base;
 #else
-#if (EMU_SYSTEM == CPS1 || (EMU_SYSTEM == CPS2 && defined(LARGE_MEMORY)))
 		state_buffer = state_buffer_base = malloc(STATE_BUFFER_SIZE);
-#else
-		state_buffer = state_buffer_base = cache_alloc_state_buffer(STATE_BUFFER_SIZE);
+#if USE_CACHE
+		if (!state_buffer)
+		{
+			state_buffer = state_buffer_base = cache_alloc_state_buffer(STATE_BUFFER_SIZE);
+			state_buffer_uses_cache = state_buffer != NULL;
+		}
 #endif
 		if (!state_buffer)
 		{
@@ -320,6 +438,7 @@ int state_save(int slot)
 
 		case MACHINE_pang3:
 			state_save_eeprom();
+			/* fall through */
 
 		default:
 			state_save_ym2151();
@@ -335,18 +454,19 @@ int state_save(int slot)
 #endif
 		update_progress();
 
-		size = (uint32_t)state_buffer - (uint32_t)state_buffer_base;
-		write(fd, state_buffer_base, size);
+		size = (uint32_t)(state_buffer - state_buffer_base);
+		{ ssize_t io_result = write(fd, state_buffer_base, size); (void)io_result; }
 		close(fd);
 		update_progress();
 
-#ifndef ADHOC
-#if (EMU_SYSTEM == CPS1 || (EMU_SYSTEM == CPS2 && defined(LARGE_MEMORY)))
-		free(state_buffer_base);
-#else
-		cache_free_state_buffer(STATE_BUFFER_SIZE);
+	#ifndef ADHOC
+#if USE_CACHE
+			if (state_buffer_uses_cache)
+				cache_free_state_buffer(STATE_BUFFER_SIZE);
+			else
 #endif
-#endif
+				free(state_buffer_base);
+	#endif
 		update_progress();
 
 		show_progress(buf);
@@ -379,11 +499,7 @@ error:
 
 int state_load(int slot)
 {
-#if defined(ADHOC) || (EMU_SYSTEM == NCDZ)
 	int32_t fd;
-#else
-	FILE *fp;
-#endif
 	char path[PATH_MAX];
 	char error_mes[128];
 	char buf[128];
@@ -392,7 +508,7 @@ int state_load(int slot)
 	unsigned long insize, outsize;
 #endif
 
-	sprintf(path, "%sstate/%s.sv%d", launchDir, game_name, slot);
+	if (!path_format(path, sizeof(path), "%sstate/%s.sv%d", launchDir, game_name, slot)) return 0;
 
 #if (EMU_SYSTEM == MVS)
 	state_reload_bios = 0;
@@ -411,7 +527,7 @@ int state_load(int slot)
 		lseek(fd, (8+16) + (152*112*2), SEEK_SET);
 		update_progress();
 
-		read(fd, &insize, 4);
+		{ ssize_t io_result = read(fd, &insize, 4); (void)io_result; }
 		if ((inbuf = malloc(insize)) == NULL)
 		{
 			strcpy(error_mes, TEXT(COULD_NOT_ALLOCATE_STATE_BUFFER));
@@ -421,7 +537,7 @@ int state_load(int slot)
 		memset(inbuf, 0, insize);
 		update_progress();
 
-		read(fd, inbuf, insize);
+		{ ssize_t io_result = read(fd, inbuf, insize); (void)io_result; }
 		close(fd);
 		update_progress();
 
@@ -434,7 +550,7 @@ int state_load(int slot)
 		}
 		memset(outbuf, 0, outsize);
 
-		if (uncompress(outbuf, &outsize, inbuf, insize) != Z_OK)
+		if (mz_uncompress(outbuf, &outsize, inbuf, insize) != MZ_OK)
 		{
 			strcpy(error_mes, TEXT(COULD_NOT_UNCOMPRESS_STATE_DATA));
 			free(inbuf);
@@ -480,7 +596,7 @@ int state_load(int slot)
 
 		size = lseek(fd, 0, SEEK_END);
 		lseek(fd, 0, SEEK_SET);
-		read(fd, state_buffer_base, size);
+		{ ssize_t io_result = read(fd, state_buffer_base, size); (void)io_result; }
 		close(fd);
 
 		state_buffer = state_buffer_base;
@@ -510,6 +626,7 @@ int state_load(int slot)
 
 		case MACHINE_pang3:
 			state_load_eeprom();
+			/* fall through */
 
 		default:
 			state_load_ym2151();
@@ -537,7 +654,7 @@ int state_load(int slot)
 		}
 #endif
 #else
-	if ((fp = fopen(path, "rb")) != NULL)
+	if ((fd = open(path, O_RDONLY)) >= 0)
 	{
 		state_load_skip((8+16));
 		update_progress();
@@ -545,40 +662,41 @@ int state_load(int slot)
 		state_load_skip((152*112*2));
 		update_progress();
 
-		state_load_memory(fp);
-		state_load_m68000(fp);
-		state_load_z80(fp);
-		state_load_input(fp);
-		state_load_timer(fp);
-		state_load_driver(fp);
-		state_load_video(fp);
+		state_load_memory(fd);
+		state_load_m68000(fd);
+		state_load_z80(fd);
+		state_load_input(fd);
+		state_load_timer(fd);
+		state_load_driver(fd);
+		state_load_video(fd);
 #if (EMU_SYSTEM == CPS1)
 
-		state_load_coin(fp);
+		state_load_coin(fd);
 		switch (machine_driver_type)
 		{
 		case MACHINE_qsound:
-			state_load_qsound(fp);
-			state_load_eeprom(fp);
+			state_load_qsound(fd);
+			state_load_eeprom(fd);
 			break;
 
 		case MACHINE_pang3:
-			state_load_eeprom(fp);
+			state_load_eeprom(fd);
+			/* fall through */
 
 		default:
-			state_load_ym2151(fp);
+			state_load_ym2151(fd);
 			break;
 		}
-		fclose(fp);
+		close(fd);
 #elif (EMU_SYSTEM == CPS2)
-		state_load_coin(fp);
-		state_load_qsound(fp);
-		state_load_eeprom(fp);
-		fclose(fp);
+		state_load_coin(fd);
+		state_load_qsound(fd);
+		state_load_eeprom(fd);
+		close(fd);
 #elif (EMU_SYSTEM == MVS)
-		state_load_ym2610(fp);
-		state_load_pd4990a(fp);
-		fclose(fp);
+		state_load_ym2610(fd);
+		state_load_pd4990a(fd);
+		close(fd);
 
 		if (state_reload_bios)
 		{
@@ -622,8 +740,6 @@ error:
 
 void state_make_thumbnail(void)
 {
-	uint16_t *tex = UI_TEXTURE;
-
 	{
 #if (EMU_SYSTEM == CPS1 || EMU_SYSTEM == CPS2)
 		RECT clip1 = { 64, 16, 64 + 384, 16 + 224 };
@@ -631,18 +747,18 @@ void state_make_thumbnail(void)
 		if (machine_screen_type)
 		{
 			RECT clip2 = { 152, 0, 152 + 112, 152 };
-			video_driver->copyRectRotate(video_data, work_frame, tex, &clip1, &clip2);
+			video_driver->copyRectRotate(video_data, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER, &clip1, &clip2);
 		}
 		else
 		{
 			RECT clip2 = { 152, 0, 152 + 152, 112 };
-			video_driver->copyRect(video_data, work_frame, tex, &clip1, &clip2);
+			video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER, &clip1, &clip2);
 		}
 #elif (EMU_SYSTEM == MVS || EMU_SYSTEM == NCDZ)
 		RECT clip1 = { 24, 16, 336, 240 };
 		RECT clip2 = { 152, 0, 152 + 152, 112 };
 
-		video_driver->copyRect(video_data, work_frame, tex, &clip1, &clip2);
+		video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER, &clip1, &clip2);
 #endif
 	}
 }
@@ -654,29 +770,30 @@ void state_make_thumbnail(void)
 
 int state_load_thumbnail(int slot)
 {
-	FILE *fp;
+	int fd;
 	char path[PATH_MAX];
 
 	clear_thumbnail();
 
-	sprintf(path, "%sstate/%s.sv%d", launchDir, game_name, slot);
+	if (!path_format(path, sizeof(path), "%sstate/%s.sv%d", launchDir, game_name, slot)) return 0;
 
-	if ((fp = fopen(path, "rb")) != NULL)
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
 	{
 		stateTime t;
 
 		memset(stver_str, 0, 16);
 
-		fread(stver_str, 1, 8, fp);
-		fread(&t, 1, 16, fp);
-		load_thumbnail(fp);
-		fclose(fp);
+		{ ssize_t io_result = read(fd, stver_str, 8); (void)io_result; }
+		{ ssize_t io_result = read(fd, &t, 16); (void)io_result; }
+		load_thumbnail(fd);
+		close(fd);
 
 		current_state_version = current_version_str[7] - '0';
 		state_version = stver_str[7] - '0';
 
-		sprintf(date_str, "%04d/%02d/%02d", t.year, t.month, t.day);
-		sprintf(time_str, "%02d:%02d:%02d", t.hour, t.minutes, t.seconds);
+		snprintf(date_str, sizeof(date_str), "%04u/%02u/%02u", (unsigned)t.year, (unsigned)(uint8_t)t.month, (unsigned)(uint8_t)t.day);
+		snprintf(time_str, sizeof(time_str), "%02u:%02u:%02u", (unsigned)(uint8_t)t.hour, (unsigned)(uint8_t)t.minutes, (unsigned)(uint8_t)t.seconds);
 
 		return 1;
 	}
@@ -759,6 +876,7 @@ int adhoc_send_state(uint32_t *frame)
 
 	case MACHINE_pang3:
 		state_save_eeprom();
+		/* fall through */
 
 	default:
 		state_save_ym2151();
@@ -860,6 +978,7 @@ retry:
 
 	case MACHINE_pang3:
 		state_load_eeprom();
+		/* fall through */
 
 	default:
 		state_load_ym2151();

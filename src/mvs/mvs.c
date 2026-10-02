@@ -8,9 +8,38 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "mvs.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#include "common/adhoc_transport.h"
+#endif
+#include "common/cache.h"
+#ifdef COMMAND_LIST
+#include "common/cmdlist.h"
+#endif
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/filer.h"
+#include "common/config.h"
 
-void swab(const void *restrict src, void *restrict dest, ssize_t nbytes);
+static void byte_swap_pairs_in_place(uint8_t *data, size_t length)
+{
+	size_t i;
+	for (i = 0; i + 1 < length; i += 2)
+	{
+		uint8_t tmp = data[i];
+		data[i] = data[i + 1];
+		data[i + 1] = tmp;
+	}
+}
 
 /******************************************************************************
 	Global Variables
@@ -80,19 +109,19 @@ static int neogeo_init(void)
 	if (!adhoc_enable)
 #endif
 	{
-		sprintf(path, "%smemcard/%s.bin", launchDir, game_name);
+		if (!path_format(path, sizeof(path), "%smemcard/%s.bin", launchDir, game_name)) return 0;
 		if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 		{
-			read(fd, neogeo_memcard, 0x800);
+			{ ssize_t io_result = read(fd, neogeo_memcard, 0x800); (void)io_result; }
 			close(fd);
 		}
 
-		sprintf(path, "%snvram/%s.nv", launchDir, game_name);
+		if (!path_format(path, sizeof(path), "%snvram/%s.nv", launchDir, game_name)) return 0;
 		if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 		{
-			read(fd, neogeo_sram16, 0x2000);
+			{ ssize_t io_result = read(fd, neogeo_sram16, 0x2000); (void)io_result; }
 			close(fd);
-			swab(neogeo_sram16, neogeo_sram16, 0x2000);
+			byte_swap_pairs_in_place((uint8_t *)neogeo_sram16, 0x2000);
 		}
 	}
 
@@ -153,12 +182,6 @@ static void neogeo_reset(void)
 	neogeo_driver_reset();
 	neogeo_video_reset();
 
-	/* "Reset Game" does not reload the BIOS, so the region / machine-mode
-	 * bytes that load_rom_user1() patched into the BIOS memory would keep
-	 * their old values.  Re-apply the patch so a Region (or Machine Mode)
-	 * changed in the in-game Settings menu actually takes effect. */
-	neogeo_apply_bios_patch();
-
 	sound_reset();
 	blit_clear_all_sprite();
 	autoframeskip_reset();
@@ -189,18 +212,18 @@ static void neogeo_exit(void)
 	if (!adhoc_enable)
 #endif
 	{
-		sprintf(path, "%smemcard/%s.bin", launchDir, game_name);
+		if (!path_format(path, sizeof(path), "%smemcard/%s.bin", launchDir, game_name)) return;
 		if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
 		{
-			write(fd, neogeo_memcard, 0x800);
+			{ ssize_t io_result = write(fd, neogeo_memcard, 0x800); (void)io_result; }
 			close(fd);
 		}
 
-		sprintf(path, "%snvram/%s.nv", launchDir, game_name);
+		if (!path_format(path, sizeof(path), "%snvram/%s.nv", launchDir, game_name)) return;
 		if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
 		{
-			swab(neogeo_sram16, neogeo_sram16, 0x2000);
-			write(fd, neogeo_sram16, 0x2000);
+			byte_swap_pairs_in_place((uint8_t *)neogeo_sram16, 0x2000);
+			{ ssize_t io_result = write(fd, neogeo_sram16, 0x2000); (void)io_result; }
 			close(fd);
 		}
 
@@ -288,13 +311,10 @@ static void neogeo_run(void)
 			}
 
 			apply_cheat();//davex
-			/* Input before CPU (SNESticleRevive order): the pad snapshot
-			 * taken now is what this frame's emulation sees, instead of
-			 * the previous frame's late sample. */
-			update_inputport();
 			
 			timer_update_cpu();
 			update_screen();
+			update_inputport();
 		}
 
 		video_driver->clearScreen(video_data);
@@ -333,7 +353,10 @@ void neogeo_main(void)
 				{
 					if (neogeo_init())
 					{
-						neogeo_run();
+						if (emu_test_exit_after_init())
+							Loop = LOOP_EXIT;
+						else
+							neogeo_run();
 					}
 					neogeo_exit();
 				}

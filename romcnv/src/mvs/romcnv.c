@@ -7,7 +7,9 @@
 ******************************************************************************/
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +18,7 @@
 #include "romcnv.h"
 #include "common.h"
 #include "neogeo.h"
-#include "zfile.h"
+#include "zip_writer.h"
 
 #define MAX_GAMES			512
 
@@ -74,6 +76,12 @@ static int machine_driver_type;
 static int machine_init_type;
 static int machine_input_type;
 static int machine_screen_type;
+
+static void change_directory(const char *path)
+{
+	if (chdir(path) != 0)
+		perror(path);
+}
 
 static struct rom_t gfx2rom[MAX_GFX2ROM];
 static struct rom_t gfx3rom[MAX_GFX3ROM];
@@ -139,8 +147,10 @@ struct cacheinfo_t MVS_cacheinfo[] =
 	{ "shocktroa","shocktro", 0, 0, 0 },
 	{ "rbff2h",   "rbff2",    0, 0, 0 },
 	{ "rbff2k",   "rbff2",    0, 0, 0 },
+	{ "kof98a",   "kof98",    0, 0, 0 },
 	{ "kof98c",   "kof98",    1, 1, 0 },
 	{ "kof98cn",  "kof98",    1, 1, 0 },
+	{ "kof98evo", "kof98",    1, 0, 0 },
 	{ "kof98k",   "kof98",    0, 0, 0 },
 	{ "kof98ka",  "kof98",    0, 0, 0 },
 	{ "kof98h",   "kof98",    0, 0, 0 },
@@ -212,6 +222,28 @@ struct cacheinfo_t MVS_cacheinfo[] =
 	{ "shocktroa","shocktro", 0, 0, 0 },
 	{ NULL }
 };
+
+
+static void set_cache_conversion_policy(const char *game_name)
+{
+	int i = 0;
+
+	convert_crom = parent_name[0] ? 0 : 1;
+	convert_srom = parent_name[0] ? 0 : 1;
+	convert_vrom = parent_name[0] ? 0 : 1;
+
+	while (MVS_cacheinfo[i].name)
+	{
+		if (strcmp(game_name, MVS_cacheinfo[i].name) == 0)
+		{
+			convert_crom = MVS_cacheinfo[i].crom;
+			convert_srom = MVS_cacheinfo[i].srom;
+			convert_vrom = MVS_cacheinfo[i].vrom;
+			break;
+		}
+		i++;
+	}
+}
 
 
 /******************************************************************************
@@ -311,12 +343,12 @@ static int load_rom_gfx2(void)
 
 		for (i = 0; i < num_gfx2rom; )
 		{
-			int res;
+			rom_file_open_result_t res;
 
 			strcpy(fname, gfx2rom[i].name);
 			if ((res = file_open(game_name, parent, gfx2rom[i].crc, fname)) < 0)
 			{
-				if (res == -1)
+				if (res == ROM_FILE_OPEN_NOT_FOUND)
 					error_file(fname);
 				else
 					error_crc(fname);
@@ -359,12 +391,12 @@ static int load_rom_gfx3(void)
 
 	for (i = 0; i < num_gfx3rom; )
 	{
-		int res;
+		rom_file_open_result_t res;
 
 		strcpy(fname, gfx3rom[i].name);
 		if ((res = file_open(game_name, parent, gfx3rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -399,12 +431,12 @@ static int load_rom_sound1(void)
 
 	for (i = 0; i < num_snd1rom; )
 	{
-		int res;
+		rom_file_open_result_t res;
 
 		strcpy(fname, snd1rom[i].name);
 		if ((res = file_open(game_name, parent, snd1rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -425,18 +457,32 @@ static int load_rom_sound1(void)
 }
 
 
+static ssize_t fd_readline(int fd, char *buf, size_t size)
+{
+	size_t i = 0;
+	char c;
+	while (i < size - 1) {
+		if (read(fd, &c, 1) <= 0) break;
+		buf[i++] = c;
+		if (c == '\n') break;
+	}
+	buf[i] = '\0';
+	return (ssize_t)i;
+}
+
 static int build_game_list(void)
 {
-	FILE *fp;
+	int fp;
 	char path[PATH_MAX];
 	char buf[256];
 	int num_games = 0;
 
 	sprintf(path, "%srominfo.mvs", launchDir);
 
-	if ((fp = fopen(path, "r")) != NULL)
+	fp = open(path, O_RDONLY);
+	if (fp >= 0)
 	{
-		while (fgets(buf, 255, fp))
+		while (fd_readline(fp, buf, 255) > 0)
 		{
 			if (buf[0] == '/' && buf[1] == '/')
 				continue;
@@ -453,7 +499,7 @@ static int build_game_list(void)
 				}
 			}
 		}
-		fclose(fp);
+		close(fp);
 		return num_games;
 	}
 	return 0;
@@ -462,7 +508,7 @@ static int build_game_list(void)
 
 static int load_rom_info(const char *game_name)
 {
-	FILE *fp;
+	int fp;
 	char path[PATH_MAX];
 	char buf[256];
 	int rom_start = 0;
@@ -486,9 +532,10 @@ static int load_rom_info(const char *game_name)
 
 	sprintf(path, "%srominfo.mvs", launchDir);
 
-	if ((fp = fopen(path, "r")) != NULL)
+	fp = open(path, O_RDONLY);
+	if (fp >= 0)
 	{
-		while (fgets(buf, 255, fp))
+		while (fd_readline(fp, buf, 255) > 0)
 		{
 			if (buf[0] == '/' && buf[1] == '/')
 				continue;
@@ -538,7 +585,7 @@ static int load_rom_info(const char *game_name)
 /*
 				else if (rom_start && str_cmp(buf, "END") == 0)
 				{
-					fclose(fp);
+					close(fp);
 					if (total_size >= 16*1024*1024)
 						return 0;
 					else
@@ -547,7 +594,7 @@ static int load_rom_info(const char *game_name)
 */
 				else if (rom_start && str_cmp(buf, "END") == 0)
 				{
-					fclose(fp);
+					close(fp);
 					if (psp2k)
 						{
 						if ((total_size > 0x2b50000) || (encrypt_gfx3))
@@ -700,7 +747,7 @@ static int load_rom_info(const char *game_name)
 				}
 			}
 		}
-		fclose(fp);
+		close(fp);
 		return 2;
 	}
 	return 3;
@@ -761,9 +808,16 @@ static int convert_rom(char *game_name)
 #else
 		printf("Clone set (parent: %s)\n", parent_name);
 #endif
+	set_cache_conversion_policy(game_name);
+	if (!convert_crom && !convert_srom && !convert_vrom)
+	{
+		printf("INFO: Cache data inherited from parent; no conversion needed.\n");
+		return 2;
+	}
+
 	if (psp2k) disable_sound = 0;
 
-	if (encrypt_snd1 || disable_sound)
+	if (convert_vrom && (encrypt_snd1 || disable_sound))
 	{
 		if (load_rom_sound1())
 		{
@@ -926,10 +980,12 @@ static int convert_rom(char *game_name)
 
 			case INIT_kf2k3bl:
 			case INIT_kf2k3pl:
+				cmc50_neogeo_gfx_decrypt(0x9d);
 				neogeo_bootleg_sx_decrypt(1);
 				break;
 
 			case INIT_kf2k3upl:
+				cmc50_neogeo_gfx_decrypt(0x9d);
 				neogeo_bootleg_sx_decrypt(2);
 				break;
 
@@ -1006,13 +1062,13 @@ error:
 
 static int create_raw_cache(char *game_name)
 {
-	FILE *fp;
+	int fp;
 	char version[8];
 	char fname[PATH_MAX];
 
 	sprintf(version, "MVS_V%d%d\0", VERSION_MAJOR, VERSION_MINOR);
 
-	chdir("cache");
+	change_directory("cache");
 #ifdef CHINESE
 	printf("正在创建缓存文件...\n");
 #else
@@ -1028,38 +1084,42 @@ static int create_raw_cache(char *game_name)
 #else
 			printf("ERROR: Could not create folder.\n");
 #endif
-			chdir(launchDir);
+			change_directory(launchDir);
 			return 0;
 		}
-		chdir(fname);
+		change_directory(fname);
 	}
 
-	if ((fp = fopen("cache_info", "wb")) == NULL) goto error;
-	fwrite(version, 1, 8, fp);
-	fwrite(gfx_pen_usage[TILE_SPR], 1, gfx_total_elements[TILE_SPR], fp);
-	fclose(fp);
+	fp = open("cache_info", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+	if (fp < 0) goto error;
+	write(fp, version, 8);
+	write(fp, gfx_pen_usage[TILE_SPR], gfx_total_elements[TILE_SPR]);
+	close(fp);
 
 	if (convert_crom)
 	{
-		if ((fp = fopen("crom", "wb")) == NULL) goto error;
-		fwrite(memory_region_gfx3, 1, memory_length_gfx3, fp);
-		fclose(fp);
+		fp = open("crom", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+		if (fp < 0) goto error;
+		write(fp, memory_region_gfx3, memory_length_gfx3);
+		close(fp);
 	}
 	if (convert_srom && encrypt_gfx2)
 	{
-		if ((fp = fopen("srom", "wb")) == NULL) goto error;
-		fwrite(memory_region_gfx2, 1, memory_length_gfx2, fp);
-		fclose(fp);
+		fp = open("srom", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+		if (fp < 0) goto error;
+		write(fp, memory_region_gfx2, memory_length_gfx2);
+		close(fp);
 	}
 	if (convert_vrom && (encrypt_snd1 || disable_sound))
 	{
-		if ((fp = fopen("vrom", "wb")) == NULL) goto error;
-		fwrite(memory_region_sound1, 1, memory_length_sound1, fp);
-		fclose(fp);
+		fp = open("vrom", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+		if (fp < 0) goto error;
+		write(fp, memory_region_sound1, memory_length_sound1);
+		close(fp);
 	}
 
-	chdir("..");
-	chdir("..");
+	change_directory("..");
+	change_directory("..");
 	return 1;
 
 error:
@@ -1077,7 +1137,7 @@ error:
 		remove("vrom");
 	}
 
-	chdir("..");
+	change_directory("..");
 
 	sprintf(fname, "cache_%s", game_name);
 	rmdir(fname);
@@ -1086,21 +1146,22 @@ error:
 #else
 	printf("ERROR: Could not create file.\n");
 #endif
-	chdir("..");
+	change_directory("..");
 	return 0;
 }
 
 
 static int create_zip_cache(char *game_name)
 {
-	int fd;
-	uint32_t block, total = 0, count = 0, num_blocks;
+	zip_writer_t writer = {0};
+	zip_writer_segment_t cache_info[2];
+	uint32_t block, num_blocks;
 	char version[8], zipname[PATH_MAX];
 	int res = 0;
 
 	sprintf(version, "MVS_V%d%d\0", VERSION_MAJOR, VERSION_MINOR);
 
-	chdir("cache");
+	change_directory("cache");
 
 	sprintf(zipname, "%s%ccache%c%s_cache.zip", launchDir, delimiter, delimiter, game_name);
 	remove(zipname);
@@ -1113,7 +1174,7 @@ static int create_zip_cache(char *game_name)
 	printf("Create cache file...\n");
 #endif
 
-	if (zip_open(zipname, "wb") < 0)
+	if (!zip_writer_open(&writer, zipname))
 	{
 #ifdef CHINESE
 		printf("错误: 无法创建zip文件 \"cache%c%s_cache.zip\".\n", delimiter, game_name);
@@ -1148,38 +1209,47 @@ static int create_zip_cache(char *game_name)
 			fname[2] = cnv_table[ block       & 0x0f];
 			fname[3] = '\0';
 
-			if ((fd = zopen(fname)) < 0) goto error;
-			zwrite(fd, &memory_region_gfx3[block << 16], 0x10000);
-			zclose(fd);
+			if (!zip_writer_add_mem(&writer, fname,
+			                        &memory_region_gfx3[block << 16], 0x10000))
+			{
+				printf("ERROR: Could not write cache block %s.\n", fname);
+				goto error;
+			}
 		}
 	}
 
 	/* Write srom */
 	if (convert_srom && encrypt_gfx2)
 	{
-		if ((fd = zopen("srom")) < 0) goto error;
-		zwrite(fd, memory_region_gfx2, memory_length_gfx2);
-		zclose(fd);
+		if (!zip_writer_add_mem(&writer, "srom", memory_region_gfx2, memory_length_gfx2))
+			goto error;
 	}
 
 	/* Write vrom */
 	if (convert_vrom && (encrypt_snd1 || disable_sound))
 	{
-		if ((fd = zopen("vrom")) < 0) goto error;
-		zwrite(fd, memory_region_sound1, memory_length_sound1);
-		zclose(fd);
+		if (!zip_writer_add_mem(&writer, "vrom", memory_region_sound1, memory_length_sound1))
+			goto error;
 	}
 
-	/* Write cache_info (version + pen_usage) */
-	if ((fd = zopen("cache_info")) < 0) goto error;
-	zwrite(fd, version, 8);
-	zwrite(fd, gfx_pen_usage[TILE_SPR], gfx_total_elements[TILE_SPR]);
-	zclose(fd);
+	/* Write cache_info (version + pen_usage) without staging a combined buffer. */
+	cache_info[0].data = version;
+	cache_info[0].size = 8;
+	cache_info[1].data = gfx_pen_usage[TILE_SPR];
+	cache_info[1].size = gfx_total_elements[TILE_SPR];
+	if (!zip_writer_add_segments(&writer, "cache_info", cache_info, 2))
+		goto error;
 
+	if (!zip_writer_close(&writer))
+		goto error;
 	res = 1;
+	goto done;
 
 error:
-	zip_close();
+	zip_writer_abort(&writer);
+	remove(zipname);
+
+done:
 
 #ifdef CHINESE
 	if (!res) printf("错误: 无法创建文件.\n");
@@ -1187,7 +1257,7 @@ error:
 	if (!res) printf("ERROR: Could not create file.\n");
 #endif
 
-	chdir("..");
+	change_directory("..");
 
 	return res;
 }
@@ -1251,7 +1321,7 @@ int main(int argc, char *argv[])
 			goto error;
 		}
 	}
-	else chdir("..");
+	else change_directory("..");
 
 	getcwd(launchDir, PATH_MAX);
 	strcat(launchDir, "/");
@@ -1268,29 +1338,11 @@ int main(int argc, char *argv[])
 
 		for (i = 0; i < total_games; i++)
 		{
-			int j = 0;
+			int convert_result;
 
 			res = 1;
 
 			strcpy(game_name, game_names[i]);
-
-			convert_crom = 1;
-			convert_srom = 1;
-			convert_vrom = 1;
-
-			while (MVS_cacheinfo[j].name)
-			{
-				if (strcmp(game_name, MVS_cacheinfo[j].name) == 0)
-				{
-					convert_crom = MVS_cacheinfo[j].crom;
-					convert_srom = MVS_cacheinfo[j].srom;
-					convert_vrom = MVS_cacheinfo[j].vrom;
-					break;
-				}
-				j++;
-			}
-			if (!convert_crom && !convert_srom && !convert_vrom)
-				continue;
 #ifdef CHINESE
 			printf("\n-------------------------------------------\n");
 			printf("  ROM set: %s\n", game_name);
@@ -1301,8 +1353,9 @@ int main(int argc, char *argv[])
 			printf("-------------------------------------------\n\n");
 #endif
 
-			chdir(launchDir);
-			if (!convert_rom(game_name))
+			change_directory(launchDir);
+			convert_result = convert_rom(game_name);
+			if (convert_result == 0)
 			{
 #ifdef CHINESE
 				printf("跳过.\n\n");
@@ -1310,7 +1363,7 @@ int main(int argc, char *argv[])
 				printf("Skip.\n\n");
 #endif
 			}
-			else
+			else if (convert_result == 1)
 			{
 				if (zip ? create_zip_cache(game_name) : create_raw_cache(game_name))
 				{
@@ -1376,34 +1429,39 @@ int main(int argc, char *argv[])
 		printf("cache folder name: cache%c%s_cache\n", delimiter, game_name);
 #endif
 
-		convert_crom = 1;
-		convert_srom = 1;
-		convert_vrom = 1;
+		change_directory(launchDir);
+		{
+			int convert_result = convert_rom(game_name);
 
-		chdir(launchDir);
-		if (!convert_rom(game_name))
-		{
-			res = 0;
-		}
-		else
-		{
-			res = zip ? create_zip_cache(game_name) : create_raw_cache(game_name);
-		}
-		if (res)
-		{
+			if (convert_result == 0)
+			{
+				res = 0;
+			}
+			else if (convert_result == 1)
+			{
+				res = zip ? create_zip_cache(game_name) : create_raw_cache(game_name);
+			}
+			else
+			{
+				res = 1;
+			}
+
+			if (res && convert_result == 1)
+			{
 #ifdef CHINESE
-			printf("完成.\n");
-			if (zip)
-				printf("请将\"cache%c%s_cache.zip\"文件复制到\"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
-			else
-				printf("请将\"cache%c%s_cache\"文件夹复制到\"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
+				printf("完成.\n");
+				if (zip)
+					printf("请将\"cache%c%s_cache.zip\"文件复制到\"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
+				else
+					printf("请将\"cache%c%s_cache\"文件夹复制到\"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
 #else
-			printf("complete.\n");
-			if (zip)
-				printf("Please copy \"cache%c%s_cache.zip\" to directory \"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
-			else
-				printf("Please copy \"cache%c%s_cache\" folder to directory \"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
+				printf("complete.\n");
+				if (zip)
+					printf("Please copy \"cache%c%s_cache.zip\" to directory \"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
+				else
+					printf("Please copy \"cache%c%s_cache\" folder to directory \"/PSP/GAMES/mvspsp/cache\".\n", delimiter, game_name);
 #endif
+			}
 		}
 		free_memory();
 	}

@@ -7,7 +7,20 @@
 ******************************************************************************/
 
 #include <limits.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include "cps2.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/capcom_driver_info.h"
+#include "common/coin.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
 
 
 /******************************************************************************
@@ -103,10 +116,15 @@ struct driver_t CPS2_driver[] =
 	{ "hsf2",     CPS2_KLUDGE_SSF2T,   1,   0x00, { COIN_NONE } },
 	{ "jyangoku", 0,                   0,   0x00, { COIN_NONE } },
 #endif
-	{ NULL }
+	{ 0 }
 };
 
 struct driver_t *driver;
+
+const char *capcom_driver_name(void)
+{
+	return driver != NULL ? driver->name : NULL;
+}
 
 
 /******************************************************************************
@@ -268,24 +286,26 @@ READ16_HANDLER( cps2_qsound_volume_r )
 static void cps2_nvram_read_write(int read_or_write)
 {
 	char path[PATH_MAX];
-	FILE *fp;
+	int fd;
 
-	sprintf(path, "%snvram/%s.nv", launchDir, game_name);
+	if (!path_format(path, sizeof(path), "%snvram/%s.nv", launchDir, game_name)) return;
 
 	if (read_or_write)
 	{
-		if ((fp = fopen(path, "wb")) != NULL)
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd >= 0)
 		{
-			EEPROM_save(fp);
-			fclose(fp);
+			EEPROM_save(fd);
+			close(fd);
 		}
 	}
 	else
 	{
-		if ((fp = fopen(path, "rb")) != NULL)
+		fd = open(path, O_RDONLY);
+		if (fd >= 0)
 		{
-			EEPROM_load(fp);
-			fclose(fp);
+			EEPROM_load(fd);
+			close(fd);
 		}
 	}
 }

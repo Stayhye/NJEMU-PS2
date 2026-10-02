@@ -9,11 +9,12 @@
 #ifndef PSP_VIDEO_H
 #define PSP_VIDEO_H
 
-#include "psp.h"
+#include <stdint.h>
+#include <pspgu.h>
+#include "emucfg.h"
+#include "common/video_driver.h"
+#include "common/video_geometry.h"
 
-#define SCR_WIDTH			480
-#define SCR_HEIGHT			272
-#define BUF_WIDTH			512
 #define	FRAMESIZE			(BUF_WIDTH * SCR_HEIGHT * sizeof(uint16_t))
 #define	FRAMESIZE32			(BUF_WIDTH * SCR_HEIGHT * sizeof(uint32_t))
 
@@ -22,5 +23,10 @@
 #define PRIMITIVE_FLAGS		(GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D)
 
 extern uint8_t gulist[GULIST_SIZE];
+
+/* The proportional UI font uses one mutable scratch texture.  Flush the
+ * current GU commands before common/ui_draw.c rewrites that scratch for the
+ * next glyph, while keeping ownership of the surrounding logical frame. */
+void psp_video_sync_ui_scratch(void *video_data);
 
 #endif /* PSP_VIDE_H */

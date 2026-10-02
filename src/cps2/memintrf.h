@@ -9,6 +9,10 @@
 #ifndef CPS2_MEMORY_INTERFACE_H
 #define CPS2_MEMORY_INTERFACE_H
 
+#include <stdint.h>
+#include "emucfg.h"
+#include "common/state.h"
+
 extern uint8_t *memory_region_cpu1;
 extern uint8_t *memory_region_cpu2;
 extern uint8_t *memory_region_gfx1;
@@ -35,11 +39,6 @@ extern uint16_t cps2_output[0x10 >> 1];
 
 extern uint8_t *qsound_sharedram1;
 extern uint8_t *qsound_sharedram2;
-
-#ifdef LARGE_MEMORY
-extern uint32_t psp2k_mem_offset;
-extern int32_t psp2k_mem_left;
-#endif
 
 int memory_init(void);
 void memory_shutdown(void);

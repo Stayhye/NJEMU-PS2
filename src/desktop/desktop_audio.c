@@ -47,6 +47,7 @@ static void desktop_free(void *data) {
 }
 
 static int32_t desktop_volumeMax(void *data) {
+	(void)data;
 	return 32767;
 }
 
@@ -82,12 +83,11 @@ static bool desktop_chSRCReserve(void *data, uint16_t samples, int32_t frequency
     }
     
     SDL_PauseAudioDevice(desktop->device, 0);
-    printf("AUDIO_RESERVE OK freq=%d ch=%d samples=%d (obtained freq=%d)\n",
-        frequency, channels, samples, obtained.freq);
     return true;
 }
 
 static bool desktop_chReserve(void *data, uint16_t samplecount, uint8_t channels) {
+	(void)channels;
     desktop_audio_t *desktop = (desktop_audio_t*)data;
     
     /* MP3 channel - 44.1kHz stereo 16-bit */
@@ -131,6 +131,7 @@ static void desktop_release(void *data) {
 }
 
 static void desktop_srcOutputBlocking(void *data, int32_t volume, void *buffer, uint32_t size) {
+	(void)volume;
     desktop_audio_t *desktop = (desktop_audio_t*)data;
 
     if (!desktop->device || !desktop->stream) {
@@ -154,20 +155,9 @@ static void desktop_srcOutputBlocking(void *data, int32_t volume, void *buffer, 
         free(out_buffer);
     }
 
-    /* DEBUG: sample counter (dummy driver never consumes, so skip waiting) */
-    {
-        static uint64_t aud_cnt = 0, aud_bytes = 0;
-        aud_cnt++; aud_bytes += size;
-        if ((aud_cnt % 120) == 0)
-            printf("AUDIO_OUT cnt=%llu bytes=%llu queued=%u\n",
-                (unsigned long long)aud_cnt, (unsigned long long)aud_bytes,
-                SDL_GetQueuedAudioSize(desktop->device));
-    }
     /* Wait if too much audio is queued to prevent runaway buffering */
-    if (strcmp(SDL_GetCurrentAudioDriver(), "dummy") != 0) {
-        while (SDL_GetQueuedAudioSize(desktop->device) > size * 8) {
-            SDL_Delay(1);
-        }
+    while (SDL_GetQueuedAudioSize(desktop->device) > size * 8) {
+        SDL_Delay(1);
     }
 }
 
@@ -216,4 +206,5 @@ audio_driver_t audio_desktop = {
 	desktop_srcOutputBlocking,
 	desktop_outputPannedBlocking,
 	desktop_release,
+	NULL,
 };

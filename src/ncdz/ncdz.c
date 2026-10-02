@@ -7,6 +7,16 @@
 ******************************************************************************/
 
 #include "ncdz.h"
+#include "common/cmdlist.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/filer.h"
+#include "common/config.h"
+#include <string.h>
 #include "common/memory_sizes.h"
 
 void swab(const void *restrict src, void *restrict dest, ssize_t nbytes);
@@ -62,6 +72,7 @@ static int neogeo_init(void)
 	neogeo_driver_init();
 	neogeo_video_init();
 	input_reset();
+	timer_reset();
 
 	cpu_reset_flag = 0;
 
@@ -211,14 +222,18 @@ static void apply_cheat()
     //Se busca cual es el option habilitado
     a_cheat_option = a_cheat->cheat_option[ a_cheat->curr_option];
     if( a_cheat_option == NULL)
+    {
 		break; //seguro
+    }
 
 		//Se ejecutan todos los value del cheat option
 		for(  j = 0; j< a_cheat_option->num_cheat_values; j++)
 		{
 		a_cheat_value = a_cheat_option->cheat_value[j];
 			if( a_cheat_value == NULL)
+			{
 				break;//seguro
+			}
 				m68000_write_memory_8(a_cheat_value->address,  a_cheat_value->value);
 
 		}
@@ -248,10 +263,6 @@ static void neogeo_run(void)
 			}
 			
 			apply_cheat();//davex
-			/* Input before CPU (SNESticleRevive order): the pad snapshot
-			 * taken now is what this frame's emulation sees, instead of
-			 * the previous frame's late sample. */
-			update_inputport();
 			timer_update_cpu();
 
 			neogeo_cdda_check();
@@ -271,6 +282,8 @@ static void neogeo_run(void)
 				fix_disable_w(0);
 				spr_disable_w(0);
 			}
+
+			update_inputport();
 		}
 
 		sound_mute(1);
@@ -330,7 +343,10 @@ void neogeo_main(void)
 
 						if (neogeo_init())
 						{
-							neogeo_run();
+							if (emu_test_exit_after_init())
+								Loop = LOOP_EXIT;
+							else
+								neogeo_run();
 						}
 						neogeo_exit();
 					}

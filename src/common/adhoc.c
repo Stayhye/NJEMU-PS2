@@ -6,7 +6,21 @@
 
 ******************************************************************************/
 
-#include "emumain.h"
+#include "common/adhoc.h"
+#include "common/adhoc_transport.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/sound.h"
+#include "common/state.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui_draw.h"
+#include "common/ui.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include "thread_driver.h"
 
 
@@ -43,6 +57,8 @@ static volatile int adhoc_active;
 
 static int32_t adhoc_update_inputport(uint32_t args, void *argp)
 {
+	(void)args;
+	(void)argp;
 	int error = 0;
 
 	adhoc_update = 0;
@@ -217,9 +233,10 @@ void adhoc_pause(void)
 	else
 		control = 0;
 
+	sound_thread_pause(1);
 	sound_thread_enable(0);
 
-	video_driver->copyRect(video_data, show_frame, work_frame, &rect, &rect);
+	video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, &rect, &rect);
 
 	do
 	{
@@ -261,7 +278,9 @@ void adhoc_pause(void)
 				if (sel == 1) Loop = LOOP_BROWSER;
 			}
 
+			video_driver->beginFrame(video_data);
 			video_driver->transferWorkFrame(video_data, &rect, &rect);
+			video_driver->endFrame(video_data);
 
 			draw_dialog(140, 96, 340, 176);
 
@@ -280,7 +299,7 @@ void adhoc_pause(void)
 			}
 
 			video_driver->waitVsync(video_data);
-			video_driver->copyRect(video_data, draw_frame, show_frame, &rect, &rect);
+			video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER, &rect, &rect);
 
 			buttons = poll_gamepad();
 
@@ -302,4 +321,5 @@ void adhoc_pause(void)
 
 	autoframeskip_reset();
 	sound_thread_enable(1);
+	sound_thread_pause(0);
 }

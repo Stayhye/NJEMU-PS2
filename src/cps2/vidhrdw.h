@@ -9,6 +9,10 @@
 #ifndef CPS2_VIDEO_HARDWARE_H
 #define CPS2_VIDEO_HARDWARE_H
 
+#include "emucfg.h"
+#include "common/state.h"
+#include "include/memory.h"
+
 #define FIRST_VISIBLE_LINE	16
 #define LAST_VISIBLE_LINE	239
 
@@ -56,9 +60,7 @@ void cps2_video_exit(void);
 void cps2_video_reset(void);
 void cps2_screenrefresh(int start, int end);
 void cps2_objram_latch(void);
-#ifdef LARGE_MEMORY
 void cps2_gfx_decode(void);
-#endif
 
 READ16_HANDLER( cps1_output_r );
 WRITE16_HANDLER( cps1_output_w );

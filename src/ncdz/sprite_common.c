@@ -7,6 +7,7 @@
 ******************************************************************************/
 
 #include "sprite_common.h"
+#include "common/emulator_runtime.h"
 
 /******************************************************************************
 	Shared variable definitions
@@ -15,95 +16,30 @@
 SPRITE ALIGN16_DATA *fix_head[FIX_HASH_SIZE];
 SPRITE ALIGN16_DATA fix_data[FIX_TEXTURE_SIZE];
 SPRITE *fix_free_head;
-uint16_t fix_num;
 uint16_t fix_texture_num;
 
 SPRITE ALIGN16_DATA *spr_head[SPR_HASH_SIZE];
 SPRITE ALIGN16_DATA spr_data[SPR_TEXTURE_SIZE];
 SPRITE *spr_free_head;
-uint16_t spr_num;
 uint16_t spr_texture_num;
-uint16_t spr_index;
 
 int clip_min_y;
 int clip_max_y;
 int clear_spr_texture;
 int clear_fix_texture;
 
-uint16_t *scrbitmap;
-uint8_t *tex_fix;
-uint8_t *tex_spr[3];
-uint16_t *clut;
-
 /*
  * Color table for palette index encoding
  * Each entry broadcasts a 4-bit palette offset to all bytes of a 32-bit word
  * Used when rendering tiles to texture cache
  */
-const uint32_t ALIGN16_DATA color_table[16] =
+const uint32_t ALIGN16_DATA sprite_color_table[16] =
 {
 	0x00000000, 0x10101010, 0x20202020, 0x30303030,
 	0x40404040, 0x50505050, 0x60606060, 0x70707070,
 	0x80808080, 0x90909090, 0xa0a0a0a0, 0xb0b0b0b0,
 	0xc0c0c0c0, 0xd0d0d0d0, 0xe0e0e0e0, 0xf0f0f0f0
 };
-
-/*
- * Horizontal shrink pixel-skip tables
- * Reference: https://wiki.neogeodev.org/index.php?title=Sprite_shrinking
- *
- * Neo Geo sprites can only SHRINK (not zoom). The hardware uses pixel-skipping
- * with no interpolation. Each table entry indicates which of the 16 pixels
- * in a sprite row should be displayed (1) or skipped (0).
- *
- * Hardware SCB2 upper nibble values:
- *   $F = full size (16 pixels) - uses fixed rendering path, not this table
- *   $E = 15 pixels
- *   ...
- *   $1 = 2 pixels
- *   $0 = 1 pixel (at position 8)
- *
- * Table indexing: hardware_value + 1, so:
- *   - Index 0 is unused (hardware $0 maps to index 1)
- *   - Index 1 = 1 pixel (hardware $0)
- *   - Index 15 = 15 pixels (hardware $E)
- *   - Index 16 would be full size, but that uses drawgfxline_fixed() instead
- *
- * The pixel positions in each table are optimized for even visual distribution.
- */
-const uint8_t zoom_x_tables[][16] =
-{
-	{ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },  /* Index 0: unused (never accessed) */
-	{ 0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0 },  /* Index 1: 1 pixel at center (hardware $0) */
-	{ 0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0 },  /* Index 2: 2 pixels */
-	{ 0,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0 },  /* Index 3: 3 pixels */
-	{ 0,0,1,0,1,0,0,0,1,0,0,0,1,0,0,0 },  /* Index 4: 4 pixels */
-	{ 0,0,1,0,1,0,0,0,1,0,0,0,1,0,1,0 },  /* Index 5: 5 pixels */
-	{ 0,0,1,0,1,0,1,0,1,0,0,0,1,0,1,0 },  /* Index 6: 6 pixels */
-	{ 0,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0 },  /* Index 7: 7 pixels (alternating) */
-	{ 1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0 },  /* Index 8: 8 pixels (every other) */
-	{ 1,0,1,0,1,0,1,0,1,1,1,0,1,0,1,0 },  /* Index 9: 9 pixels */
-	{ 1,0,1,1,1,0,1,0,1,1,1,0,1,0,1,0 },  /* Index 10: 10 pixels */
-	{ 1,0,1,1,1,0,1,0,1,1,1,0,1,0,1,1 },  /* Index 11: 11 pixels */
-	{ 1,0,1,1,1,0,1,1,1,1,1,0,1,0,1,1 },  /* Index 12: 12 pixels */
-	{ 1,0,1,1,1,0,1,1,1,1,1,0,1,1,1,1 },  /* Index 13: 13 pixels */
-	{ 1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1 },  /* Index 14: 14 pixels */
-	{ 1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1 },  /* Index 15: 15 pixels (hardware $E) */
-	/* Index 16 (hardware $F = full) uses drawgfxline_fixed() instead */
-};
-
-void ALIGN16_DATA (*drawgfxline[8])(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom) =
-{
-	drawgfxline_zoom,					// 0000
-	drawgfxline_zoom_flip,				// 0001
-	drawgfxline_zoom_opaque,			// 0010
-	drawgfxline_zoom_flip_opaque,		// 0011
-	drawgfxline_fixed,					// 0100
-	drawgfxline_fixed_flip,				// 0101
-	drawgfxline_fixed_opaque,			// 0110
-	drawgfxline_fixed_flip_opaque		// 0111
-};
-
 
 /******************************************************************************
 	FIX Sprite Management
@@ -134,62 +70,13 @@ int fix_get_sprite(uint32_t key)
 	Register sprite in FIX texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-/* Tile-cache diagnostics: incremented when the pool is exhausted
- * and a sprite must be skipped (never draw a black tile). */
-uint32_t g_tile_pool_full = 0;
-
-static void fix_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < FIX_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = fix_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			fix_head[best->key & FIX_HASH_MASK] = best->next;
-		best->next = fix_free_head;
-		fix_free_head = best;
-		fix_texture_num--;
-	}
-}
-
 int fix_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & FIX_HASH_MASK;
 	SPRITE *p = fix_head[hash];
 	SPRITE *q = fix_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		fix_evict_lru();
-		q = fix_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	fix_free_head = fix_free_head->next;
 
@@ -287,58 +174,13 @@ int spr_get_sprite(uint32_t key)
 	Register sprite in SPR texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-static void spr_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < SPR_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = spr_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			spr_head[best->key & SPR_HASH_MASK] = best->next;
-		best->next = spr_free_head;
-		spr_free_head = best;
-		spr_texture_num--;
-	}
-}
-
 int spr_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & SPR_HASH_MASK;
 	SPRITE *p = spr_head[hash];
 	SPRITE *q = spr_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		spr_evict_lru();
-		q = spr_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	spr_free_head = spr_free_head->next;
 
@@ -450,229 +292,6 @@ void blit_clear_spr_sprite(void)
 
 	spr_texture_num = 0;
 	clear_spr_texture = 0;
-}
-
-
-/******************************************************************************
-	SPR Software rendering
-******************************************************************************/
-
-void drawgfxline_zoom(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-	const uint8_t *zoom_x_table = zoom_x_tables[zoom];
-
-	tile = src[0];
-	if (zoom_x_table[ 0]) { if (tile & 0x0000000f) *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-	if (zoom_x_table[ 1]) { if (tile & 0x00000f00) *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[ 2]) { if (tile & 0x000f0000) *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[ 3]) { if (tile & 0x0f000000) *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[ 4]) { if (tile & 0x000000f0) *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[ 5]) { if (tile & 0x0000f000) *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[ 6]) { if (tile & 0x00f00000) *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[ 7]) { if (tile & 0xf0000000) *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-
-	tile = src[1];
-	if (zoom_x_table[ 8]) { if (tile & 0x0000000f) *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-	if (zoom_x_table[ 9]) { if (tile & 0x00000f00) *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[10]) { if (tile & 0x000f0000) *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[11]) { if (tile & 0x0f000000) *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[12]) { if (tile & 0x000000f0) *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[13]) { if (tile & 0x0000f000) *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[14]) { if (tile & 0x00f00000) *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[15]) { if (tile & 0xf0000000) *dst = pal[(tile >> 28) & 0x0f]; }
-}
-
-void drawgfxline_zoom_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-	const uint8_t *zoom_x_table = zoom_x_tables[zoom];
-
-	tile = src[0];
-	if (zoom_x_table[ 0]) { *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-	if (zoom_x_table[ 1]) { *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[ 2]) { *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[ 3]) { *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[ 4]) { *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[ 5]) { *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[ 6]) { *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[ 7]) { *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-
-	tile = src[1];
-	if (zoom_x_table[ 8]) { *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-	if (zoom_x_table[ 9]) { *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[10]) { *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[11]) { *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[12]) { *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[13]) { *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[14]) { *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[15]) { *dst = pal[(tile >> 28) & 0x0f]; }
-}
-
-void drawgfxline_zoom_flip(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-	const uint8_t *zoom_x_table = zoom_x_tables[zoom];
-
-	tile = src[1];
-	if (zoom_x_table[ 0]) { if (tile & 0xf0000000) *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-	if (zoom_x_table[ 1]) { if (tile & 0x00f00000) *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[ 2]) { if (tile & 0x0000f000) *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[ 3]) { if (tile & 0x000000f0) *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[ 4]) { if (tile & 0x0f000000) *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[ 5]) { if (tile & 0x000f0000) *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[ 6]) { if (tile & 0x00000f00) *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[ 7]) { if (tile & 0x0000000f) *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-
-	tile = src[0];
-	if (zoom_x_table[ 8]) { if (tile & 0xf0000000) *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-	if (zoom_x_table[ 9]) { if (tile & 0x00f00000) *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[10]) { if (tile & 0x0000f000) *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[11]) { if (tile & 0x000000f0) *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[12]) { if (tile & 0x0f000000) *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[13]) { if (tile & 0x000f0000) *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[14]) { if (tile & 0x00000f00) *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[15]) { if (tile & 0x0000000f) *dst = pal[(tile >>  0) & 0x0f]; }
-}
-
-void drawgfxline_zoom_flip_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-	const uint8_t *zoom_x_table = zoom_x_tables[zoom];
-
-	tile = src[1];
-	if (zoom_x_table[ 0]) { *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-	if (zoom_x_table[ 1]) { *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[ 2]) { *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[ 3]) { *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[ 4]) { *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[ 5]) { *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[ 6]) { *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[ 7]) { *dst = pal[(tile >>  0) & 0x0f]; dst++; }
-
-	tile = src[0];
-	if (zoom_x_table[ 8]) { *dst = pal[(tile >> 28) & 0x0f]; dst++; }
-	if (zoom_x_table[ 9]) { *dst = pal[(tile >> 20) & 0x0f]; dst++; }
-	if (zoom_x_table[10]) { *dst = pal[(tile >> 12) & 0x0f]; dst++; }
-	if (zoom_x_table[11]) { *dst = pal[(tile >>  4) & 0x0f]; dst++; }
-	if (zoom_x_table[12]) { *dst = pal[(tile >> 24) & 0x0f]; dst++; }
-	if (zoom_x_table[13]) { *dst = pal[(tile >> 16) & 0x0f]; dst++; }
-	if (zoom_x_table[14]) { *dst = pal[(tile >>  8) & 0x0f]; dst++; }
-	if (zoom_x_table[15]) { *dst = pal[(tile >>  0) & 0x0f]; }
-}
-
-void drawgfxline_fixed(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-
-	tile = src[0];
-	if (tile)
-	{
-		if (tile & 0x000f) dst[ 0] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[ 4] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[ 1] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[ 5] = pal[(tile >> 12) & 0x0f];
-		tile >>= 16;
-		if (tile & 0x000f) dst[ 2] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[ 6] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[ 3] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[ 7] = pal[(tile >> 12) & 0x0f];
-	}
-	tile = src[1];
-	if (tile)
-	{
-		if (tile & 0x000f) dst[ 8] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[12] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[ 9] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[13] = pal[(tile >> 12) & 0x0f];
-		tile >>= 16;
-		if (tile & 0x000f) dst[10] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[14] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[11] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[15] = pal[(tile >> 12) & 0x0f];
-	}
-}
-
-void drawgfxline_fixed_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-
-	tile = src[0];
-	dst[ 0] = pal[(tile >>  0) & 0x0f];
-	dst[ 4] = pal[(tile >>  4) & 0x0f];
-	dst[ 1] = pal[(tile >>  8) & 0x0f];
-	dst[ 5] = pal[(tile >> 12) & 0x0f];
-	dst[ 2] = pal[(tile >> 16) & 0x0f];
-	dst[ 6] = pal[(tile >> 20) & 0x0f];
-	dst[ 3] = pal[(tile >> 24) & 0x0f];
-	dst[ 7] = pal[(tile >> 28) & 0x0f];
-
-	tile = src[1];
-	dst[ 8] = pal[(tile >>  0) & 0x0f];
-	dst[12] = pal[(tile >>  4) & 0x0f];
-	dst[ 9] = pal[(tile >>  8) & 0x0f];
-	dst[13] = pal[(tile >> 12) & 0x0f];
-	dst[10] = pal[(tile >> 16) & 0x0f];
-	dst[14] = pal[(tile >> 20) & 0x0f];
-	dst[11] = pal[(tile >> 24) & 0x0f];
-	dst[15] = pal[(tile >> 28) & 0x0f];
-}
-
-void drawgfxline_fixed_flip(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-
-	tile = src[0];
-	if (tile)
-	{
-		if (tile & 0x000f) dst[15] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[11] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[14] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[10] = pal[(tile >> 12) & 0x0f];
-		tile >>= 16;
-		if (tile & 0x000f) dst[13] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[ 9] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[12] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[ 8] = pal[(tile >> 12) & 0x0f];
-	}
-	tile = src[1];
-	if (tile)
-	{
-		if (tile & 0x000f) dst[ 7] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[ 3] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[ 6] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[ 2] = pal[(tile >> 12) & 0x0f];
-		tile >>= 16;
-		if (tile & 0x000f) dst[ 5] = pal[(tile >>  0) & 0x0f];
-		if (tile & 0x00f0) dst[ 1] = pal[(tile >>  4) & 0x0f];
-		if (tile & 0x0f00) dst[ 4] = pal[(tile >>  8) & 0x0f];
-		if (tile & 0xf000) dst[ 0] = pal[(tile >> 12) & 0x0f];
-	}
-}
-
-void drawgfxline_fixed_flip_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom)
-{
-	uint32_t tile;
-
-	tile = src[1];
-	dst[ 0] = pal[(tile >> 28) & 0x0f];
-	dst[ 1] = pal[(tile >> 20) & 0x0f];
-	dst[ 2] = pal[(tile >> 12) & 0x0f];
-	dst[ 3] = pal[(tile >>  4) & 0x0f];
-	dst[ 4] = pal[(tile >> 24) & 0x0f];
-	dst[ 5] = pal[(tile >> 16) & 0x0f];
-	dst[ 6] = pal[(tile >>  8) & 0x0f];
-	dst[ 7] = pal[(tile >>  0) & 0x0f];
-
-	tile = src[0];
-	dst[ 8] = pal[(tile >> 28) & 0x0f];
-	dst[ 9] = pal[(tile >> 20) & 0x0f];
-	dst[10] = pal[(tile >> 12) & 0x0f];
-	dst[11] = pal[(tile >>  4) & 0x0f];
-	dst[12] = pal[(tile >> 24) & 0x0f];
-	dst[13] = pal[(tile >> 16) & 0x0f];
-	dst[14] = pal[(tile >>  8) & 0x0f];
-	dst[15] = pal[(tile >>  0) & 0x0f];
 }
 
 

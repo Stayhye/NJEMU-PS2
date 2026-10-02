@@ -7,6 +7,8 @@
 ******************************************************************************/
 
 #include "cps2.h"
+#include <string.h>
+#include <unistd.h>
 
 
 #define SERIAL_BUFFER_LENGTH	40
@@ -219,9 +221,9 @@ void EEPROM_set_clock_line(int state)
 	Load Data from File
 --------------------------------------------------------*/
 
-void EEPROM_load(FILE *fp)
+void EEPROM_load(int fd)
 {
-	fread(eeprom_data, 1, EEPROM_SIZE, fp);
+	{ ssize_t io_result = read(fd, eeprom_data, EEPROM_SIZE); (void)io_result; }
 }
 
 
@@ -229,9 +231,9 @@ void EEPROM_load(FILE *fp)
 	Save Data to File
 --------------------------------------------------------*/
 
-void EEPROM_save(FILE *fp)
+void EEPROM_save(int fd)
 {
-	fwrite(eeprom_data, 1, EEPROM_SIZE, fp);
+	{ ssize_t io_result = write(fd, eeprom_data, EEPROM_SIZE); (void)io_result; }
 }
 
 

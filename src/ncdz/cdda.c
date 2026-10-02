@@ -8,6 +8,11 @@
 
 #include <limits.h>
 #include "ncdz.h"
+#include "common/emulator_runtime.h"
+#include "common/filer.h"
+#include "common/mp3.h"
+#include "common/path_utils.h"
+#include <stdio.h>
 
 
 /******************************************************************************
@@ -82,7 +87,7 @@ void cdda_play(int track)
 		{
 			char path[PATH_MAX];
 
-			sprintf(path, "%s/%s", mp3_dir, fname);
+			if (!path_format(path, sizeof(path), "%s/%s", mp3_dir, fname)) return;
 			mp3_play(path);
 			autoframeskip_reset();
 		}
@@ -209,12 +214,10 @@ void neogeo_cdda_check(void)
 
 static void neogeo_cdda_command(int command, int track)
 {
-	int loop, mode, flag, _track;
+	int loop, flag;
 
-	_track = track;
 	track = ((track >> 4) * 10) + (track & 0x0f);
 	loop  = (command & 1) ? 0 : 1;
-	mode  = (command & 2) ? 1 : 0;
 	flag  = (command & 4) ? 1 : 0;
 
 	switch (command)
@@ -304,7 +307,7 @@ STATE_LOAD( cdda )
 			{
 				char path[PATH_MAX];
 
-				sprintf(path, "%s/%s", mp3_dir, fname);
+				if (!path_format(path, sizeof(path), "%s/%s", mp3_dir, fname)) return;
 				mp3_seek_set(path, frame);
 			}
 			else

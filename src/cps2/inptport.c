@@ -7,6 +7,17 @@
 ******************************************************************************/
 
 #include "cps2.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/cmdlist.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/ui_text_driver.h"
+#include "common/ui.h"
+#include "common/ui_menu.h"
+#include <string.h>
 
 
 /******************************************************************************
@@ -31,11 +42,17 @@ int af_interval = 1;
 static uint8_t ALIGN16_DATA input_flag[MAX_INPUTS];
 static int ALIGN16_DATA af_map1[CPS2_BUTTON_MAX];
 static int ALIGN16_DATA af_map2[CPS2_BUTTON_MAX];
-static int ALIGN16_DATA af_counter[CPS2_BUTTON_MAX];
+static int ALIGN16_DATA af_counter[4][CPS2_BUTTON_MAX];
 static int input_analog_value[2];
 static int input_ui_wait;
 static int service_switch;
 static int p12_start_pressed;
+
+static void update_inputport0(void);
+static void update_inputport1(void);
+static void update_inputport2(void);
+static void update_inputport3(void);
+static uint32_t adjust_input(uint32_t buttons);
 
 static uint8_t max_players[COIN_MAX] =
 {
@@ -81,6 +98,8 @@ static uint8_t coin_chuter[COIN_MAX][4] =
 static void check_eeprom_settings(int popup)
 {
 	uint8_t eeprom_value = EEPROM_read_data(driver->inp_eeprom);
+	if (eeprom_value >= sizeof(driver->inp_eeprom_value))
+		return;
 	uint8_t coin_type = driver->inp_eeprom_value[eeprom_value];
 
 	if (input_coin_chuter != coin_type)
@@ -101,9 +120,10 @@ static void check_eeprom_settings(int popup)
 	Update Autofire Flag
 ------------------------------------------------------*/
 
-static uint32_t update_autofire(uint32_t buttons)
+static uint32_t update_autofire(uint32_t buttons, int controller)
 {
 	int i;
+	int *counter = af_counter[controller & 3];
 
 	for (i = 0; i < input_max_buttons; i++)
 	{
@@ -113,22 +133,140 @@ static uint32_t update_autofire(uint32_t buttons)
 			{
 				buttons &= ~af_map1[i];
 
-				if (af_counter[i] == 0)
+				if (counter[i] == 0)
 					buttons |= af_map2[i];
 				else
 					buttons &= ~af_map2[i];
 
-				if (++af_counter[i] > af_interval)
-					af_counter[i] = 0;
+				if (++counter[i] > af_interval)
+					counter[i] = 0;
 			}
 			else
 			{
-				af_counter[i] = 0;
+				counter[i] = 0;
 			}
 		}
 	}
 
 	return buttons;
+}
+
+static void set_input_flags(uint32_t buttons)
+{
+	int i;
+
+	for (i = 0; i < MAX_INPUTS; i++)
+		input_flag[i] = (buttons & input_map[i]) != 0;
+}
+
+static void clear_secondary_system_flags(void)
+{
+	input_flag[SERV_COIN] = 0;
+	input_flag[SERV_SWITCH] = 0;
+}
+
+static void update_inputport_multi(uint32_t controller_count)
+{
+	uint16_t combined_port0 = 0xffff;
+	uint16_t combined_port1 = 0xffff;
+	uint16_t combined_port2 = 0xffff;
+	uint32_t primary_buttons;
+	uint32_t primary_processed = 0;
+	int saved_controller;
+	uint32_t controller;
+	int serv_switch = 0;
+
+	if (controller_count > (uint32_t)input_max_players)
+		controller_count = (uint32_t)input_max_players;
+	if (controller_count > 4)
+		controller_count = 4;
+
+	service_switch = 0;
+	p12_start_pressed = 0;
+	primary_buttons = poll_gamepad_index(0);
+
+	if (pad_menu_combo_pressed(primary_buttons))
+	{
+		showmenu();
+		setup_autofire();
+		primary_buttons = poll_gamepad_index(0);
+	}
+
+	if ((primary_buttons & PLATFORM_PAD_L) &&
+	    (primary_buttons & PLATFORM_PAD_R))
+	{
+		if (primary_buttons & PLATFORM_PAD_SELECT)
+		{
+			primary_buttons &= ~(PLATFORM_PAD_SELECT |
+				PLATFORM_PAD_L | PLATFORM_PAD_R);
+			serv_switch = 1;
+		}
+		else if (primary_buttons & PLATFORM_PAD_START)
+		{
+			primary_buttons &= ~(PLATFORM_PAD_START |
+				PLATFORM_PAD_L | PLATFORM_PAD_R);
+			p12_start_pressed = 1;
+		}
+	}
+
+	saved_controller = option_controller;
+
+	for (controller = 0; controller < controller_count; controller++)
+	{
+		uint32_t buttons = controller == 0 ? primary_buttons :
+			poll_gamepad_index(controller);
+
+		buttons = adjust_input(buttons);
+		buttons = update_autofire(buttons, (int)controller);
+		set_input_flags(buttons);
+		/* P2_START is a legacy single-pad compatibility binding that lets one
+		 * physical controller start the opposite emulated player. In true
+		 * multi-controller mode each physical pad already owns its player, so
+		 * keeping this flag would allow cross-player start input. */
+		input_flag[P2_START] = 0;
+		if (controller != 0)
+			clear_secondary_system_flags();
+		if (serv_switch && controller == 0)
+			input_flag[SERV_SWITCH] = 1;
+
+		option_controller = (int)controller;
+		update_inputport0();
+		update_inputport1();
+		update_inputport2();
+		if (machine_input_type == INPTYPE_pzloop2)
+			update_inputport3();
+
+		combined_port0 &= cps2_port_value[0];
+		combined_port1 &= cps2_port_value[1];
+		combined_port2 &= cps2_port_value[2];
+
+		if (controller == 0)
+		{
+			primary_processed = buttons;
+
+			if (input_flag[SNAPSHOT])
+				save_snapshot();
+
+#ifdef COMMAND_LIST
+			if (input_flag[COMMANDLIST])
+				commandlist(1);
+#endif
+		}
+	}
+
+	cps2_port_value[0] = combined_port0;
+	cps2_port_value[1] = combined_port1;
+	cps2_port_value[2] = combined_port2;
+	/* cps2_port_value[3] is an analog packed value for pzloop2. It is updated
+	 * in-place above after each player's accumulator changes and must not be
+	 * combined as an active-low bit field. */
+
+	option_controller = saved_controller;
+	set_input_flags(primary_processed);
+
+	/* Switch Player remains a single-pad compatibility feature. */
+	if (input_ui_wait > 0)
+		input_ui_wait--;
 }
 
 
@@ -801,7 +939,7 @@ void update_inputport(void)
 
 			buttons = poll_gamepad();
 
-			if (systembuttons_available ? readHomeButton() : (buttons & PLATFORM_PAD_START) && (buttons & PLATFORM_PAD_SELECT))
+			if (pad_menu_combo_pressed(buttons))
 			{
 				buttons = 0;
 				adhoc_paused = adhoc_server + 1;
@@ -821,7 +959,7 @@ void update_inputport(void)
 			}
 
 			buttons = adjust_input(buttons);
-			buttons = update_autofire(buttons);
+			buttons = update_autofire(buttons, 0);
 
 			for (i = 0; i < MAX_INPUTS; i++)
 				input_flag[i] = (buttons & input_map[i]) != 0;
@@ -849,29 +987,22 @@ void update_inputport(void)
 
 		if (driver->inp_eeprom) check_eeprom_settings(1);
 
+		{
+			uint32_t controller_count = gamepad_count();
+
+			if (controller_count > 1)
+			{
+				update_inputport_multi(controller_count);
+				return;
+			}
+		}
+
 		buttons = poll_gamepad();
 
-		if (systembuttons_available ? readHomeButton() : (buttons & PLATFORM_PAD_START) && (buttons & PLATFORM_PAD_SELECT))
+		if (pad_menu_combo_pressed(buttons))
 		{
 			showmenu();
 			setup_autofire();
-
-			/* Debounce: the menu is opened with Start+Select and Start is
-			 * also a confirm key inside it. Without waiting for a full
-			 * release, the very next update_inputport() call re-enters
-			 * showmenu(), so the menu looks like it never closes (and the
-			 * cursor appears frozen because sel resets to 0 every time). */
-			{
-				int guard;
-				for (guard = 0; guard < 45; guard++)
-				{
-					uint32_t p = poll_gamepad();
-					if ((p & (PLATFORM_PAD_START | PLATFORM_PAD_SELECT))
-					    != (PLATFORM_PAD_START | PLATFORM_PAD_SELECT))
-						break;
-					usleep(16000);
-				}
-			}
 			buttons = poll_gamepad();
 		}
 
@@ -890,7 +1021,7 @@ void update_inputport(void)
 		}
 
 		buttons = adjust_input(buttons);
-		buttons = update_autofire(buttons);
+		buttons = update_autofire(buttons, 0);
 
 		for (i = 0; i < MAX_INPUTS; i++)
 			input_flag[i] = (buttons & input_map[i]) != 0;

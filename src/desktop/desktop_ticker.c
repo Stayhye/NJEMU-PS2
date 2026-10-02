@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <time.h>
 
-#include <timer.h>
 #include "common/ticker_driver.h"
 
 typedef struct desktop_ticker {
@@ -20,6 +19,7 @@ static void desktop_free(void *data) {
 }
 
 static u_int64_t desktop_currentUs(void *data) {
+	(void)data;
 	struct timespec start;
 	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
     return (start.tv_sec * 1000000) + (start.tv_nsec / 1000);

@@ -9,8 +9,30 @@
 #include <ctype.h>
 #include <limits.h>
 #include "ncdz.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui_draw.h"
+#include "common/ui.h"
+#include "common/png_io.h"
+#include <stdio.h>
+#include <string.h>
+#include "ncdz/resource_source.h"
 
 void swab(const void *restrict src, void *restrict dest, ssize_t nbytes);
+
+static void byte_swap_pairs_in_place(uint8_t *data, size_t length)
+{
+	size_t i;
+	for (i = 0; i + 1 < length; i += 2)
+	{
+		uint8_t tmp = data[i];
+		data[i] = data[i + 1];
+		data[i + 1] = tmp;
+	}
+}
 
 /******************************************************************************
 	Global Variables
@@ -42,6 +64,19 @@ static uint32_t loaded_sectors;
 static int total_files;
 
 static int firsttime_update;
+
+static int get_resource_length(const char *name, uint32_t *length)
+{
+	resource_file_info_t info;
+
+	if (length == NULL ||
+		!resource_source_stat(&ncdz_game_source, name, &info) ||
+		info.size > UINT32_MAX)
+		return 0;
+
+	*length = (uint32_t)info.size;
+	return 1;
+}
 
 
 #ifdef SAVE_STATE
@@ -143,9 +178,9 @@ static void show_loading_image(void)
 
 	video_driver->clearScreen(video_data);
 
-	sprintf(path, "%sdata/%s", launchDir, "loading.png");
+	if (!path_format(path, sizeof(path), "%sdata/%s", launchDir, "loading.png")) return;
 
-#if !defined(NO_GUI)
+#if defined(GUI)
 	if (load_png(path, -1) == 0) 
 #endif
 	{
@@ -286,7 +321,7 @@ static void upload_file(int fileno, uint32_t offset, uint32_t length)
 		break;
 
 	case PAT_TYPE:
-		swab(cdrom_cache, cdrom_cache, length);
+		byte_swap_pairs_in_place(cdrom_cache, length);
 		neogeo_apply_patch((uint16_t *)cdrom_cache, file->bank, file->offset);
 		break;
 
@@ -305,7 +340,7 @@ static void upload_file(int fileno, uint32_t offset, uint32_t length)
 static int load_file(int fileno)
 {
 	struct filelist_t *file = &filelist[fileno];
-	int64_t f;
+	resource_file_t resource = {0};
 	uint32_t length, next = 0;
 
 #ifdef SAVE_STATE
@@ -320,7 +355,7 @@ static int load_file(int fileno)
 	if (file->type == Z80_TYPE)
 		m68000_write_memory_8(0xff0183, 0);
 
-	if ((f = zopen(file->name)) == -1)
+	if (!resource_file_open(&ncdz_game_source, file->name, &resource))
 	{
 		fatalerror(TEXT(COULD_NOT_OPEN_FILE), file->name);
 		return -1;
@@ -328,7 +363,7 @@ static int load_file(int fileno)
 
 	if (neogeo_loadscreen && with_image())
 	{
-		while ((length = zread(f, cdrom_cache, 0x800)) != 0)
+		while ((length = resource_file_read(&resource, cdrom_cache, 0x800)) != 0)
 		{
 			upload_file(fileno, next, length);
 			next += length;
@@ -337,14 +372,18 @@ static int load_file(int fileno)
 	}
 	else
 	{
-		while ((length = zread(f, cdrom_cache, 0x800)) != 0)
+		while ((length = resource_file_read(&resource, cdrom_cache, 0x800)) != 0)
 		{
 			upload_file(fileno, next, length);
 			next += length;
 		}
 	}
 
-	zclose(f);
+	if (!resource_file_close(&resource))
+	{
+		fatalerror(TEXT(COULD_NOT_OPEN_FILE), file->name);
+		return -1;
+	}
 
 	if (file->type == Z80_TYPE)
 		m68000_write_memory_8(0xff0183, 0xff);
@@ -682,12 +721,10 @@ int cdrom_process_ipl(void)
 {
 	struct filelist_t *file = &filelist[0];
     int i, j;
-    int64_t f;
+	resource_file_t resource = {0};
     uint32_t length;
     char linebuf[32], *buf, *p, *ext;
 	char region_chr[3] = { 'J','U','E' };
-
-	zip_open(game_dir);
 
 	video_driver->clearScreen(video_data);
 	neogeo_loadfinished = 0;
@@ -700,14 +737,15 @@ int cdrom_process_ipl(void)
 		{
 			sprintf(fname, "LOGO_%c.PRG", region_chr[i]);
 
-			if ((f = zopen(fname)) != -1)
+			if (resource_file_open(&ncdz_game_source, fname, &resource))
 			{
 				uint8_t *mem = (uint8_t *)(memory_region_cpu1 + 0x120000);
 
-				length = zread(f, mem, 0x10000);
-				zclose(f);
+				length = resource_file_read(&resource, mem, 0x10000);
+				if (!resource_file_close(&resource))
+					return 0;
 
-				swab(mem, mem, length);
+				byte_swap_pairs_in_place(mem, length);
 			}
 		}
 	}
@@ -717,16 +755,15 @@ int cdrom_process_ipl(void)
 	}
 
 	memset(cdrom_cache, 0, 0x800);
-	length = zlength("IPL.TXT");
-
-    if ((f = zopen("IPL.TXT")) == -1)
-    {
-		zip_close();
+	if (!get_resource_length("IPL.TXT", &length))
 		return 0;
-	}
 
-	zread(f, cdrom_cache, length);
-	zclose(f);
+    if (!resource_file_open(&ncdz_game_source, "IPL.TXT", &resource))
+		return 0;
+
+	if (resource_file_read(&resource, cdrom_cache, length) != length ||
+		!resource_file_close(&resource))
+		return 0;
 
 	total_sectors = 0;
 	loaded_sectors = 0;
@@ -779,7 +816,8 @@ int cdrom_process_ipl(void)
 			file->offset += hextodec(linebuf[i++]);
 		}
 
-		file->length = zlength(file->name);
+		if (!get_resource_length(file->name, &file->length))
+			return 0;
 		file->sectors = (file->length + 0x7ff) / 0x800;
 
 		total_sectors += file->sectors;
@@ -811,8 +849,6 @@ int cdrom_process_ipl(void)
 	autoframeskip_reset();
 	blit_clear_fix_sprite();
 
-	zip_close();
-
 	return 1;
 }
 
@@ -833,8 +869,6 @@ void cdrom_load_files(void)
 
     if (m68000_read_memory_8(src) == 0)
 		return;
-
-	zip_open(game_dir);
 
 	if (with_image() && !neogeo_loadscreen)
 		show_loading_image();
@@ -898,7 +932,7 @@ void cdrom_load_files(void)
 		swab(memory_region_cpu1 + offset, file->name, 16);
 
 		for (i = 0; file->name[i]; i++)
-			if (!isprint(file->name[i]))
+			if (!isprint((unsigned char)file->name[i]))
 				break;
 
 		if ((p = strchr(file->name, ';')) != NULL) *p = '\0';
@@ -907,7 +941,8 @@ void cdrom_load_files(void)
 		file->offset = m68000_read_memory_32(offset + 0x12);
 		file->type   = get_filetype(strrchr(file->name, '.') + 1);
 
-		file->length = zlength(file->name);
+		if (!get_resource_length(file->name, &file->length))
+			return;
 		total_sectors += (file->length + 0x7ff) / 0x800;
 		total_files++;
 
@@ -955,7 +990,6 @@ void cdrom_load_files(void)
 
 	if (!neogeo_loadscreen) neogeo_loadfinished = 1;
 
-	zip_close();
 }
 
 
@@ -1188,8 +1222,6 @@ STATE_LOAD( cdrom )
 	memset(memory_region_gfx2, 0, memory_length_gfx2);
 	memset(memory_region_sound1, 0, memory_length_sound1);
 
-	zip_open(game_dir);
-
 	cdrom_init();
 
 	for (i = 0; i < 3; i++)
@@ -1225,7 +1257,6 @@ STATE_LOAD( cdrom )
 		}
 	}
 
-	zip_close();
 }
 
 
@@ -1237,10 +1268,10 @@ static void cdrom_state_load_file(int type, const char *fname, int bank, uint32_
 {
 	struct filelist_t *file = &filelist[0];
 	int ftype[3] = { FIX_TYPE, SPR_TYPE, PCM_TYPE };
-	int64_t f;
+	resource_file_t resource = {0};
 	uint32_t next = 0;
 
-	if ((f = zopen(fname)) == -1)
+	if (!resource_file_open(&ncdz_game_source, fname, &resource))
 	{
 		fatalerror(TEXT(COULD_NOT_OPEN_FILE), file->name);
 		return;
@@ -1251,13 +1282,13 @@ static void cdrom_state_load_file(int type, const char *fname, int bank, uint32_
 	file->offset = offset;
 	file->length = length;
 
-	while ((length = zread(f, cdrom_cache, 0x800)) != 0)
+	while ((length = resource_file_read(&resource, cdrom_cache, 0x800)) != 0)
 	{
 		upload_file(0, next, length);
 		next += length;
 	}
 
-	zclose(f);
+	resource_file_close(&resource);
 }
 
 /*------------------------------------------------------

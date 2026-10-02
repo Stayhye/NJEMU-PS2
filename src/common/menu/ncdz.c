@@ -1,0 +1,112 @@
+/******************************************************************************
+
+	menu/ncdz.c
+
+	PSP メニュー (NCDZ)
+
+******************************************************************************/
+
+#if defined(INCLUDE_GAMECFG_STRUCT)
+
+/*-----------------------------------------------------------------------------
+	gamecfg 構造体
+-----------------------------------------------------------------------------*/
+
+static gamecfg2_t gamecfg_ncdz[] =
+{
+	{ MACHINE_REGION,      &neogeo_region,        CFG_RESTART,  2,  { REGION_JAPAN,REGION_USA,REGION_EUROPE } , 0},
+	{ RASTER_EFFECTS,      &neogeo_raster_enable, CFG_RESET,    1,  { OFF, ON } , 0},
+	{ EMULATE_LOAD_SCREEN, &neogeo_loadscreen,    CFG_RESTART,  1,  { NO, YES } , 0},
+	{ CDROM_SPEED_LIMIT,   &neogeo_cdspeed_limit, CFG_CONTINUE, 1,  { NO, YES } , 0},
+	MENU_BLANK,
+	{ DISPLAY_MODE, &option_display_mode, CFG_CONTINUE, 3, { DISPLAY_ORIGINAL_SIZE, DISPLAY_ORIGINAL_ASPECT, DISPLAY_4_3, DISPLAY_FULLSCREEN }, 0},
+	{ VIDEO_SYNC,          &option_vsync,         CFG_CONTINUE, 1,  { OFF, ON } , 0},
+	{ AUTO_FRAMESKIP,      &option_autoframeskip, CFG_CONTINUE, 1,  { DISABLE, ENABLE } , 0},
+	{ FRAMESKIP,           &option_frameskip,     CFG_CONTINUE, 11, { OFF,SKIP1,SKIP2,SKIP3,SKIP4,SKIP5,SKIP6,SKIP7,SKIP8,SKIP9,SKIP10,SKIP11 } , 0},
+	{ SHOW_FPS,            &option_showfps,       CFG_CONTINUE, 1,  { OFF, ON } , 0},
+	{ FRAME_LIMIT,         &option_speedlimit,    CFG_CONTINUE, 1,  { OFF, ON } , 0},
+	MENU_BLANK,
+	{ ENABLE_SOUND,        &option_sound_enable,  CFG_RESTART,  1,  { NO, YES } , 0},
+	{ SAMPLE_RATE,         &option_samplerate,    CFG_CONTINUE, 2,  { RATE11KHz,RATE22KHz,RATE44KHz } , 0},
+	{ SOUND_VOLUME,        &option_sound_volume,  CFG_CONTINUE, 10, { VOL0,VOL10,VOL20,VOL30,VOL40,VOL50,VOL60,VOL70,VOL80,VOL90,VOL100 } , 0},
+	{ ENABLE_CDDA,         &option_mp3_enable,    CFG_RESTART,  1,  { NO, YES } , 0},
+	{ CDDA_VOLUME,         &option_mp3_volume,    CFG_CONTINUE, 10, { VOL0,VOL10,VOL20,VOL30,VOL40,VOL50,VOL60,VOL70,VOL80,VOL90,VOL100 } , 0},
+	MENU_BLANK,
+	{ CONTROLLER,          &option_controller,    CFG_CONTINUE, 1,  { CONTROLLER1,CONTROLLER2 } , 0},
+	MENU_BLANK,
+	{ CPU_CLOCK, &platform_performance_level, CFG_CONTINUE, PLATFORM_PERFORMANCE_LEVEL_HIGHEST, { CLK222MHz,CLK266MHz,CLK300MHz,CLK333MHz }, POWER_CAP_PERFORMANCE },
+	MENU_BLANK_POWER(POWER_CAP_PERFORMANCE),
+	MENU_RETURN,
+	MENU_END
+};
+
+#elif defined(INCLUDE_GAMECFG_MENU)
+
+/*-----------------------------------------------------------------------------
+	gamecfg menu 初期化
+-----------------------------------------------------------------------------*/
+
+	gamecfg2 = gamecfg_ncdz;
+
+	if (neogeo_ngh == NGH_aof2
+	||	neogeo_ngh == NGH_tpgolf
+	||	neogeo_ngh == NGH_trally
+	||	neogeo_ngh == NGH_neodrift)
+		gamecfg[1].enable = 0;
+
+#elif defined(INCLUDE_KEYCFG_STRUCT)
+
+/*-----------------------------------------------------------------------------
+	keycfg 構造体
+-----------------------------------------------------------------------------*/
+
+static keycfg2_t keycfg_ncdz[] =
+{
+	{ BUTTON_LAYOUT,    KEYCFG_LAYOUT, NEOGEO_PAD },
+	MENU_BLANK,
+	{ INPUT_UP,         KEYCFG_BUTTON, P1_UP      },
+	{ INPUT_DOWN,       KEYCFG_BUTTON, P1_DOWN    },
+	{ INPUT_LEFT,       KEYCFG_BUTTON, P1_LEFT    },
+	{ INPUT_RIGHT,      KEYCFG_BUTTON, P1_RIGHT   },
+	{ INPUT_BUTTON_A,    KEYCFG_BUTTON, P1_BUTTONA },
+	{ INPUT_BUTTON_B,    KEYCFG_BUTTON, P1_BUTTONB },
+	{ INPUT_BUTTON_C,    KEYCFG_BUTTON, P1_BUTTONC },
+	{ INPUT_BUTTON_D,    KEYCFG_BUTTON, P1_BUTTOND },
+	{ INPUT_START,      KEYCFG_BUTTON, P1_START   },
+	{ INPUT_SELECT,     KEYCFG_BUTTON, P1_SELECT  },
+	MENU_BLANK,
+	{ AUTOFIRE_A,        KEYCFG_BUTTON, P1_AF_A    },
+	{ AUTOFIRE_B,        KEYCFG_BUTTON, P1_AF_B    },
+	{ AUTOFIRE_C,        KEYCFG_BUTTON, P1_AF_C    },
+	{ AUTOFIRE_D,        KEYCFG_BUTTON, P1_AF_D    },
+	{ AUTOFIRE_INV,     KEYCFG_NUMBER, 0          },
+	MENU_BLANK,
+	{ HOTKEY_AB,        KEYCFG_BUTTON, P1_AB      },
+	{ HOTKEY_AC,        KEYCFG_BUTTON, P1_AC      },
+	{ HOTKEY_AD,        KEYCFG_BUTTON, P1_AD      },
+	{ HOTKEY_BC,        KEYCFG_BUTTON, P1_BC      },
+	{ HOTKEY_BD,        KEYCFG_BUTTON, P1_BD      },
+	{ HOTKEY_CD,        KEYCFG_BUTTON, P1_CD      },
+	{ HOTKEY_ABC,       KEYCFG_BUTTON, P1_ABC     },
+	{ HOTKEY_ABD,       KEYCFG_BUTTON, P1_ABD     },
+	{ HOTKEY_ACD,       KEYCFG_BUTTON, P1_ACD     },
+	{ HOTKEY_BCD,       KEYCFG_BUTTON, P1_BCD     },
+	{ HOTKEY_ABCD,      KEYCFG_BUTTON, P1_ABCD    },
+	MENU_BLANK,
+	{ SAVE_SCREENSHOT,  KEYCFG_BUTTON, SNAPSHOT   },
+	{ SWITCH_PLAYER,    KEYCFG_BUTTON, SWPLAYER   },
+	{ _COMMAND_LIST,    KEYCFG_BUTTON, COMMANDLIST },
+	MENU_BLANK,
+	MENU_RETURN,
+	MENU_END
+};
+
+#elif defined(INCLUDE_KEYCFG_MENU)
+
+/*-----------------------------------------------------------------------------
+	keycfg menu 初期化
+-----------------------------------------------------------------------------*/
+
+	keycfg2 = keycfg_ncdz;
+
+#endif

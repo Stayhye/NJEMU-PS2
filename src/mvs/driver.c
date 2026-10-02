@@ -7,7 +7,16 @@
 ******************************************************************************/
 
 #include "mvs.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include <string.h>
+#include <time.h>
 #include "common/memory_sizes.h"
+#include "common/palette_convert.h"
+#include "include/osd_cpu.h"
 
 
 #define IRQ2CTRL_ENABLE				0x10
@@ -136,7 +145,7 @@ struct cacheinfo_t MVS_cacheinfo[] =
 	{ "samsho2k2","samsho2",  0, 0, 0 },
 	{ "samsho4k", "samsho4",  0, 0, 0 },
 	{ "shocktroa","shocktro", 0, 0, 0 },
-	{ NULL }
+	{ 0 }
 };
 
 
@@ -945,7 +954,7 @@ WRITE16_HANDLER( neogeo_paletteram_w )
 	color = COMBINE_DATA(&palettes[palette_bank][offset]);
 
 	if (offset & 0x0f)
-		video_palette[offset] = video_clut16[color & 0x7fff];
+		video_palette[offset] = neogeo_palette_to_555(color);
 }
 
 

@@ -7,6 +7,13 @@
 ******************************************************************************/
 
 #include "ncdz.h"
+#include "common/cmdlist.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/ui_text_driver.h"
+#include "common/ui.h"
+#include "common/ui_menu.h"
+#include <string.h>
 
 
 /******************************************************************************
@@ -47,8 +54,12 @@ static const uint8_t hotkey_mask[11] =
 static uint8_t ALIGN16_DATA input_flag[MAX_INPUTS];
 static int ALIGN16_DATA af_map1[NCDZ_BUTTON_MAX];
 static int ALIGN16_DATA af_map2[NCDZ_BUTTON_MAX];
-static int ALIGN16_DATA af_counter[NCDZ_BUTTON_MAX];
+static int ALIGN16_DATA af_counter[2][NCDZ_BUTTON_MAX];
 static int input_ui_wait;
+
+static void update_inputport0(void);
+static void update_inputport1(void);
+static void update_inputport2(void);
 
 
 /******************************************************************************
@@ -59,9 +70,10 @@ static int input_ui_wait;
 	Update autofire flag
 ------------------------------------------------------*/
 
-static uint32_t update_autofire(uint32_t buttons)
+static uint32_t update_autofire(uint32_t buttons, int controller)
 {
 	int i;
+	int *counter = af_counter[controller & 1];
 
 	for (i = 0; i < NCDZ_BUTTON_MAX; i++)
 	{
@@ -71,22 +83,96 @@ static uint32_t update_autofire(uint32_t buttons)
 			{
 				buttons &= ~af_map1[i];
 
-				if (af_counter[i] == 0)
+				if (counter[i] == 0)
 					buttons |= af_map2[i];
 				else
 					buttons &= ~af_map2[i];
 
-				if (++af_counter[i] > af_interval)
-					af_counter[i] = 0;
+				if (++counter[i] > af_interval)
+					counter[i] = 0;
 			}
 			else
 			{
-				af_counter[i] = 0;
+				counter[i] = 0;
 			}
 		}
 	}
 
 	return buttons;
+}
+
+static void set_input_flags(uint32_t buttons)
+{
+	int i;
+
+	for (i = 0; i < MAX_INPUTS; i++)
+		input_flag[i] = (buttons & input_map[i]) != 0;
+}
+
+static void update_inputport_multi(uint32_t controller_count)
+{
+	uint8_t combined_port0 = 0xff;
+	uint8_t combined_port1 = 0xff;
+	uint8_t combined_port2 = 0x0f;
+	uint32_t primary_buttons;
+	uint32_t primary_processed = 0;
+	int saved_controller;
+	uint32_t controller;
+
+	if (controller_count > 2)
+		controller_count = 2;
+
+	primary_buttons = poll_gamepad_index(0);
+	if (pad_menu_combo_pressed(primary_buttons))
+	{
+		showmenu();
+		setup_autofire();
+		primary_buttons = poll_gamepad_index(0);
+	}
+
+	saved_controller = option_controller;
+
+	for (controller = 0; controller < controller_count; controller++)
+	{
+		uint32_t buttons = controller == 0 ? primary_buttons :
+			poll_gamepad_index(controller);
+
+		buttons = update_autofire(buttons, (int)controller);
+		set_input_flags(buttons);
+		option_controller = (int)controller;
+
+		update_inputport0();
+		update_inputport1();
+		update_inputport2();
+
+		combined_port0 &= neogeo_port_value[0];
+		combined_port1 &= neogeo_port_value[1];
+		combined_port2 &= neogeo_port_value[2];
+
+		if (controller == 0)
+		{
+			primary_processed = buttons;
+
+			if (input_flag[SNAPSHOT])
+				save_snapshot();
+
+#ifdef COMMAND_LIST
+			if (input_flag[COMMANDLIST])
+				commandlist(1);
+#endif
+		}
+	}
+
+	neogeo_port_value[0] = combined_port0;
+	neogeo_port_value[1] = combined_port1;
+	neogeo_port_value[2] = combined_port2;
+	option_controller = saved_controller;
+	set_input_flags(primary_processed);
+
+	/* Switch Player is intentionally ignored while multiple physical pads are
+	 * active: physical pad N is already bound directly to emulated player N. */
+	if (input_ui_wait > 0)
+		input_ui_wait--;
 }
 
 
@@ -249,29 +335,20 @@ void update_inputport(void)
 {
 	int i;
 	uint32_t buttons;
+	uint32_t controller_count = gamepad_count();
+
+	if (controller_count > 1)
+	{
+		update_inputport_multi(controller_count);
+		return;
+	}
 
 	buttons = poll_gamepad();
 
-	if (systembuttons_available ? readHomeButton() : (buttons & PLATFORM_PAD_START) && (buttons & PLATFORM_PAD_SELECT))
+	if (pad_menu_combo_pressed(buttons))
 	{
 		showmenu();
 		setup_autofire();
-
-		/* Debounce: the menu is opened with Start+Select and Start is
-		 * also a confirm key inside it. Without waiting for a full
-		 * release the next update_inputport() call re-enters showmenu(),
-		 * so the menu looks like it never closes. */
-		{
-			int guard;
-			for (guard = 0; guard < 45; guard++)
-			{
-				uint32_t p = poll_gamepad();
-				if ((p & (PLATFORM_PAD_START | PLATFORM_PAD_SELECT))
-				    != (PLATFORM_PAD_START | PLATFORM_PAD_SELECT))
-					break;
-				usleep(16000);
-			}
-		}
 		buttons = poll_gamepad();
 	}
 /*
@@ -283,7 +360,7 @@ void update_inputport(void)
 	}
 #endif
 */
-	buttons = update_autofire(buttons);
+	buttons = update_autofire(buttons, 0);
 
 	for (i = 0; i < MAX_INPUTS; i++)
 		input_flag[i] = (buttons & input_map[i]) != 0;

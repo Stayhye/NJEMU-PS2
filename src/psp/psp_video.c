@@ -8,8 +8,13 @@
 
 #include "psp_video.h"
 #include <pspge.h> // for sceGeEdramGetAddr
+#include <pspdisplay.h>
+#include <pspkernel.h>
 #include <stdint.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /******************************************************************************
 		Local Variables/Structures
@@ -46,6 +51,9 @@ typedef struct psp_video
 
 	texture_layer_t *current_tex_layer;
 	uint16_t *current_clut;
+	uintptr_t prepared_vertices_start;
+	uintptr_t prepared_vertices_end;
+	int frame_active;  /* assert: beginFrame/endFrame called exactly once per frame */
 } psp_video_t;
 
 static uint16_t next_pow2(uint16_t v)
@@ -81,9 +89,16 @@ static void *psp_init(layer_texture_info_t *layer_textures,
 	psp->scrbitmap = offset; // Store relative offset
 	offset += framesize;
 	offset = VRAM_ALIGN_UP(offset);
+#if (EMU_SYSTEM == CPS2)
+	/* Only CPS2 uses the Z buffer (for sprite-priority masking).  Reserving a
+	 * fourth full-screen buffer for every core shifts MVS/NCDZ texture atlases
+	 * into the fixed GUI texture area at the end of the PSP's 2 MiB EDRAM. */
 	psp->depth_frame = offset; // Store relative offset for depth buffer (16-bit)
 	offset += framesize;
 	offset = VRAM_ALIGN_UP(offset);
+#else
+	psp->depth_frame = 0;
+#endif
 
 	// Original buffers containing clut indexes
 	psp->tex_layers =
@@ -163,8 +178,6 @@ static void *psp_init(layer_texture_info_t *layer_textures,
 	sceDisplayWaitVblankStart();
 	sceGuDisplay(GU_TRUE);
 
-	ui_init();
-
 	psp->current_tex_layer = NULL;
 	psp->current_clut = NULL;
 
@@ -193,7 +206,10 @@ static void psp_free(void *data)
 		Wait for VSYNC
 --------------------------------------------------------*/
 
-static void psp_waitVsync(void *data) { sceDisplayWaitVblankStart(); }
+static void psp_waitVsync(void *data) {
+	(void)data;
+	sceDisplayWaitVblankStart(); 
+}
 
 /*--------------------------------------------------------
 		Flip Screen
@@ -210,29 +226,93 @@ static void psp_flipScreen(void *data, bool vsync)
 }
 
 /*--------------------------------------------------------
+		Begin Frame (start GPU command list)
+--------------------------------------------------------*/
+
+static void psp_beginFrame(void *data)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+	assert(!psp->frame_active && "beginFrame called while frame already active");
+	psp->frame_active = 1;
+	sceKernelDcacheWritebackRange(gulist, GULIST_SIZE);
+	sceGuStart(GU_DIRECT, gulist);
+	sceGuDrawBufferList(pixel_format, (void *)psp->draw_frame, BUF_WIDTH);
+	sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
+}
+
+/*--------------------------------------------------------
+		End Frame (finish and sync GPU command list)
+--------------------------------------------------------*/
+
+static void psp_endFrame(void *data)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+	assert(psp->frame_active && "endFrame called without matching beginFrame");
+	psp->frame_active = 0;
+	sceGuFinish();
+	sceGuSync(0, GU_SYNC_FINISH);
+}
+
+void psp_video_sync_ui_scratch(void *data)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+
+	assert(psp->frame_active && "UI scratch sync requires an active frame");
+
+	/* tex_font is rewritten for every proportional glyph.  Complete the draw
+	 * that samples its current contents before the CPU writes the next glyph,
+	 * then immediately continue the same logical frame with a fresh GU list. */
+	sceGuFinish();
+	sceGuSync(0, GU_SYNC_FINISH);
+	sceKernelDcacheWritebackRange(gulist, GULIST_SIZE);
+	sceGuStart(GU_DIRECT, gulist);
+	sceGuDrawBufferList(pixel_format, (void *)psp->draw_frame, BUF_WIDTH);
+	sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
+}
+
+/*--------------------------------------------------------
+		Resolve frame index to VRAM pointer
+--------------------------------------------------------*/
+
+static inline uint16_t *psp_uncachedFrameAddr(void *frame)
+{
+	return (uint16_t *)((uintptr_t)frame | 0x44000000u);
+}
+
+static void *psp_resolveFrame(psp_video_t *psp, int index) {
+	switch (index) {
+	case COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER:
+		return (void *)psp->show_frame;
+	case COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER:
+		return (void *)psp->draw_frame;
+	case COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP:
+		return (void *)psp->scrbitmap;
+	default:
+		return (void *)psp->tex_layers[index - COMMON_GRAPHIC_OBJECTS_INITIAL_TEXTURE_LAYER].buffer;
+	}
+}
+
+/*--------------------------------------------------------
 		Get VRAM Address
 --------------------------------------------------------*/
 
-static void *psp_frameAddr(void *data, void *frame, int x, int y)
+static void *psp_frameAddr(void *data, int frameIndex, int x, int y)
 {
-	// Buffers are stored as relative offsets, convert to pointer
+	psp_video_t *psp = (psp_video_t *)data;
+	void *frame = psp_resolveFrame(psp, frameIndex);
 	return (void *)((uintptr_t)frame + ((x + (y << 9)) << 1));
 }
 
-static void *psp_workFrame(void *data)
+static void psp_getOutputSize(void *data, int *width, int *height)
 {
-	psp_video_t *psp = (psp_video_t *)data;
-	return (void *)psp->scrbitmap;
-}
-
-static void *psp_textureLayer(void *data, uint8_t layerIndex)
-{
-	psp_video_t *psp = (psp_video_t *)data;
-	return psp->tex_layers[layerIndex].buffer;
+	(void)data;
+	if (width) *width = SCR_WIDTH;
+	if (height) *height = SCR_HEIGHT;
 }
 
 static void psp_scissor(void *data, uint16_t left, uint16_t top, uint16_t right, uint16_t bottom)
 {
+	(void)data;
 	sceGuScissor(left, top, right - left, bottom - top);
 }
 
@@ -294,8 +374,10 @@ static void psp_clearFrame(void *data, int index) {
 		Fill Specified Frame
 --------------------------------------------------------*/
 
-static void psp_fillFrame(void *data, void *frame, uint32_t color)
+static void psp_fillFrame(void *data, int frameIndex, uint32_t color)
 {
+	psp_video_t *psp = (psp_video_t *)data;
+	void *frame = psp_resolveFrame(psp, frameIndex);
 	sceGuDrawBufferList(pixel_format, frame, BUF_WIDTH);
 	sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
 	sceGuClearColor(color);
@@ -306,26 +388,28 @@ static void psp_fillFrame(void *data, void *frame, uint32_t color)
 		Copy Rectangular Area
 --------------------------------------------------------*/
 
-static void psp_copyRect(void *data, void *src, void *dst, RECT *src_rect,
+static void psp_copyRect(void *data, int srcIndex, int dstIndex, RECT *src_rect,
 						 RECT *dst_rect)
 {
+	psp_video_t *psp = (psp_video_t *)data;
+	void *src_ptr = psp_resolveFrame(psp, srcIndex);
+	void *dst_ptr = psp_resolveFrame(psp, dstIndex);
 	int j, sw, dw, sh, dh;
-	struct Vertex *vertices;
+	video_sprite_vertex_t *vertices;
 
 	sw = src_rect->right - src_rect->left;
 	dw = dst_rect->right - dst_rect->left;
 	sh = src_rect->bottom - src_rect->top;
 	dh = dst_rect->bottom - dst_rect->top;
 
-	// sceGuStart(GU_DIRECT, gulist);
-
-	sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
-	sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right,
-				 dst_rect->bottom);
+	sceGuDrawBufferList(pixel_format, dst_ptr, BUF_WIDTH);
+	sceGuScissor(dst_rect->left, dst_rect->top, dw, dh);
 	sceGuDisable(GU_ALPHA_TEST);
+	sceGuDisable(GU_BLEND);
 
 	sceGuTexMode(pixel_format, 0, 0, GU_FALSE);
-	sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, GU_FRAME_ADDR(src));
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+	sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, psp_uncachedFrameAddr(src_ptr));
 	if (sw == dw && sh == dh)
 		sceGuTexFilter(GU_NEAREST, GU_NEAREST);
 	else
@@ -333,7 +417,7 @@ static void psp_copyRect(void *data, void *src, void *dst, RECT *src_rect,
 
 	for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -350,7 +434,7 @@ static void psp_copyRect(void *data, void *src, void *dst, RECT *src_rect,
 
 	if (j < sw)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -373,23 +457,27 @@ static void psp_startWorkFrame(void *data, uint32_t color)
 {
 	psp_video_t *psp = (psp_video_t *)data;
 
-	sceKernelDcacheWritebackRange(gulist, GULIST_SIZE);
-	sceGuStart(GU_DIRECT, gulist);
+	/* A GUI frame can leave both the clear color and fixed-function GU state in
+	 * a UI-specific configuration.  Normalize the game frame explicitly so the
+	 * first emulation frame cannot inherit GUI background/blending state. */
+	sceGuClearColor(color);
 	sceGuDrawBufferList(GU_PSM_5551, (void *)psp->draw_frame, BUF_WIDTH);
 	sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
 	sceGuClear(GU_COLOR_BUFFER_BIT | GU_FAST_CLEAR_BIT);
 
 	sceGuDrawBufferList(GU_PSM_5551, (void *)psp->scrbitmap, BUF_WIDTH);
-	sceGuClear(GU_COLOR_BUFFER_BIT | GU_FAST_CLEAR_BIT);
-
 	sceGuScissor(0, 0, SCR_WIDTH, SCR_HEIGHT);
-	sceGuClearColor(color);
 	sceGuClear(GU_COLOR_BUFFER_BIT | GU_FAST_CLEAR_BIT);
 
 	sceGuClearColor(0);
+	sceGuDisable(GU_BLEND);
 	sceGuEnable(GU_ALPHA_TEST);
+	sceGuEnable(GU_TEXTURE_2D);
 	sceGuTexMode(GU_PSM_T8, 0, 0, GU_TRUE);
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
 	sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+	psp->current_tex_layer = NULL;
+	psp->current_clut = NULL;
 
 	// sceGuFinish();
 	// sceGuSync(0, GU_SYNC_FINISH);
@@ -398,14 +486,9 @@ static void psp_startWorkFrame(void *data, uint32_t color)
 static void psp_transferWorkFrame(void *data, RECT *src_rect, RECT *dst_rect)
 {
 	psp_video_t *psp = (psp_video_t *)data;
-	psp_copyRect(psp, (void *)psp->scrbitmap, (void *)psp->draw_frame, src_rect,
+	psp_copyRect(psp, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER, src_rect,
 				 dst_rect);
 
-	size_t listSize = sceGuFinish();
-	u_int64_t tick = ticker_driver->currentUs(ticker_data);
-	sceGuSync(0, GU_SYNC_FINISH);
-	// printf("Transfer Work Frame GU List Size: %zu bytes, time: %llu us\n",
-	// listSize, ticker_driver->currentUs(ticker_data) - tick);
 	psp->current_tex_layer = NULL;
 	psp->current_clut = NULL;
 }
@@ -413,26 +496,26 @@ static void psp_transferWorkFrame(void *data, RECT *src_rect, RECT *dst_rect)
 		Copy Rectangular Area with Horizontal Flip
 --------------------------------------------------------*/
 
-static void psp_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect,
+static void psp_copyRectFlip(void *data, int srcIndex, int dstIndex, RECT *src_rect,
 							 RECT *dst_rect)
 {
+	psp_video_t *psp = (psp_video_t *)data;
+	void *src_ptr = psp_resolveFrame(psp, srcIndex);
+	void *dst_ptr = psp_resolveFrame(psp, dstIndex);
 	int16_t j, sw, dw, sh, dh;
-	struct Vertex *vertices;
+	video_sprite_vertex_t *vertices;
 
 	sw = src_rect->right - src_rect->left;
 	dw = dst_rect->right - dst_rect->left;
 	sh = src_rect->bottom - src_rect->top;
 	dh = dst_rect->bottom - dst_rect->top;
 
-	// sceGuStart(GU_DIRECT, gulist);
-
-	sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
-	sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right,
-				 dst_rect->bottom);
+	sceGuDrawBufferList(pixel_format, dst_ptr, BUF_WIDTH);
+	sceGuScissor(dst_rect->left, dst_rect->top, dw, dh);
 	sceGuDisable(GU_ALPHA_TEST);
 
 	sceGuTexMode(pixel_format, 0, 0, GU_FALSE);
-	sceGuTexImage(0, 512, 512, BUF_WIDTH, GU_FRAME_ADDR(src));
+	sceGuTexImage(0, 512, 512, BUF_WIDTH, psp_uncachedFrameAddr(src_ptr));
 	if (sw == dw && sh == dh)
 		sceGuTexFilter(GU_NEAREST, GU_NEAREST);
 	else
@@ -440,7 +523,7 @@ static void psp_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect,
 
 	for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -457,7 +540,7 @@ static void psp_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect,
 
 	if (j < sw)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -480,36 +563,36 @@ static void psp_copyRectFlip(void *data, void *src, void *dst, RECT *src_rect,
 		Copy Rectangular Area with 270-degree Rotation
 --------------------------------------------------------*/
 
-static void psp_copyRectRotate(void *data, void *src, void *dst, RECT *src_rect,
+static void psp_copyRectRotate(void *data, int srcIndex, int dstIndex, RECT *src_rect,
 							   RECT *dst_rect)
 {
+	psp_video_t *psp = (psp_video_t *)data;
+	void *src_ptr = psp_resolveFrame(psp, srcIndex);
+	void *dst_ptr = psp_resolveFrame(psp, dstIndex);
 	int16_t j, sw, dw, sh, dh;
-	struct Vertex *vertices;
+	video_sprite_vertex_t *vertices;
 
 	sw = src_rect->right - src_rect->left;
 	dw = dst_rect->right - dst_rect->left;
 	sh = src_rect->bottom - src_rect->top;
 	dh = dst_rect->bottom - dst_rect->top;
 
-	// sceGuStart(GU_DIRECT, gulist);
-
-	sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
-	sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right,
-				 dst_rect->bottom);
+	sceGuDrawBufferList(pixel_format, dst_ptr, BUF_WIDTH);
+	sceGuScissor(dst_rect->left, dst_rect->top, dw, dh);
 	sceGuDisable(GU_ALPHA_TEST);
 
 	sceGuTexMode(pixel_format, 0, 0, GU_FALSE);
-	sceGuTexImage(0, 512, 512, BUF_WIDTH, GU_FRAME_ADDR(src));
+	sceGuTexImage(0, 512, 512, BUF_WIDTH, psp_uncachedFrameAddr(src_ptr));
 	if (sw == dh && sh == dw)
 		sceGuTexFilter(GU_NEAREST, GU_NEAREST);
 	else
 		sceGuTexFilter(GU_LINEAR, GU_LINEAR);
 
-	vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+	vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 	for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->right - j;
 		vertices[0].v = src_rect->bottom;
@@ -526,7 +609,7 @@ static void psp_copyRectRotate(void *data, void *src, void *dst, RECT *src_rect,
 
 	if (j < sw)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->right + j;
 		vertices[0].v = src_rect->bottom;
@@ -549,25 +632,25 @@ static void psp_copyRectRotate(void *data, void *src, void *dst, RECT *src_rect,
 		Draw Texture with Specified Rectangular Area
 --------------------------------------------------------*/
 
-static void psp_drawTexture(void *data, uint32_t src_fmt, uint32_t dst_fmt,
-							void *src, void *dst, RECT *src_rect,
-							RECT *dst_rect)
+static void psp_drawTexture(void *data, int srcIndex, int dstIndex,
+							RECT *src_rect, RECT *dst_rect)
 {
+	psp_video_t *psp = (psp_video_t *)data;
+	void *src = psp_resolveFrame(psp, srcIndex);
+	void *dst = psp_resolveFrame(psp, dstIndex);
 	int j, sw, dw, sh, dh;
-	struct Vertex *vertices;
+	video_sprite_vertex_t *vertices;
 
 	sw = src_rect->right - src_rect->left;
 	dw = dst_rect->right - dst_rect->left;
 	sh = src_rect->bottom - src_rect->top;
 	dh = dst_rect->bottom - dst_rect->top;
 
-	// sceGuStart(GU_DIRECT, gulist);
-	sceGuDrawBufferList(dst_fmt, dst, BUF_WIDTH);
-	sceGuScissor(dst_rect->left, dst_rect->top, dst_rect->right,
-				 dst_rect->bottom);
+	sceGuDrawBufferList(pixel_format, dst, BUF_WIDTH);
+	sceGuScissor(dst_rect->left, dst_rect->top, dw, dh);
 
-	sceGuTexMode(src_fmt, 0, 0, GU_FALSE);
-	sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, GU_FRAME_ADDR(src));
+	sceGuTexMode(GU_PSM_5551, 0, 0, GU_FALSE);
+	sceGuTexImage(0, BUF_WIDTH, BUF_WIDTH, BUF_WIDTH, psp_uncachedFrameAddr(src));
 	if (sw == dw && sh == dh)
 		sceGuTexFilter(GU_NEAREST, GU_NEAREST);
 	else
@@ -575,7 +658,7 @@ static void psp_drawTexture(void *data, uint32_t src_fmt, uint32_t dst_fmt,
 
 	for (j = 0; (j + SLICE_SIZE) < sw; j = j + SLICE_SIZE)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -592,7 +675,7 @@ static void psp_drawTexture(void *data, uint32_t src_fmt, uint32_t dst_fmt,
 
 	if (j < sw)
 	{
-		vertices = (struct Vertex *)sceGuGetMemory(2 * sizeof(struct Vertex));
+		vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
 
 		vertices[0].u = src_rect->left + j;
 		vertices[0].v = src_rect->top;
@@ -611,8 +694,6 @@ static void psp_drawTexture(void *data, uint32_t src_fmt, uint32_t dst_fmt,
 	// sceGuSync(0, GU_SYNC_FINISH);
 }
 
-static void *psp_getNativeObjects(void *data, int index) { return NULL; }
-
 static void psp_uploadMem(void *data, uint8_t textureIndex)
 {
 	psp_video_t *psp = (psp_video_t *)data;
@@ -623,32 +704,138 @@ static void psp_uploadMem(void *data, uint8_t textureIndex)
 
 static void psp_uploadClut(void *data, uint16_t *clut, uint8_t bank_index)
 {
+	(void)data;
+	(void)bank_index;
 	/* Flush the actual CLUT bank pointer that will be used by sceGuClutLoad */
 	size_t size = 256 * sizeof(uint16_t);
 	sceKernelDcacheWritebackRange(clut, size);
 }
 
-static void psp_blitTexture(void *data, uint8_t textureIndex, void *clut,
-							uint8_t clut_index, uint32_t vertices_count,
-							void *vertices)
+static size_t psp_swizzled8_offset(uint16_t stride, int x, int y)
+{
+	const size_t block_width = 16;
+	const size_t block_height = 8;
+	const size_t block_size = block_width * block_height;
+	return (size_t)(y / (int)block_height) * stride * block_height +
+		(size_t)(x / (int)block_width) * block_size +
+		(size_t)(y % (int)block_height) * block_width +
+		(size_t)(x % (int)block_width);
+}
+
+static void psp_writeIndexedTextureRect(void *data, uint8_t textureIndex,
+	int x, int y, int width, int height, const uint8_t *pixels, int srcPitch)
 {
 	psp_video_t *psp = (psp_video_t *)data;
+	texture_layer_t *layer;
+	int row;
+
+	if (!psp || textureIndex >= psp->tex_layers_count || !pixels ||
+	    width <= 0 || height <= 0 || srcPitch < width)
+		return;
+	layer = &psp->tex_layers[textureIndex];
+	if (!layer->buffer || layer->bytes_per_pixel != 1 ||
+	    x < 0 || y < 0 || x + width > layer->width || y + height > layer->height)
+		return;
+
+	for (row = 0; row < height; row++) {
+		int column = 0;
+		while (column < width) {
+			int dst_x = x + column;
+			int run = 16 - (dst_x & 15);
+			if (run > width - column) run = width - column;
+			memcpy(layer->buffer + psp_swizzled8_offset(layer->stride,
+					dst_x, y + row),
+				pixels + row * srcPitch + column, (size_t)run);
+			column += run;
+		}
+	}
+}
+
+static void psp_writeDirectTextureRect(void *data, uint8_t textureIndex,
+	int x, int y, int width, int height, const uint16_t *pixels, int srcPitch)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+	texture_layer_t *layer;
+	uint16_t *dst;
+	int row;
+
+	if (!psp || textureIndex >= psp->tex_layers_count || !pixels ||
+	    width <= 0 || height <= 0 || srcPitch < width)
+		return;
+	layer = &psp->tex_layers[textureIndex];
+	if (!layer->buffer || layer->bytes_per_pixel != 2 ||
+	    x < 0 || y < 0 || x + width > layer->width || y + height > layer->height)
+		return;
+
+	dst = (uint16_t *)layer->buffer;
+	for (row = 0; row < height; row++)
+		memcpy(dst + (size_t)(y + row) * layer->stride + x,
+			pixels + row * srcPitch, (size_t)width * sizeof(uint16_t));
+}
+
+static void psp_bindSpriteTexture(psp_video_t *psp, uint8_t textureIndex,
+	const uint16_t *clut)
+{
 	texture_layer_t *layer = &psp->tex_layers[textureIndex];
 	if (psp->current_tex_layer != layer) {
 		psp->current_tex_layer = layer;
 		int is_indexed = (layer->bytes_per_pixel == 1);
-		sceGuTexMode(is_indexed ? GU_PSM_T8 : GU_PSM_5551, 0, 0, is_indexed ? GU_TRUE : GU_FALSE);
+		sceGuTexMode(is_indexed ? GU_PSM_T8 : GU_PSM_5551, 0, 0,
+			is_indexed ? GU_TRUE : GU_FALSE);
 		sceGuTexImage(0, layer->width, layer->height, layer->stride, layer->buffer);
 	}
-	if (clut != NULL && psp->current_clut != (uint16_t *)clut) {
+	if (clut != NULL && psp->current_clut != clut) {
 		psp->current_clut = (uint16_t *)clut;
+		/* Portable renderers pass the exact 256-entry CLUT window used by a
+		 * batch. Keep cache coherency a backend concern instead of requiring
+		 * targets to know that the PSP consumes CLUTs directly from RAM. */
+		sceKernelDcacheWritebackRange(clut, 256 * sizeof(uint16_t));
 		sceGuClutLoad(256 / 8, clut);
 	}
+}
+
+static void psp_prepareSpriteVertices(void *data, uint32_t vertices_count,
+	const video_sprite_vertex_t *vertices)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+	size_t size;
+
+	if (!psp || !vertices || vertices_count == 0) return;
+	size = vertices_count * sizeof(video_sprite_vertex_t);
+	sceKernelDcacheWritebackRange(vertices, size);
+	psp->prepared_vertices_start = (uintptr_t)vertices;
+	psp->prepared_vertices_end = (uintptr_t)vertices + size;
+}
+
+static void psp_blitSpriteVertices(void *data, uint8_t textureIndex,
+	const uint16_t *clut, uint8_t bank_index,
+	uint32_t vertices_count, const video_sprite_vertex_t *vertices)
+{
+	psp_video_t *psp = (psp_video_t *)data;
+	(void)bank_index;
+	if (!psp || textureIndex >= psp->tex_layers_count || !vertices ||
+	    vertices_count == 0)
+		return;
+
+	{
+		uintptr_t start = (uintptr_t)vertices;
+		uintptr_t end = start + vertices_count * sizeof(video_sprite_vertex_t);
+		if (start < psp->prepared_vertices_start || end > psp->prepared_vertices_end)
+			sceKernelDcacheWritebackRange(vertices,
+				vertices_count * sizeof(video_sprite_vertex_t));
+	}
+	psp_bindSpriteTexture(psp, textureIndex, clut);
 	sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, vertices_count, NULL, vertices);
 }
 
-static void psp_blitPoints(void *data, uint32_t points_count, void *vertices)
+static void psp_blitPointVertices(void *data, uint32_t points_count,
+	const video_point_vertex_t *vertices)
 {
+	(void)data;
+	if (!vertices || points_count == 0)
+		return;
+	sceKernelDcacheWritebackRange(vertices,
+		points_count * sizeof(video_point_vertex_t));
 	sceGuDisable(GU_TEXTURE_2D);
 	sceGuDisable(GU_ALPHA_TEST);
 	sceGuDrawArray(GU_POINTS, GU_COLOR_5551 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, points_count, NULL, vertices);
@@ -656,20 +843,16 @@ static void psp_blitPoints(void *data, uint32_t points_count, void *vertices)
 	sceGuEnable(GU_ALPHA_TEST);
 }
 
-static void psp_flushCache(void *data, void *addr, size_t size)
-{
-	size_t aligned_size = (size + 63) & ~63;
-	sceKernelDcacheWritebackRange(addr, aligned_size);
-}
-
 static void psp_enableDepthTest(void *data)
 {
+	(void)data;
 	sceGuEnable(GU_DEPTH_TEST);
 	sceGuDepthMask(GU_FALSE);
 }
 
 static void psp_disableDepthTest(void *data)
 {
+	(void)data;
 	sceGuDisable(GU_DEPTH_TEST);
 	sceGuDepthMask(GU_TRUE);
 }
@@ -684,8 +867,305 @@ static void psp_clearDepthBuffer(void *data)
 
 static void psp_clearColorBuffer(void *data)
 {
+	(void)data;
 	sceGuClearColor(0);
 	sceGuClear(GU_COLOR_BUFFER_BIT | GU_FAST_CLEAR_BIT);
+}
+
+/*--------------------------------------------------------
+		2D UI Drawing Primitives
+--------------------------------------------------------*/
+
+typedef struct Vertex16_t
+{
+	uint32_t color;
+	int16_t x, y, z;
+} Vertex16;
+
+static void psp_drawUISprite(void *data, void *tex, int tex_format, int tex_swizzled,
+	int tex_width, int tex_height, int tex_stride,
+	int su, int sv, int sw, int sh,
+	int dx, int dy, int dw, int dh, int blend)
+{
+	(void)data;
+	video_sprite_vertex_t *vertices;
+
+	if (!tex) return;
+
+	if (blend)
+	{
+		sceGuEnable(GU_BLEND);
+		sceGuDisable(GU_ALPHA_TEST);
+	}
+
+	sceGuTexMode(tex_format, 0, 0, tex_swizzled);
+	sceGuTexImage(0, tex_width, tex_height, tex_stride, tex);
+	sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+	sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+
+	vertices = (video_sprite_vertex_t *)sceGuGetMemory(2 * sizeof(video_sprite_vertex_t));
+
+	if (vertices)
+	{
+		vertices[0].u = su;
+		vertices[0].v = sv;
+		vertices[0].x = dx;
+		vertices[0].y = dy;
+		vertices[0].z = 0;
+		vertices[0].color = 0xffff;
+
+		vertices[1].u = su + sw;
+		vertices[1].v = sv + sh;
+		vertices[1].x = dx + dw;
+		vertices[1].y = dy + dh;
+		vertices[1].z = 0;
+		vertices[1].color = 0xffff;
+
+		sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, 2, NULL, vertices);
+	}
+
+	if (blend)
+		sceGuDisable(GU_BLEND);
+}
+
+static void psp_drawUILine(void *data,
+	int x1, int y1, int x2, int y2, uint32_t color)
+{
+	(void)data;
+	Vertex16 *vertices;
+	int has_alpha = ((color >> 24) & 0xff) != 0xff;
+
+	sceGuDisable(GU_TEXTURE_2D);
+
+	if (has_alpha)
+		sceGuEnable(GU_BLEND);
+
+	vertices = (Vertex16 *)sceGuGetMemory(2 * sizeof(Vertex16));
+
+	if (vertices)
+	{
+		vertices[0].x = x1;
+		vertices[0].y = y1;
+		vertices[0].z = 0;
+		vertices[0].color = color;
+
+		vertices[1].x = x2;
+		vertices[1].y = y2;
+		vertices[1].z = 0;
+		vertices[1].color = color;
+
+		sceGuDrawArray(GU_LINES, PRIMITIVE_FLAGS, 2, NULL, vertices);
+	}
+
+	if (has_alpha)
+		sceGuDisable(GU_BLEND);
+
+	sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void psp_drawUILineGradient(void *data,
+	int x1, int y1, int x2, int y2,
+	uint32_t color1, uint32_t color2)
+{
+	(void)data;
+	Vertex16 *vertices;
+
+	sceGuDisable(GU_TEXTURE_2D);
+	sceGuEnable(GU_BLEND);
+	sceGuShadeModel(GU_SMOOTH);
+	sceGuEnable(GU_DITHER);
+
+	vertices = (Vertex16 *)sceGuGetMemory(2 * sizeof(Vertex16));
+
+	if (vertices)
+	{
+		vertices[0].x = x1;
+		vertices[0].y = y1;
+		vertices[0].z = 0;
+		vertices[0].color = color1;
+
+		vertices[1].x = x2;
+		vertices[1].y = y2;
+		vertices[1].z = 0;
+		vertices[1].color = color2;
+
+		sceGuDrawArray(GU_LINES, PRIMITIVE_FLAGS, 2, NULL, vertices);
+	}
+
+	sceGuDisable(GU_DITHER);
+	sceGuShadeModel(GU_FLAT);
+	sceGuDisable(GU_BLEND);
+	sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void psp_drawUIRect(void *data,
+	int x, int y, int w, int h, uint32_t color)
+{
+	(void)data;
+	Vertex16 *vertices;
+
+	sceGuDisable(GU_TEXTURE_2D);
+
+	vertices = (Vertex16 *)sceGuGetMemory(5 * sizeof(Vertex16));
+
+	if (vertices)
+	{
+		int sx = x;
+		int sy = y;
+		int ex = x + w;
+		int ey = y + h;
+
+		vertices[0].x = sx;
+		vertices[0].y = sy;
+		vertices[0].z = 0;
+		vertices[0].color = color;
+
+		vertices[1].x = ex;
+		vertices[1].y = sy;
+		vertices[1].z = 0;
+		vertices[1].color = color;
+
+		vertices[2].x = ex;
+		vertices[2].y = ey;
+		vertices[2].z = 0;
+		vertices[2].color = color;
+
+		vertices[3].x = sx;
+		vertices[3].y = ey - 1;
+		vertices[3].z = 0;
+		vertices[3].color = color;
+
+		vertices[4].x = sx;
+		vertices[4].y = sy;
+		vertices[4].z = 0;
+		vertices[4].color = color;
+
+		sceGuDrawArray(GU_LINE_STRIP, PRIMITIVE_FLAGS, 5, NULL, vertices);
+	}
+
+	sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void psp_fillUIRect(void *data,
+	int x, int y, int w, int h, uint32_t color)
+{
+	(void)data;
+	Vertex16 *vertices;
+	int has_alpha = ((color >> 24) & 0xff) != 0xff;
+
+	sceGuDisable(GU_TEXTURE_2D);
+
+	if (has_alpha)
+		sceGuEnable(GU_BLEND);
+
+	vertices = (Vertex16 *)sceGuGetMemory(4 * sizeof(Vertex16));
+
+	if (vertices)
+	{
+		int sx = x;
+		int sy = y;
+		int ex = x + w;
+		int ey = y + h;
+
+		vertices[0].x = sx;
+		vertices[0].y = sy;
+		vertices[0].z = 0;
+		vertices[0].color = color;
+
+		vertices[1].x = ex;
+		vertices[1].y = sy;
+		vertices[1].z = 0;
+		vertices[1].color = color;
+
+		vertices[2].x = sx;
+		vertices[2].y = ey;
+		vertices[2].z = 0;
+		vertices[2].color = color;
+
+		vertices[3].x = ex;
+		vertices[3].y = ey;
+		vertices[3].z = 0;
+		vertices[3].color = color;
+
+		sceGuDrawArray(GU_TRIANGLE_STRIP, PRIMITIVE_FLAGS, 4, NULL, vertices);
+	}
+
+	if (has_alpha)
+		sceGuDisable(GU_BLEND);
+
+	sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void psp_fillUIRectGradient(void *data,
+	int x, int y, int w, int h,
+	uint32_t color1, uint32_t color2, int direction)
+{
+	(void)data;
+	Vertex16 *vertices;
+
+	sceGuDisable(GU_TEXTURE_2D);
+	sceGuEnable(GU_BLEND);
+	sceGuShadeModel(GU_SMOOTH);
+	sceGuEnable(GU_DITHER);
+
+	vertices = (Vertex16 *)sceGuGetMemory(4 * sizeof(Vertex16));
+
+	if (vertices)
+	{
+		int sx = x;
+		int sy = y;
+		int ex = x + w;
+		int ey = y + h;
+
+		vertices[0].x = sx;
+		vertices[0].y = sy;
+		vertices[0].z = 0;
+
+		vertices[1].x = ex;
+		vertices[1].y = sy;
+		vertices[1].z = 0;
+
+		vertices[2].x = sx;
+		vertices[2].y = ey;
+		vertices[2].z = 0;
+
+		vertices[3].x = ex;
+		vertices[3].y = ey;
+		vertices[3].z = 0;
+
+		if (direction)
+		{
+			vertices[0].color = color1;
+			vertices[1].color = color1;
+			vertices[2].color = color2;
+			vertices[3].color = color2;
+		}
+		else
+		{
+			vertices[0].color = color1;
+			vertices[2].color = color1;
+			vertices[1].color = color2;
+			vertices[3].color = color2;
+		}
+
+		sceGuDrawArray(GU_TRIANGLE_STRIP, PRIMITIVE_FLAGS, 4, NULL, vertices);
+	}
+
+	sceGuDisable(GU_DITHER);
+	sceGuShadeModel(GU_FLAT);
+	sceGuDisable(GU_BLEND);
+	sceGuEnable(GU_TEXTURE_2D);
+}
+
+static void psp_setUIScissor(void *data, int x, int y, int w, int h)
+{
+	/* Preserve the historical PSP UI behavior: individual GE draws own their
+	 * clipping state and the higher-level UI scissor hint is not applied. */
+	(void)data;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
 }
 
 video_driver_t video_psp = {
@@ -694,9 +1174,11 @@ video_driver_t video_psp = {
 	psp_free,
 	psp_waitVsync,
 	psp_flipScreen,
+	psp_beginFrame,
+	psp_endFrame,
 	psp_frameAddr,
-	psp_workFrame,
-	psp_textureLayer,
+	NULL, // readFrame: PSP surfaces are directly CPU-addressable
+	psp_getOutputSize,
 	psp_scissor,
 	psp_clearScreen,
 	psp_clearFrame,
@@ -707,14 +1189,22 @@ video_driver_t video_psp = {
 	psp_copyRectFlip,
 	psp_copyRectRotate,
 	psp_drawTexture,
-	psp_getNativeObjects,
 	psp_uploadMem,
 	psp_uploadClut,
-	psp_blitTexture,
-	psp_blitPoints,
-	psp_flushCache,
+	psp_writeIndexedTextureRect,
+	psp_writeDirectTextureRect,
+	psp_blitSpriteVertices,
+	psp_blitPointVertices,
 	psp_enableDepthTest,
 	psp_disableDepthTest,
 	psp_clearDepthBuffer,
 	psp_clearColorBuffer,
+	psp_drawUISprite,
+	psp_drawUILine,
+	psp_drawUILineGradient,
+	psp_drawUIRect,
+	psp_fillUIRect,
+	psp_fillUIRectGradient,
+	psp_setUIScissor,
+	psp_prepareSpriteVertices,
 };

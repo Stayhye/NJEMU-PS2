@@ -8,7 +8,33 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
 #include "mvs.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/cache.h"
+#ifdef COMMAND_LIST
+#include "common/cmdlist.h"
+#endif
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/loadrom.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/config.h"
+#include "common/memory_plan.h"
 #include "common/memory_sizes.h"
 
 #define M68K_AMASK M68K_ADDR_MASK
@@ -113,10 +139,9 @@ int use_parent_crom;
 int use_parent_srom;
 int use_parent_vrom;
 
-#ifdef LARGE_MEMORY
-uint32_t psp2k_mem_offset = PSP2K_MEM_TOP;
-int32_t psp2k_mem_left = PSP2K_MEM_SIZE;
-#endif
+static memory_plan_t mvs_memory_plan;
+static int mvs_memory_plan_valid;
+static memory_allocation_shape_t mvs_memory_shape;
 
 
 /******************************************************************************
@@ -454,68 +479,6 @@ static int build_zoom_tables(void)
 
 
 /******************************************************************************
-	PSP-2000 Memory Management
-******************************************************************************/
-
-#ifdef LARGE_MEMORY
-
-#define MEMORY_IS_PSP2K(mem)	((uint32_t)mem >= PSP2K_MEM_TOP)
-
-/*--------------------------------------------------------
-	Allocate Memory from Extended Region
---------------------------------------------------------*/
-
-static void *psp2k_mem_alloc(int32_t size)
-{
-	uint8_t *mem = NULL;
-
-	if (size <= psp2k_mem_left)
-	{
-		mem = (uint8_t *)psp2k_mem_offset;
-		psp2k_mem_offset += size;
-		psp2k_mem_left -= size;
-	}
-	return mem;
-}
-
-
-/*--------------------------------------------------------
-	Move Memory to Extended Region
---------------------------------------------------------*/
-
-static void *psp2k_mem_move(void *mem, int32_t size)
-{
-	if (!mem) return NULL;
-
-	if (size <= psp2k_mem_left)
-	{
-		memcpy((uint8_t *)psp2k_mem_offset, mem, size);
-		free(mem);
-
-		mem = (uint8_t *)psp2k_mem_offset;
-		psp2k_mem_offset += size;
-		psp2k_mem_left   -= size;
-	}
-	return mem;
-}
-
-
-/*--------------------------------------------------------
-	Check Memory Range and free()
---------------------------------------------------------*/
-
-static void psp2k_mem_free(void *mem)
-{
-	if (!mem || MEMORY_IS_PSP2K(mem))
-		return;	// Do not free extended memory (will freeze)
-
-	free(mem);
-}
-
-#endif
-
-
-/******************************************************************************
 	ROM Loading
 ******************************************************************************/
 
@@ -540,10 +503,25 @@ static int load_rom_cpu1(void)
 
 	for (i = 0; i < num_cpu1rom; )
 	{
+		int irrmaze_legacy_program = 0;
+
 		strcpy(fname, cpu1rom[i].name);
-		if ((res = file_open(game_name, parent, cpu1rom[i].crc, fname)) < 0)
+		res = file_open(game_name, parent, cpu1rom[i].crc, fname);
+
+		/* Older Irritating Maze sets store the same 2 MiB program image with
+		 * its 1 MiB halves already in the order expected by the CPU. */
+		if (res < 0
+		&& strcmp(game_name, "irrmaze") == 0
+		&& cpu1rom[i].crc == 0x4c2ff660)
 		{
-			if (res == -1)
+			strcpy(fname, "236-p1.bin");
+			res = file_open(game_name, parent, 0x6d536c6e, fname);
+			irrmaze_legacy_program = (res >= 0);
+		}
+
+		if (res < 0)
+		{
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -552,7 +530,17 @@ static int load_rom_cpu1(void)
 
 		msg_printf(TEXT(LOADING), fname);
 
-		i = rom_load(cpu1rom, memory_region_cpu1, i, num_cpu1rom);
+		if (irrmaze_legacy_program)
+		{
+			file_read(memory_region_cpu1, memory_length_cpu1);
+			i++;
+			while (i < num_cpu1rom && cpu1rom[i].type == ROM_CONTINUE)
+				i++;
+		}
+		else
+		{
+			i = rom_load(cpu1rom, memory_region_cpu1, i, num_cpu1rom);
+		}
 
 		file_close();
 	}
@@ -575,6 +563,7 @@ static int load_rom_cpu1(void)
 		case INIT_svc:      res = svc_px_decrypt();       break;
 		case INIT_samsho5:  res = samsho5_decrypt_68k();  break;
 		case INIT_kof2003:  res = kof2003_decrypt_68k();  break;
+		case INIT_kof2003h: res = kof2003h_decrypt_68k(); break;
 		case INIT_samsh5sp: res = samsh5sp_decrypt_68k(); break;
 		case INIT_matrim:   res = matrim_decrypt_68k();   break;
 
@@ -651,7 +640,7 @@ static int load_rom_cpu2(void)
 		strcpy(fname, cpu2rom[i].name);
 		if ((res = file_open(game_name, parent, cpu2rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -747,7 +736,7 @@ static int load_rom_gfx1(void)
 	strcpy(fname, sfix_name);
 	if ((res = file_open(game_name, bios_zip, sfix_crc, fname)) < 0)
 	{
-		if (res == -1)
+		if (res == ROM_FILE_OPEN_NOT_FOUND)
 			error_file(fname);
 		else
 			error_crc(fname);
@@ -778,33 +767,23 @@ static int load_rom_gfx2(void)
 
 	if (encrypt_gfx2)
 	{
-#if USE_CACHE
-		if (cache_type == CACHE_ZIPFILE)
+		int32_t fd = cachefile_open(CACHE_SROM);
+
+		if (fd >= 0)
 		{
-			int64_t zfd = zopen("srom");
-			if (zfd == -1)
-			{
-				error_file("cache/srom");
-				return 0;
-			}
 			msg_printf(TEXT(LOADING_DECRYPTED_GFX2_ROM));
-			zread(zfd, memory_region_gfx2, memory_length_gfx2);
-			zclose(zfd);
+			{ ssize_t io_result = read(fd, memory_region_gfx2, memory_length_gfx2); (void)io_result; }
+			close(fd);
 		}
 		else
-#endif
 		{
-			int32_t fd;
-
-			if ((fd = cachefile_open(CACHE_SROM)) < 0)
+			if (cachefile_zip_read(CACHE_SROM, "srom",
+				memory_region_gfx2, memory_length_gfx2) != memory_length_gfx2)
 			{
 				error_file("cache/srom");
 				return 0;
 			}
-
 			msg_printf(TEXT(LOADING_DECRYPTED_GFX2_ROM));
-			read(fd, memory_region_gfx2, memory_length_gfx2);
-			close(fd);
 		}
 	}
 	else
@@ -820,7 +799,7 @@ static int load_rom_gfx2(void)
 			strcpy(fname, gfx2rom[i].name);
 			if ((res = file_open(game_name, parent, gfx2rom[i].crc, fname)) < 0)
 			{
-				if (res == -1)
+				if (res == ROM_FILE_OPEN_NOT_FOUND)
 					error_file(fname);
 				else
 					error_crc(fname);
@@ -858,14 +837,15 @@ static int load_rom_gfx2(void)
 
 static int load_rom_gfx3(void)
 {
-	if (!encrypt_gfx3)
+	int use_streaming = encrypt_gfx3 || (option_sound_enable && disable_sound);
+
+	if (!use_streaming && mvs_memory_plan_valid &&
+		mvs_memory_plan.gfx_fully_resident &&
+		mvs_memory_plan.gfx_cache_bytes >= memory_length_gfx3)
 	{
-#ifdef LARGE_MEMORY
-		if ((memory_region_gfx3 = psp2k_mem_alloc(memory_length_gfx3)) == NULL)
-#endif
-		{
-			memory_region_gfx3 = malloc(memory_length_gfx3);
-		}
+		memory_allocation_shape_release_reserve(&mvs_memory_shape);
+		memory_region_gfx3 = mvs_memory_shape.gfx_memory;
+		mvs_memory_shape.gfx_memory = NULL;
 
 		if (memory_region_gfx3 != NULL)
 		{
@@ -882,7 +862,7 @@ static int load_rom_gfx3(void)
 				strcpy(fname, gfx3rom[i].name);
 				if ((res = file_open(game_name, parent, gfx3rom[i].crc, fname)) < 0)
 				{
-					if (res == -1)
+					if (res == ROM_FILE_OPEN_NOT_FOUND)
 						error_file(fname);
 					else
 						error_crc(fname);
@@ -897,17 +877,30 @@ static int load_rom_gfx3(void)
 			}
 
 			neogeo_decode_spr(memory_region_gfx3, memory_length_gfx3, gfx_pen_usage[2]);
+			msg_printf(TEXT(CACHE_USAGE_CROM),
+				memory_length_gfx3 / 1024, memory_length_gfx3 / 1024);
+			return 1;
 		}
-		else
-		{
-			msg_printf(TEXT(COULD_NOT_ALLOCATE_MEMORY_FOR_SPRITE_DATA));
-			msg_printf(TEXT(TRY_TO_USE_SPRITE_CACHE));
-		}
+
+		msg_printf(TEXT(COULD_NOT_ALLOCATE_MEMORY_FOR_SPRITE_DATA));
+		msg_printf(TEXT(TRY_TO_USE_SPRITE_CACHE));
 	}
 
-	if (memory_region_gfx3 == NULL)
+	memory_allocation_shape_release_reserve(&mvs_memory_shape);
+	if (!mvs_memory_plan_valid)
 	{
-		if (cache_start() == 0)
+		msg_printf(TEXT(PRESS_ANY_BUTTON2));
+		pad_wait_press(PAD_WAIT_INFINITY);
+		Loop = LOOP_BROWSER;
+		return 0;
+	}
+
+	{
+		void *gfx_memory = mvs_memory_shape.gfx_memory;
+		void *pcm_memory = mvs_memory_shape.pcm_memory;
+		mvs_memory_shape.gfx_memory = NULL;
+		mvs_memory_shape.pcm_memory = NULL;
+		if (cache_start(&mvs_memory_plan, gfx_memory, pcm_memory) == 0)
 		{
 			msg_printf(TEXT(PRESS_ANY_BUTTON2));
 			pad_wait_press(PAD_WAIT_INFINITY);
@@ -938,7 +931,7 @@ static int load_rom_gfx4(void)
 	strcpy(fname, lorom_name);
 	if ((res = file_open(game_name, bios_zip, lorom_crc, fname)) < 0)
 	{
-		if (res == -1)
+		if (res == ROM_FILE_OPEN_NOT_FOUND)
 			error_file(fname);
 		else
 			error_crc(fname);
@@ -959,73 +952,73 @@ static int load_rom_gfx4(void)
 
 static int load_rom_sound1(void)
 {
+	int cache_candidate;
+
 	if (!option_sound_enable)
 	{
 		memory_length_sound1 = 0;
 		return 1;
 	}
-#ifndef LARGE_MEMORY
-	if (disable_sound)
+
+	cache_candidate = disable_sound;
+	if (cache_candidate && (!mvs_memory_plan_valid ||
+		!mvs_memory_plan.pcm_fully_resident ||
+		mvs_memory_plan.pcm_cache_bytes < memory_length_sound1 ||
+		memory_length_sound2 != 0))
 	{
 		return 1;
 	}
 
-	if ((memory_region_sound1 = malloc(memory_length_sound1)) == NULL)
+	if (cache_candidate)
 	{
+		/* The retained reserve exists to protect loader/cache setup allocations.
+		 * Once the final PCM buffer is committed, make that reserve available to
+		 * file/zip I/O instead of keeping it artificially occupied. */
+		memory_allocation_shape_release_reserve(&mvs_memory_shape);
+		memory_region_sound1 = mvs_memory_shape.pcm_memory;
+		mvs_memory_shape.pcm_memory = NULL;
+	}
+	else
+	{
+		memory_region_sound1 = malloc(memory_length_sound1);
+	}
+
+	if (memory_region_sound1 == NULL)
+	{
+		if (cache_candidate)
+		{
+			/* The empirical shape may choose streaming PCM instead. */
+			return 1;
+		}
+
 		error_memory("REGION_SOUND1");
 		return 0;
 	}
-#else
-	if ((memory_region_sound1 = malloc(memory_length_sound1)) == NULL)
-	{
-		if (disable_sound)
-		{
-			if ((memory_region_sound1 = psp2k_mem_alloc(memory_length_sound1)) == NULL)
-			{
-				return 1;
-			}
-		}
-		else
-		{
-			error_memory("REGION_SOUND1");
-			return 0;
-		}
-	}
 
-	disable_sound = 0;
-#endif
+	if (cache_candidate)
+		disable_sound = 0;
 
 	memset(memory_region_sound1, 0, memory_length_sound1);
 
 	if (encrypt_snd1)
 	{
-#if USE_CACHE
-		if (cache_type == CACHE_ZIPFILE)
+		int32_t fd = cachefile_open(CACHE_VROM);
+
+		if (fd >= 0)
 		{
-			int64_t zfd = zopen("vrom");
-			if (zfd == -1)
-			{
-				error_file("cache/vrom");
-				return 0;
-			}
 			msg_printf(TEXT(LOADING_DECRYPTED_SOUND1_ROM));
-			zread(zfd, memory_region_sound1, memory_length_sound1);
-			zclose(zfd);
+			{ ssize_t io_result = read(fd, memory_region_sound1, memory_length_sound1); (void)io_result; }
+			close(fd);
 		}
 		else
-#endif
 		{
-			int32_t fd;
-
-			if ((fd = cachefile_open(CACHE_VROM)) < 0)
+			if (cachefile_zip_read(CACHE_VROM, "vrom",
+				memory_region_sound1, memory_length_sound1) != memory_length_sound1)
 			{
 				error_file("cache/vrom");
 				return 0;
 			}
-
 			msg_printf(TEXT(LOADING_DECRYPTED_SOUND1_ROM));
-			read(fd, memory_region_sound1, memory_length_sound1);
-			close(fd);
 		}
 	}
 	else
@@ -1041,7 +1034,7 @@ static int load_rom_sound1(void)
 			strcpy(fname, snd1rom[i].name);
 			if ((res = file_open(game_name, parent, snd1rom[i].crc, fname)) < 0)
 			{
-				if (res == -1)
+				if (res == ROM_FILE_OPEN_NOT_FOUND)
 					error_file(fname);
 				else
 					error_crc(fname);
@@ -1055,6 +1048,10 @@ static int load_rom_sound1(void)
 			file_close();
 		}
 	}
+
+	if (cache_candidate)
+		msg_printf(TEXT(CACHE_USAGE_PCM),
+			memory_length_sound1 / 1024, memory_length_sound1 / 1024);
 
 	return 1;
 }
@@ -1089,7 +1086,7 @@ static int load_rom_sound2(void)
 		strcpy(fname, snd2rom[i].name);
 		if ((res = file_open(game_name, parent, snd2rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -1136,7 +1133,7 @@ static int load_rom_user1(int reload)
 		strcpy(fname, bios_name[neogeo_bios]);
 		if ((res = file_open(game_name, bios_zip, bios_crc[neogeo_bios], fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -1154,7 +1151,7 @@ static int load_rom_user1(int reload)
 		strcpy(fname, usr1rom[0].name);
 		if ((res = file_open(game_name, parent, usr1rom[0].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -1184,56 +1181,27 @@ static int load_rom_user1(int reload)
 
 	bios_amask = memory_length_user1 - 1;
 
-	neogeo_bios_patch_addr = patch;
-	neogeo_apply_bios_patch();
+	if (patch)
+	{
+		uint16_t *mem16 = (uint16_t *)memory_region_user1;
+		uint16_t value;
+
+		if (!neogeo_region)
+			value = mem16[0x00400 >> 1] & 0x03;
+		else
+			value = neogeo_region - 1;
+
+		if (!neogeo_machine_mode)
+			value |= mem16[0x00400 >> 1] & 0x8000;
+		else
+			value |= (neogeo_machine_mode - 1) ? 0x8000 : 0;
+
+		mem16[0x00400 >> 1] = value;
+		mem16[(patch + 0) >> 1] = 0x4e71;
+		mem16[(patch + 2) >> 1] = 0x4e71;
+	}
 
 	return 1;
-}
-
-
-/*--------------------------------------------------------
-	BIOS region / machine-mode patch
-
-	The NeoGeo BIOS holds its region byte at $C00400.  The PSP build
-	applies the user's Region / Machine Mode settings by patching that
-	byte (and NOP-ing out the BIOS region-check code) once, while loading
-	the BIOS in load_rom_user1().  The PS2 port's "Reset Game" only calls
-	neogeo_reset() (CPU/video/sound state reset, NO BIOS reload), so a
-	Region changed in the in-game Settings menu never took effect on
-	reset.  Extracting the patch here lets neogeo_reset() re-apply it to
-	the already-loaded BIOS in memory.
---------------------------------------------------------*/
-
-uint32_t neogeo_bios_patch_addr = 0;
-
-void neogeo_apply_bios_patch(void)
-{
-	uint16_t *mem16;
-	uint16_t value;
-
-	/* BIOSes that need no region-check patch (and the irrmaze special
-	 * case) leave the address at 0: the Region setting then has no
-	 * effect, exactly like the PSP build. */
-	if (!neogeo_bios_patch_addr)
-		return;
-	if (!memory_region_user1)
-		return;
-
-	mem16 = (uint16_t *)memory_region_user1;
-
-	if (!neogeo_region)
-		value = mem16[0x00400 >> 1] & 0x03;
-	else
-		value = neogeo_region - 1;
-
-	if (!neogeo_machine_mode)
-		value |= mem16[0x00400 >> 1] & 0x8000;
-	else
-		value |= (neogeo_machine_mode - 1) ? 0x8000 : 0;
-
-	mem16[0x00400 >> 1] = value;
-	mem16[(neogeo_bios_patch_addr + 0) >> 1] = 0x4e71;
-	mem16[(neogeo_bios_patch_addr + 2) >> 1] = 0x4e71;
 }
 
 /*--------------------------------------------------------
@@ -1266,7 +1234,7 @@ static int load_rom_user2(void)
 		strcpy(fname, usr2rom[i].name);
 		if ((res = file_open(game_name, parent, usr2rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -1291,6 +1259,7 @@ static int load_rom_user2(void)
 static int load_rom_info(const char *game_name)
 {
 	int32_t fd;
+	const char *rominfo_name = game_name;
 	char path[PATH_MAX];
 	char *buf;
 	char linebuf[256];
@@ -1319,7 +1288,12 @@ static int load_rom_info(const char *game_name)
 
 	disable_sound = 0;
 
-	sprintf(path, "%srominfo.mvs", launchDir);
+	/* Keep the legacy public set name used by the game list/cache table while
+	 * accepting the newer rominfo name for Fatal Fury Special set 2. */
+	if (strcmp(game_name, "fatfursa") == 0)
+		rominfo_name = "fatfurspa";
+
+	if (!path_format(path, sizeof(path), "%srominfo.mvs", launchDir)) return 0;
 
 	if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 	{
@@ -1332,7 +1306,7 @@ static int load_rom_info(const char *game_name)
 			return 3;	// Quick and dirty
 		}
 
-		read(fd, buf, size);
+		{ ssize_t io_result = read(fd, buf, size); (void)io_result; }
 		close(fd);
 
 		i = 0;
@@ -1371,7 +1345,7 @@ static int load_rom_info(const char *game_name)
 					init    = strtok(NULL, " ,");
 					rotate  = strtok(NULL, " ");
 
-					if (strcasecmp(name, game_name) == 0)
+					if (strcasecmp(name, rominfo_name) == 0)
 					{
 						if (str_cmp(parent, "neogeo") == 0)
 						{
@@ -1416,49 +1390,49 @@ static int load_rom_info(const char *game_name)
 
 					if (strcmp(type, "CPU1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu1);
+						sscanf(size, "%" SCNx32, &memory_length_cpu1);
 						encrypt_cpu1 = encrypted;
 						region = REGION_CPU1;
 					}
 					else if (strcmp(type, "CPU2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu2);
+						sscanf(size, "%" SCNx32, &memory_length_cpu2);
 						encrypt_cpu2 = encrypted;
 						region = REGION_CPU2;
 					}
 					else if (strcmp(type, "GFX2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_gfx2);
+						sscanf(size, "%" SCNx32, &memory_length_gfx2);
 						encrypt_gfx2 = encrypted;
 						region = REGION_GFX2;
 					}
 					else if (strcmp(type, "GFX3") == 0)
 					{
-						sscanf(size, "%x", &memory_length_gfx3);
+						sscanf(size, "%" SCNx32, &memory_length_gfx3);
 						encrypt_gfx3 = encrypted;
 						region = REGION_GFX3;
 					}
 					else if (strcmp(type, "SOUND1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_sound1);
+						sscanf(size, "%" SCNx32, &memory_length_sound1);
 						encrypt_snd1 = encrypted;
 						region = REGION_SOUND1;
 					}
 					else if (strcmp(type, "SOUND2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_sound2);
+						sscanf(size, "%" SCNx32, &memory_length_sound2);
 						region = REGION_SOUND2;
 					}
 					else if (strcmp(type, "USER1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_user1);
+						sscanf(size, "%" SCNx32, &memory_length_user1);
 						encrypt_usr1 = encrypted;
 						region = REGION_USER1;
 					}
 #if !RELEASE
 					else if (strcmp(type, "USER2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_user2);
+						sscanf(size, "%" SCNx32, &memory_length_user2);
 						region = REGION_USER2;
 					}
 #endif
@@ -1484,10 +1458,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
 						cpu1rom[num_cpu1rom].group = 0;
 						cpu1rom[num_cpu1rom].skip = 0;
@@ -1495,10 +1469,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_CPU2:
-						sscanf(type, "%x", &cpu2rom[num_cpu2rom].type);
-						sscanf(offset, "%x", &cpu2rom[num_cpu2rom].offset);
-						sscanf(length, "%x", &cpu2rom[num_cpu2rom].length);
-						sscanf(crc, "%x", &cpu2rom[num_cpu2rom].crc);
+						sscanf(type, "%" SCNx32, &cpu2rom[num_cpu2rom].type);
+						sscanf(offset, "%" SCNx32, &cpu2rom[num_cpu2rom].offset);
+						sscanf(length, "%" SCNx32, &cpu2rom[num_cpu2rom].length);
+						sscanf(crc, "%" SCNx32, &cpu2rom[num_cpu2rom].crc);
 						if (name) strcpy(cpu2rom[num_cpu2rom].name, name);
 						cpu2rom[num_cpu2rom].group = 0;
 						cpu2rom[num_cpu2rom].skip = 0;
@@ -1506,10 +1480,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_GFX2:
-						sscanf(type, "%x", &gfx2rom[num_gfx2rom].type);
-						sscanf(offset, "%x", &gfx2rom[num_gfx2rom].offset);
-						sscanf(length, "%x", &gfx2rom[num_gfx2rom].length);
-						sscanf(crc, "%x", &gfx2rom[num_gfx2rom].crc);
+						sscanf(type, "%" SCNx32, &gfx2rom[num_gfx2rom].type);
+						sscanf(offset, "%" SCNx32, &gfx2rom[num_gfx2rom].offset);
+						sscanf(length, "%" SCNx32, &gfx2rom[num_gfx2rom].length);
+						sscanf(crc, "%" SCNx32, &gfx2rom[num_gfx2rom].crc);
 						if (name) strcpy(gfx2rom[num_gfx2rom].name, name);
 						gfx2rom[num_gfx2rom].group = 0;
 						gfx2rom[num_gfx2rom].skip = 0;
@@ -1517,10 +1491,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_GFX3:
-						sscanf(type, "%x", &gfx3rom[num_gfx3rom].type);
-						sscanf(offset, "%x", &gfx3rom[num_gfx3rom].offset);
-						sscanf(length, "%x", &gfx3rom[num_gfx3rom].length);
-						sscanf(crc, "%x", &gfx3rom[num_gfx3rom].crc);
+						sscanf(type, "%" SCNx32, &gfx3rom[num_gfx3rom].type);
+						sscanf(offset, "%" SCNx32, &gfx3rom[num_gfx3rom].offset);
+						sscanf(length, "%" SCNx32, &gfx3rom[num_gfx3rom].length);
+						sscanf(crc, "%" SCNx32, &gfx3rom[num_gfx3rom].crc);
 						if (name) strcpy(gfx3rom[num_gfx3rom].name, name);
 						gfx3rom[num_gfx3rom].group = 0;
 						gfx3rom[num_gfx3rom].skip = 0;
@@ -1528,10 +1502,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_SOUND1:
-						sscanf(type, "%x", &snd1rom[num_snd1rom].type);
-						sscanf(offset, "%x", &snd1rom[num_snd1rom].offset);
-						sscanf(length, "%x", &snd1rom[num_snd1rom].length);
-						sscanf(crc, "%x", &snd1rom[num_snd1rom].crc);
+						sscanf(type, "%" SCNx32, &snd1rom[num_snd1rom].type);
+						sscanf(offset, "%" SCNx32, &snd1rom[num_snd1rom].offset);
+						sscanf(length, "%" SCNx32, &snd1rom[num_snd1rom].length);
+						sscanf(crc, "%" SCNx32, &snd1rom[num_snd1rom].crc);
 						if (name) strcpy(snd1rom[num_snd1rom].name, name);
 						snd1rom[num_snd1rom].group = 0;
 						snd1rom[num_snd1rom].skip = 0;
@@ -1539,10 +1513,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_SOUND2:
-						sscanf(type, "%x", &snd2rom[num_snd2rom].type);
-						sscanf(offset, "%x", &snd2rom[num_snd2rom].offset);
-						sscanf(length, "%x", &snd2rom[num_snd2rom].length);
-						sscanf(crc, "%x", &snd2rom[num_snd2rom].crc);
+						sscanf(type, "%" SCNx32, &snd2rom[num_snd2rom].type);
+						sscanf(offset, "%" SCNx32, &snd2rom[num_snd2rom].offset);
+						sscanf(length, "%" SCNx32, &snd2rom[num_snd2rom].length);
+						sscanf(crc, "%" SCNx32, &snd2rom[num_snd2rom].crc);
 						if (name) strcpy(snd2rom[num_snd2rom].name, name);
 						snd2rom[num_snd2rom].group = 0;
 						snd2rom[num_snd2rom].skip = 0;
@@ -1550,10 +1524,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_USER1:
-						sscanf(type, "%x", &usr1rom[num_usr1rom].type);
-						sscanf(offset, "%x", &usr1rom[num_usr1rom].offset);
-						sscanf(length, "%x", &usr1rom[num_usr1rom].length);
-						sscanf(crc, "%x", &usr1rom[num_usr1rom].crc);
+						sscanf(type, "%" SCNx32, &usr1rom[num_usr1rom].type);
+						sscanf(offset, "%" SCNx32, &usr1rom[num_usr1rom].offset);
+						sscanf(length, "%" SCNx32, &usr1rom[num_usr1rom].length);
+						sscanf(crc, "%" SCNx32, &usr1rom[num_usr1rom].crc);
 						if (name) strcpy(usr1rom[num_usr1rom].name, name);
 						usr1rom[num_usr1rom].group = 0;
 						usr1rom[num_usr1rom].skip = 0;
@@ -1562,10 +1536,10 @@ static int load_rom_info(const char *game_name)
 
 #if !RELEASE
 					case REGION_USER2:
-						sscanf(type, "%x", &usr2rom[num_usr2rom].type);
-						sscanf(offset, "%x", &usr2rom[num_usr2rom].offset);
-						sscanf(length, "%x", &usr2rom[num_usr2rom].length);
-						sscanf(crc, "%x", &usr2rom[num_usr2rom].crc);
+						sscanf(type, "%" SCNx32, &usr2rom[num_usr2rom].type);
+						sscanf(offset, "%" SCNx32, &usr2rom[num_usr2rom].offset);
+						sscanf(length, "%" SCNx32, &usr2rom[num_usr2rom].length);
+						sscanf(crc, "%" SCNx32, &usr2rom[num_usr2rom].crc);
 						if (name) strcpy(usr2rom[num_usr2rom].name, name);
 						usr2rom[num_usr2rom].group = 0;
 						usr2rom[num_usr2rom].skip = 0;
@@ -1594,10 +1568,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						sscanf(group, "%x", &cpu1rom[num_cpu1rom].group);
 						sscanf(skip, "%x", &cpu1rom[num_cpu1rom].skip);
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
@@ -1605,10 +1579,10 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_GFX3:
-						sscanf(type, "%x", &gfx3rom[num_gfx3rom].type);
-						sscanf(offset, "%x", &gfx3rom[num_gfx3rom].offset);
-						sscanf(length, "%x", &gfx3rom[num_gfx3rom].length);
-						sscanf(crc, "%x", &gfx3rom[num_gfx3rom].crc);
+						sscanf(type, "%" SCNx32, &gfx3rom[num_gfx3rom].type);
+						sscanf(offset, "%" SCNx32, &gfx3rom[num_gfx3rom].offset);
+						sscanf(length, "%" SCNx32, &gfx3rom[num_gfx3rom].length);
+						sscanf(crc, "%" SCNx32, &gfx3rom[num_gfx3rom].crc);
 						sscanf(group, "%x", &gfx3rom[num_gfx3rom].group);
 						sscanf(skip, "%x", &gfx3rom[num_gfx3rom].skip);
 						if (name) strcpy(gfx3rom[num_gfx3rom].name, name);
@@ -1650,6 +1624,8 @@ int memory_init(void)
 	memory_region_user2  = NULL;
 #endif
 	memory_region_user3  = NULL;
+	mvs_memory_plan_valid = 0;
+	memset(&mvs_memory_shape, 0, sizeof(mvs_memory_shape));
 
 	memory_length_cpu1   = 0;
 	memory_length_cpu2   = 0;
@@ -1669,12 +1645,7 @@ int memory_init(void)
 	gfx_pen_usage[1] = NULL;
 	gfx_pen_usage[2] = NULL;
 
-#ifdef LARGE_MEMORY
-	psp2k_mem_offset = PSP2K_MEM_TOP;
-	psp2k_mem_left   = PSP2K_MEM_SIZE;
-#endif
-
-#ifdef ADHOC
+	#ifdef ADHOC
 	if (adhoc_enable)
 	{
 		bios_select(2);
@@ -1700,7 +1671,7 @@ int memory_init(void)
 	{
 		/* Use fixed settings for some options during AdHoc communication */
 		neogeo_raster_enable = 0;
-		platform_cpuclock    = power_driver->getHighestCpuClock(power_data);
+		platform_performance_level    = power_get_highest_performance_level();
 		option_vsync         = 0;
 		option_autoframeskip = 0;
 		option_frameskip     = 0;
@@ -1712,7 +1683,7 @@ int memory_init(void)
 	}
 #endif
 
-	power_driver->setCpuClock(power_data, platform_cpuclock);
+	power_set_performance_level(platform_performance_level);
 
 	msg_printf(TEXT(CHECKING_BIOS));
 
@@ -1724,7 +1695,9 @@ int memory_init(void)
 	if (res < 0)
 	{
 		pad_wait_clear();
-		video_driver->clearScreen(video_data);
+		/* Keep the already-rendered "Load ROM / Checking BIOS" screen visible
+		 * while bios_select() scans neogeo.zip. Clearing here left PS2 users
+		 * staring at a black screen for several seconds on first boot. */
 		bios_select(1);
 		if (neogeo_bios == -1)
 		{
@@ -1747,7 +1720,7 @@ int memory_init(void)
 		{
 		case 1: msg_printf(TEXT(THIS_GAME_NOT_SUPPORTED)); break;
 		case 2: msg_printf(TEXT(ROM_NOT_FOUND)); break;
-		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND)); break;
+		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND_MVS)); break;
 		}
 		msg_printf(TEXT(PRESS_ANY_BUTTON2));
 		pad_wait_press(PAD_WAIT_INFINITY);
@@ -1817,39 +1790,53 @@ int memory_init(void)
 #if !RELEASE
 	if (load_rom_user2() == 0) return 0;
 #endif
-	if (load_rom_cpu1() == 0) return 0;
-	if (load_rom_user1(0) == 0) return 0;
-	if (load_rom_cpu2() == 0) return 0;
-	if (load_rom_gfx1() == 0) return 0;
-	if (load_rom_gfx2() == 0) return 0;
-	if (load_rom_gfx4() == 0) return 0;
+		if (load_rom_cpu1() == 0) return 0;
+		if (load_rom_user1(0) == 0) return 0;
+		if (load_rom_cpu2() == 0) return 0;
+		if (load_rom_gfx1() == 0) return 0;
+		if (load_rom_gfx2() == 0) return 0;
+		if (load_rom_gfx4() == 0) return 0;
 
-	if (load_rom_sound1() == 0) return 0;
-
-#ifdef LARGE_MEMORY
-	if (psp2k_mem_left != PSP2K_MEM_SIZE)
+	/* Load non-cache sound regions before probing so the empirical shape sees the
+	 * heap exactly as the C-ROM allocation will see it. SOUND_DISABLE sets keep
+	 * SOUND1 as the secondary probe/cache region. */
+	if (option_sound_enable && !disable_sound)
 	{
-		// If sound1 was allocated in extended memory
-
-		// To maximize cache area, move movable memory that has been allocated so far
-		// to extended memory.
-		// Move in reverse order of allocation to create the largest contiguous free area.
-
-		memory_region_user3 = psp2k_mem_move(memory_region_user3, memory_length_user3);
-		memory_region_gfx4  = psp2k_mem_move(memory_region_gfx4,  memory_length_gfx4);
-		memory_region_gfx2  = psp2k_mem_move(memory_region_gfx2,  memory_length_gfx2);
-		memory_region_gfx1  = psp2k_mem_move(memory_region_gfx1,  memory_length_gfx1);
-		memory_region_cpu2  = psp2k_mem_move(memory_region_cpu2,  memory_length_cpu2);
-		memory_region_user1 = psp2k_mem_move(memory_region_user1, memory_length_user1);
-		memory_region_cpu1  = psp2k_mem_move(memory_region_cpu1,  memory_length_cpu1);
-
-		gfx_pen_usage[2] = psp2k_mem_move(gfx_pen_usage[2], memory_length_gfx3 / 128);
-		gfx_pen_usage[1] = psp2k_mem_move(gfx_pen_usage[1], memory_length_gfx2 / 32);
-		gfx_pen_usage[0] = psp2k_mem_move(gfx_pen_usage[0], memory_length_gfx1 / 32);
+		if (load_rom_sound1() == 0) return 0;
+		if (load_rom_sound2() == 0) return 0;
 	}
-#endif
 
-	if (load_rom_sound2() == 0) return 0;
+	{
+		memory_probe_constraints_t constraints;
+		game_memory_requirements_t requirements;
+		memory_probe_constraints_default(&constraints);
+		memset(&requirements, 0, sizeof(requirements));
+		requirements.core = MEMORY_PLAN_CORE_MVS;
+		requirements.gfx_or_crom_bytes = memory_length_gfx3;
+		if (option_sound_enable && disable_sound)
+			requirements.pcm_or_vrom_bytes = memory_length_sound1;
+
+		mvs_memory_plan_valid = memory_plan_allocate_shape(&requirements, &constraints,
+			&mvs_memory_shape);
+		if (mvs_memory_plan_valid)
+		{
+			mvs_memory_plan = mvs_memory_shape.plan;
+			memory_plan_log(&mvs_memory_plan);
+		}
+		else
+		{
+			printf("[memory_plan] MVS empirical probe has no viable cache shape\n");
+			msg_printf(TEXT(MEMORY_NOT_ENOUGH));
+			Loop = LOOP_BROWSER;
+			return 0;
+		}
+	}
+
+	if (option_sound_enable && disable_sound)
+	{
+		if (load_rom_sound1() == 0) return 0;
+		if (load_rom_sound2() == 0) return 0;
+	}
 	if (load_rom_gfx3() == 0) return 0;
 
 	if (disable_sound)
@@ -1957,6 +1944,7 @@ int memory_init(void)
 	case INIT_svcsplus:
 #endif
 	case INIT_kof2003:
+	case INIT_kof2003h:
 		neogeo_protection_r = pvc_protection_r;
 		neogeo_protection_w = pvc_protection_w;
 		break;
@@ -2082,28 +2070,8 @@ void memory_shutdown(void)
 	int i;
 
 	cache_shutdown();
+	memory_allocation_shape_release(&mvs_memory_shape);
 
-#ifdef LARGE_MEMORY
-	for (i = 0; i < 3; i++)
-		psp2k_mem_free(gfx_pen_usage[i]);
-
-	psp2k_mem_free(memory_region_cpu1);
-	psp2k_mem_free(memory_region_cpu2);
-	psp2k_mem_free(memory_region_gfx1);
-	psp2k_mem_free(memory_region_gfx2);
-	psp2k_mem_free(memory_region_gfx3);
-	psp2k_mem_free(memory_region_gfx4);
-	psp2k_mem_free(memory_region_sound1);
-	psp2k_mem_free(memory_region_sound2);
-	psp2k_mem_free(memory_region_user1);
-#if !RELEASE
-	psp2k_mem_free(memory_region_user2);
-#endif
-	psp2k_mem_free(memory_region_user3);
-
-	psp2k_mem_offset = PSP2K_MEM_TOP + PSP2K_MEM_SIZE;
-	psp2k_mem_left   = PSP2K_MEM_SIZE;
-#else
 	for (i = 0; i < 3; i++)
 	{
 		if (gfx_pen_usage[i])
@@ -2121,9 +2089,8 @@ void memory_shutdown(void)
 	if (memory_region_user1)  free(memory_region_user1);
 #if !RELEASE
 	if (memory_region_user2)  free(memory_region_user2);
-#endif
+	#endif
 	if (memory_region_user3)  free(memory_region_user3);
-#endif
 }
 
 

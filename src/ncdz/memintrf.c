@@ -8,8 +8,24 @@
 
 #include <fcntl.h>
 #include <limits.h>
-#include <zlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <miniz.h>
 #include "ncdz.h"
+#include "common/cmdlist.h"
+#include "common/emulator_runtime.h"
+#include "common/loadrom.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/config.h"
 #include "common/memory_sizes.h"
 
 #define M68K_AMASK M68K_ADDR_MASK
@@ -77,9 +93,9 @@ uint8_t neogeo_memcard[0x2000];
 static uint8_t *memory_allocate(int type, uint32_t length)
 {
 	uint8_t *mem;
-	const char *region_name[6] =
+	const char *region_name[7] =
 	{
-		"CPU1","CPU2","GFX1","GFX2","SOUND1","USER1"
+		"CPU1","CPU2","GFX1","GFX2","GFX3","SOUND1","USER1"
 	};
 
 	if ((mem = malloc(length)) == NULL)
@@ -255,15 +271,15 @@ static int load_bios(void)
 	const char *lorom_name = "000-lo.lo";
 	char path[PATH_MAX];
 
-	sprintf(path, "%s%s", launchDir, bios_name);
+	if (!path_format(path, sizeof(path), "%s%s", launchDir, bios_name)) return 0;
 
 	if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 	{
 		msg_printf(TEXT(LOADING), bios_name);
-		read(fd, memory_region_user1, 0x80000);
+		{ ssize_t io_result = read(fd, memory_region_user1, 0x80000); (void)io_result; }
 		close(fd);
 
-		if (crc32(0, memory_region_user1, 0x80000) == 0xdf9de490)
+		if (mz_crc32(0, memory_region_user1, 0x80000) == 0xdf9de490)
 		{
 			uint16_t *mem16 = (uint16_t *)memory_region_user1;
 
@@ -288,15 +304,15 @@ static int load_bios(void)
 			mem16[0xa87c >> 1] = 0x0010;
 			mem16[0xa87e >> 1] = 0xfdae;
 
-			sprintf(path, "%s%s", launchDir, lorom_name);
+			if (!path_format(path, sizeof(path), "%s%s", launchDir, lorom_name)) return 0;
 
 			if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 			{
 				msg_printf(TEXT(LOADING), lorom_name);
-				read(fd, memory_region_gfx3, 0x20000);
+				{ ssize_t io_result = read(fd, memory_region_gfx3, 0x20000); (void)io_result; }
 				close(fd);
 
-				if (crc32(0, memory_region_gfx3, 0x20000) == 0x5a86cff2)
+				if (mz_crc32(0, memory_region_gfx3, 0x20000) == 0x5a86cff2)
 				{
 					return build_zoom_tables();
 				}
@@ -378,17 +394,17 @@ int memory_init(void)
 	load_commandlist(game_name, NULL);
 #endif
 
-	power_driver->setCpuClock(power_data, platform_cpuclock);
+	power_set_performance_level(platform_performance_level);
 
 	{
-		uint32_t fd;
+		int32_t fd;
 		char path[PATH_MAX];
 
-		sprintf(path, "%s%s", launchDir, "backup.bin");
+		if (!path_format(path, sizeof(path), "%s%s", launchDir, "backup.bin")) return 0;
 
 		if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 		{
-			read(fd, neogeo_memcard, 0x2000);
+			{ ssize_t io_result = read(fd, neogeo_memcard, 0x2000); (void)io_result; }
 			close(fd);
 		}
 	}
@@ -406,11 +422,11 @@ void memory_shutdown(void)
 	int32_t fd;
 	char path[PATH_MAX];
 
-	sprintf(path, "%s%s", launchDir, "backup.bin");
+	if (!path_format(path, sizeof(path), "%s%s", launchDir, "backup.bin")) return;
 
 	if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
 	{
-		write(fd, neogeo_memcard, 0x2000);
+		{ ssize_t io_result = write(fd, neogeo_memcard, 0x2000); (void)io_result; }
 		close(fd);
 	}
 

@@ -27,16 +27,12 @@ typedef struct audio_driver
 	void (*srcOutputBlocking)(void *data, int32_t volume, void *buffer, uint32_t size);
 	void (*outputPannedBlocking)(void *data, int leftvol, int rightvol, void *buffer, uint32_t size);
 	void (*release)(void *data);
+	/* Optional native stream pause/mute hook. The common sound thread keeps
+	 * feeding silent buffers so queued backends can drain stale audio safely. */
+	void (*setPaused)(void *data, bool paused);
 } audio_driver_t;
 
 
-extern audio_driver_t audio_psp;
-extern audio_driver_t audio_ps2;
-extern audio_driver_t audio_desktop;
-extern audio_driver_t audio_null;
-
-extern audio_driver_t *audio_drivers[];
-
-#define audio_driver audio_drivers[0]
+extern audio_driver_t *const audio_driver;
 
 #endif /* AUDIO_DRIVER_H */

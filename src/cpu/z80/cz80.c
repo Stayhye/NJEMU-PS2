@@ -11,8 +11,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "emumain.h"
+#include "emucfg.h"
 #include "cz80.h"
+
+#if (EMU_SYSTEM == CPS1)
+#include "cps1/memintrf.h"
+#elif (EMU_SYSTEM == CPS2)
+#include "cps2/memintrf.h"
+#elif (EMU_SYSTEM == MVS)
+#include "mvs/memintrf.h"
+#elif (EMU_SYSTEM == NCDZ)
+#include "ncdz/memintrf.h"
+#endif
 
 
 #define CF					0x01
@@ -67,6 +77,7 @@ static uint8_t ALIGN16_DATA SZHVC_sub[2*256*256];
 
 static int32_t Cz80_Interrupt_Callback(int32_t line)
 {
+	(void)line;
 	return 0xff;
 }
 

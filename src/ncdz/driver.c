@@ -7,9 +7,29 @@
 ******************************************************************************/
 
 #include <limits.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include "ncdz.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "ncdz/resource_source.h"
+#include "common/palette_convert.h"
 
 void swab(const void *restrict src, void *restrict dest, ssize_t nbytes);
+
+static void byte_swap_pairs_in_place(uint8_t *data, size_t length)
+{
+	size_t i;
+	for (i = 0; i + 1 < length; i += 2)
+	{
+		uint8_t tmp = data[i];
+		data[i] = data[i + 1];
+		data[i + 1] = tmp;
+	}
+}
 
 #define IRQ1CTRL_ENABLE				0x10
 #define IRQ1CTRL_LOAD_RELATIVE		0x20
@@ -97,10 +117,11 @@ static void raster_interrupt_aof2(int line);
 
 int neogeo_check_game(void)
 {
-	FILE *fp;
+	int posix_fd;
 	char fname[16], path[PATH_MAX], linebuf[128];
 	int i, found = 0, NGH_number;
-	int64_t fd;
+	resource_file_t file = {0};
+	resource_file_info_t info;
 
 	neogeo_ngh = 0;
 	hack_irq = 0;
@@ -115,41 +136,53 @@ int neogeo_check_game(void)
 		strcpy(game_name, default_name);
 		game_index = 0;
 
-		sprintf(path, "%sIPL.TMP", launchDir);
+		if (!path_format(path, sizeof(path), "%sIPL.TMP", launchDir)) return 0;
 
-		zip_open(game_dir);
+		if (!resource_source_stat(&ncdz_game_source, "IPL.TXT", &info) ||
+			info.size > memory_length_cpu1)
+			return 0;
+		i = (int)info.size;
 
-		i = zlength("IPL.TXT");
+		if (!resource_file_open(&ncdz_game_source, "IPL.TXT", &file))
+			return 0;
+		if (resource_file_read(&file, memory_region_cpu1, (size_t)i) != (size_t)i ||
+			!resource_file_close(&file))
+			return 0;
 
-		if ((fd = zopen("IPL.TXT")) == -1)
+		posix_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (posix_fd < 0)
 		{
-			zip_close();
 			return 0;
 		}
-		zread(fd, memory_region_cpu1, i);
-		zclose(fd);
-		zip_close();
+		{ ssize_t io_result = write(posix_fd, memory_region_cpu1, i); (void)io_result; }
+		close(posix_fd);
 
-		if ((fp = fopen(path, "w")) == NULL)
-		{
-			return 0;
-		}
-		fwrite(memory_region_cpu1, 1, i, fp);
-		fclose(fp);
-
-		if ((fp = fopen(path, "r")) == NULL)
+		posix_fd = open(path, O_RDONLY);
+		if (posix_fd < 0)
 		{
 			remove(path);
 			return 0;
 		}
 
-		while (fgets(linebuf, 127, fp))
+		while (1)
 		{
-			char *strfname = strtok(linebuf, ",\r\n");
-			char *strbank  = strtok(NULL, ",\r\n");
-			char *stroffs  = strtok(NULL, ",\r\n");
-			char *ext;
+			ssize_t n;
+			char c, *strfname, *strbank, *stroffs, *ext;
 			int bank, offs;
+
+			/* read one line manually */
+			n = 0;
+			while (n < 127) {
+				if (read(posix_fd, &c, 1) <= 0) break;
+				linebuf[n++] = c;
+				if (c == '\n') break;
+			}
+			if (n == 0) break;
+			linebuf[n] = '\0';
+
+			strfname = strtok(linebuf, ",\r\n");
+			strbank  = strtok(NULL, ",\r\n");
+			stroffs  = strtok(NULL, ",\r\n");
 
 			if (strfname == NULL || strbank == NULL || stroffs == NULL)
 				break;
@@ -168,24 +201,19 @@ int neogeo_check_game(void)
 				}
 			}
 		}
-		fclose(fp);
+		close(posix_fd);
 
 		remove(path);
 
 		if (!found) return 0;
 
-		zip_open(game_dir);
-		if ((fd = zopen(fname)) == -1)
-		{
-			zip_close();
+		if (!resource_file_open(&ncdz_game_source, fname, &file))
 			return 0;
-		}
+		if (resource_file_read(&file, memory_region_cpu1, 0x110) != 0x110 ||
+			!resource_file_close(&file))
+			return 0;
 
-		zread(fd, memory_region_cpu1, 0x110);
-		zclose(fd);
-		zip_close();
-
-		swab(memory_region_cpu1, memory_region_cpu1, 0x110);
+		byte_swap_pairs_in_place(memory_region_cpu1, 0x110);
 		memcpy(neogeo_game_vectors, memory_region_cpu1, 0x100);
 
 		NGH_number = m68000_read_memory_16(0x108);
@@ -940,12 +968,6 @@ static inline WRITE16_HANDLER( exmem_latch_clear_w )
 	Set uploading flag ($ff0161)
 ------------------------------------------------------*/
 
-static inline WRITE16_HANDLER( upload_executing_w )
-{
-	upload_executing = data & 0xff;
-}
-
-
 /*------------------------------------------------------
 	Z80 reset / enable ($ff0183)
 ------------------------------------------------------*/
@@ -1133,7 +1155,7 @@ WRITE16_HANDLER( neogeo_paletteram_w )
 	COMBINE_DATA(addr);
 
 	if (offset & 0x0f)
-		video_palette[offset] = video_clut16[*addr & 0x7fff];
+		video_palette[offset] = neogeo_palette_to_555(*addr);
 }
 
 

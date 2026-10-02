@@ -6,7 +6,23 @@
 
 ***************************************************************************/
 
-#include "emumain.h"
+#include "emucfg.h"
+#include "common/adhoc.h"
+#include "common/adhoc_transport.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/runtime_paths.h"
+#include "common/ui.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui_draw.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pspdisplay.h>
+#include <pspkernel.h>
 #include <pspsdk.h>
 #include <pspnet.h>
 #include <pspwlan.h>
@@ -106,6 +122,12 @@ static unsigned char adhoc_buffer[ADHOC_BUFFER_SIZE];
 static unsigned char adhoc_work[ADHOC_BUFFER_SIZE];
 
 
+static bool adhoc_net_modules_supported(void)
+{
+	return sceKernelDevkitVersion() >= 0x02000010;
+}
+
+
 /***************************************************************************
 	Local Functions
 ***************************************************************************/
@@ -125,7 +147,7 @@ static void adhoc_init_progress(int total, const char *text)
 	sprintf(buf, "AdHoc - %s", game_name);
 	uifont_print(32, 5, UI_COLOR(UI_PAL_TITLE), buf);
 
-	video_driver->copyRect(video_data, draw_frame, work_frame, &full_rect, &full_rect);
+	video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER, COMMON_GRAPHIC_OBJECTS_SCREEN_BITMAP, &full_rect, &full_rect);
 
 	init_progress(total, text);
 }
@@ -219,14 +241,14 @@ static void DisplayPspList(int top, int rows)
 {
 	if (max == 0)
 	{
-		msg_printf(TEXT(WAITING_FOR_ANOTHER_PSP_TO_JOIN));
+		msg_printf(TEXT(WAITING_FOR_ANOTHER_PLAYER_TO_JOIN));
 	}
 	else
 	{
 		int i;
 		char temp[20];
 
-		video_driver->copyRect(video_data, show_frame, draw_frame, &full_rect, &full_rect);
+		video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER, &full_rect, &full_rect);
 
 		draw_scrollbar(470, 26, 479, 270, rows, max, pos);
 
@@ -254,7 +276,7 @@ static void DisplayPspList(int top, int rows)
 
 
 /*--------------------------------------------------------
-	‘I‘ğ’†‚ÌPSP‚Ìî•ñ‚ğæ“¾
+	ï¿½Iï¿½ğ’†‚ï¿½PSPï¿½Ìï¿½ï¿½ï¿½ï¿½æ“¾
 --------------------------------------------------------*/
 
 static int GetPspEntry(unsigned char *mac, char *name)
@@ -363,7 +385,7 @@ int adhocLoadModules(void)
 #ifdef KERNEL_MODE
 	return adhoc_modules_loaded;
 #else
-	if (platform_driver->getDevkitVersion(platform_data) >= 0x02000010)
+	if (adhoc_net_modules_supported())
 	{
 		int error;
 
@@ -389,7 +411,7 @@ int adhocUnloadModules(void)
 #ifdef KERNEL_MODE
 	return 0;
 #else
-	if (platform_driver->getDevkitVersion(platform_data) >= 0x02000010)
+	if (adhoc_net_modules_supported())
 	{
 		int error;
 
@@ -406,8 +428,14 @@ int adhocUnloadModules(void)
 }
 
 
+bool adhocNetworkAvailable(void)
+{
+	return sceWlanGetSwitchState() != 0;
+}
+
+
 /*--------------------------------------------------------
-	‰Šú‰»
+	ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 --------------------------------------------------------*/
 
 #if (EMU_SYSTEM == CPS1)
@@ -530,7 +558,7 @@ int adhocInit(const char *matchingData)
 
 
 /*--------------------------------------------------------
-	Ø’f
+	ï¿½Ø’f
 --------------------------------------------------------*/
 
 int adhocTerm(void)
@@ -648,7 +676,7 @@ static int adhocStartP2P(void)
 	sprintf(message, TEXT(CONNECTING_TO_x), Server ? TEXT(CLIENT) : TEXT(SERVER));
 	adhoc_init_progress(4, message);
 
-	if ((error = sceNetAdhocctlConnect(g_ssid)) == 0)
+	if ((error = sceNetAdhocctlConnect((const char *)g_ssid)) == 0)
 	{
 		update_progress();
 		do
@@ -713,7 +741,7 @@ static int adhocStartP2P(void)
 
 
 /*--------------------------------------------------------
-	Ú‘±æ‚Ì‘I‘ğ
+	ï¿½Ú‘ï¿½ï¿½ï¿½Ì‘Iï¿½ï¿½
 --------------------------------------------------------*/
 
 int adhocSelect(void)
@@ -1018,7 +1046,7 @@ int adhocRecvSendAck(void *buffer, int length, int timeout, int type)
 
 
 /*--------------------------------------------------------
-	‘Šè‚Æ‚Ì“¯Šú‚ğ‘Ò‚Â
+	ï¿½ï¿½ï¿½ï¿½Æ‚Ì“ï¿½ï¿½ï¿½ï¿½ï¿½Ò‚ï¿½
 --------------------------------------------------------*/
 
 int adhocSync(void)
@@ -1077,7 +1105,7 @@ check_packet:
 
 /*--------------------------------------------------------
 	Receive data of specified size or until buffer is empty
-	‚È‚é‚Ü‚Å‘Ò‚Â
+	ï¿½È‚ï¿½Ü‚Å‘Ò‚ï¿½
 --------------------------------------------------------*/
 
 void adhocWait(int data_size)

@@ -6,7 +6,22 @@
 
 ******************************************************************************/
 
+#include <stdio.h>
 #include "cps2.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#include "common/adhoc_transport.h"
+#endif
+#include "common/cache.h"
+#include "common/cmdlist.h"
+#include "common/emulator_runtime.h"
+#include "common/runtime_paths.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/filer.h"
+#include "common/config.h"
 
 
 /* Per-target texture atlas descriptions required by the video driver.
@@ -177,14 +192,18 @@ static void apply_cheat()
     //Se busca cual es el option habilitado
     a_cheat_option = a_cheat->cheat_option[ a_cheat->curr_option];
     if( a_cheat_option == NULL)
+    {
 		break; //seguro
+    }
 
 		//Se ejecutan todos los value del cheat option
 		for(  j = 0; j< a_cheat_option->num_cheat_values; j++)
 		{
 		a_cheat_value = a_cheat_option->cheat_value[j];
 			if( a_cheat_value == NULL)
+			{
 				break;//seguro
+			}
 				m68000_write_memory_8(a_cheat_value->address,  a_cheat_value->value);
 
 		}
@@ -221,12 +240,9 @@ static void cps2_run(void)
 			}
 			
 			apply_cheat();//davex
-			/* Input before CPU (SNESticleRevive order): the pad snapshot
-			 * taken now is what this frame's emulation sees, instead of
-			 * the previous frame's late sample. */
-			update_inputport();
 			timer_update_cpu();
 			update_screen();
+			update_inputport();
 		}
 
 		video_driver->clearScreen(video_data);
@@ -265,7 +281,10 @@ void cps2_main(void)
 				{
 					if (cps2_init())
 					{
-						cps2_run();
+						if (emu_test_exit_after_init())
+							Loop = LOOP_EXIT;
+						else
+							cps2_run();
 					}
 					cps2_exit();
 				}

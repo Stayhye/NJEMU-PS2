@@ -6,10 +6,56 @@
 
 ******************************************************************************/
 
-#include <unistd.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdbool.h>
+#include <stdarg.h>
 #include <stdio.h>
-#include "emumain.h"
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "emucfg.h"
+#include "common/ui_draw.h"
+#include "common/ui_layout.h"
+#include "common/ui.h"
+#include "common/png_io.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/emulator_video.h"
+#include "common/filer.h"
+#include "common/frame_pacing.h"
+#include "common/input_driver.h"
+#include "common/platform_driver.h"
+#include "common/platform_memory_info.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/sound.h"
+#include "common/thread_driver.h"
+#include "common/ticker_driver.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/video_geometry.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#if USE_CACHE
+#include "common/cache.h"
+#endif
+#if (EMU_SYSTEM == NCDZ)
+#include "common/mp3.h"
+#endif
+
+#if (EMU_SYSTEM == CPS1)
+#include "cps1/cps1.h"
+#elif (EMU_SYSTEM == CPS2)
+#include "cps2/cps2.h"
+#elif (EMU_SYSTEM == MVS)
+#include "mvs/mvs.h"
+#elif (EMU_SYSTEM == NCDZ)
+#include "ncdz/ncdz.h"
+#endif
 
 
 #define FRAMESKIP_LEVELS	12
@@ -23,17 +69,18 @@ char game_name[16];
 char parent_name[16];
 
 char game_dir[PATH_MAX];
-#if USE_CACHE
+/* Phase 2b.5-prep: always declared so CPS2 doesn't need a duplicate
+ * declaration in cps2/memintrf.c. Unused on CPS1/NCDZ where USE_CACHE=0
+ * (small bytes-of-bss cost). */
 char cache_dir[PATH_MAX];
 char cache_parent_name[16];
-#endif
 
 int option_showfps;
 int option_speedlimit;
 int option_autoframeskip;
 int option_frameskip;
 int option_vsync;
-int option_stretch;
+int option_display_mode;
 
 int option_sound_enable;
 int option_samplerate;
@@ -48,11 +95,9 @@ int machine_sound_type;
 uint32_t frames_displayed;
 int fatal_error;
 
-char launchDir[PATH_MAX];
-char screenshotDir[PATH_MAX];
-bool systembuttons_available;
+char launchDir[PATH_MAX] = {0};
+char screenshotDir[PATH_MAX] = {0};
 void *platform_data = NULL;
-void *power_data = NULL;
 
 /******************************************************************************
 	Local Variables
@@ -97,7 +142,9 @@ static int show_frames_each_second = 0;
 	Global Variables/Structures
 ******************************************************************************/
 
+#ifdef PSP
 uint8_t ALIGN16_DATA gulist[GULIST_SIZE];
+#endif
 RECT full_rect = { 0, 0, SCR_WIDTH, SCR_HEIGHT };
 
 /******************************************************************************
@@ -115,7 +162,7 @@ volatile int Sleep;
 	FPS Display
 --------------------------------------------------------*/
 
-static void show_fps(void)
+static void show_fps(bool draw)
 {
 	size_t sx;
 	char buf[32];
@@ -126,8 +173,16 @@ static void show_fps(void)
 		game_speed_percent,
 		frames_per_second);
 
-	sx = 2; /* left-align top-left corner (right-aligned ran off-screen) */
-	printf("%s\n", buf);
+#if !defined(GUI)
+	/* NO_GUI now suppresses menus only; avoid the old per-frame console output
+	 * when the FPS HUD is being drawn. */
+	if (!draw)
+		printf("%s\n", buf);
+#endif
+	if (!draw)
+		return;
+
+	sx = (size_t)ui_layout_get()->logical_width - (strlen(buf) << 3);
 	small_font_print((int)sx, 0, buf, 1);
 }
 
@@ -138,9 +193,11 @@ static void show_fps(void)
 
 static void show_battery_warning(void)
 {
-	if (!power_driver->isBatteryCharging(power_data))
+	power_battery_status_t battery;
+
+	if (power_query_battery_status(&battery) && !battery.charging)
 	{
-		int bat = power_driver->batteryLifePercent(power_data);
+		int bat = battery.percent;
 
 		if (bat < 10)
 		{
@@ -186,6 +243,45 @@ void emu_main(void)
 #endif
 }
 
+bool emu_test_exit_after_init(void)
+{
+#if defined(DESKTOP)
+	const char *value = getenv("NJEMU_TEARDOWN_TEST");
+	return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+#else
+	return false;
+#endif
+}
+
+static uint32_t emu_test_frame_limit(void)
+{
+#if defined(DESKTOP)
+	static bool initialized;
+	static uint32_t frame_limit;
+
+	if (!initialized)
+	{
+		const char *value = getenv("NJEMU_TEST_FRAME_LIMIT");
+		char *end = NULL;
+		unsigned long parsed = 0;
+
+		if (value != NULL && value[0] != '\0')
+		{
+			parsed = strtoul(value, &end, 10);
+			if (end == value || *end != '\0' || parsed > UINT32_MAX)
+				parsed = 0;
+		}
+
+		frame_limit = (uint32_t)parsed;
+		initialized = true;
+	}
+
+	return frame_limit;
+#else
+	return 0;
+#endif
+}
+
 
 /*--------------------------------------------------------
 	Initialize Frameskip
@@ -226,21 +322,28 @@ void update_screen(void)
 {
 	uint8_t skipped_it = skiptable[frameskip][frameskip_counter];
 
-	if (show_frames_each_second && (frames_displayed % 60) == 0)
+	if (show_frames_each_second && !option_showfps &&
+		(frames_displayed % 60) == 0)
 	{
-		show_fps();
+		show_fps(false);
 	}
 
 	if (!skipped_it)
 	{
-		if (option_showfps) show_fps();
-		draw_volume_status(1);
+		/* Target rendering has already completed its frame at this point. UI
+		 * primitives (notably PSP GU draws) require their own valid backend
+		 * frame, so submit the optional FPS HUD as a small overlay pass. */
+		if (option_showfps)
+		{
+			video_driver->beginFrame(video_data);
+			show_fps(true);
+			video_driver->endFrame(video_data);
+		}
 		show_battery_warning();
 		ui_show_popup(1);
 	}
 	else
 	{
-		draw_volume_status(0);
 		ui_show_popup(0);
 	}
 
@@ -254,72 +357,65 @@ void update_screen(void)
 	if (frameskip_counter == 0)
 		this_frame_base = last_skipcount0_time + (int)((float)FRAMESKIP_LEVELS * TICKS_PER_FRAME);
 
-	/* frames_displayed is advanced once per frame at the render entry
-	 * (cps1/cps2/mvs/ncdz screenrefresh) so tile-cache age stamps are
-	 * correct DURING rendering. Only the FPS counter advances here. */
+	frames_displayed++;
 	frames_since_last_fps++;
+	{
+		uint32_t test_frame_limit = emu_test_frame_limit();
+		if (test_frame_limit != 0 && frames_displayed >= test_frame_limit)
+			Loop = LOOP_EXIT;
+	}
 
 	if (!skipped_it)
 	{
 		uint64_t curr = ticker_driver->currentUs(ticker_data);
-		int flip = 0;
+		uint64_t target = this_frame_base +
+			(int)((float)frameskip_counter * TICKS_PER_FRAME);
+		bool sync_flip = frame_pacing_should_sync_flip(
+			option_speedlimit != 0, option_vsync != 0, curr, target);
+		bool scheduler_blocked = sync_flip;
 
-		/* Vsync is independent of the frame limiter: when enabled, always
-		 * wait for the vsync so the picture never tears - even when
-		 * Frame Limit is off (the old code only vsync'd inside the
-		 * speedlimit block, so disabling Frame Limit silently disabled
-		 * vsync and tore badly on heavy games like dino). */
-		if (option_vsync)
+		/* With software pacing but no useful VBlank wait, reach the emulation
+		 * deadline before presenting. If VSync is useful, present first: waiting
+		 * for VBlank may consume most/all of the remaining budget. */
+		if (option_speedlimit && !sync_flip)
 		{
-			video_driver->flipScreen(video_data, 1);
-			flip = 1;
+			uint64_t delay = frame_pacing_sleep_us(true, curr, target);
+			if (delay != 0)
+			{
+				usleep(delay);
+				scheduler_blocked = true;
+			}
 		}
 
-		if (option_speedlimit && !flip)
-		{
-			uint64_t target = this_frame_base + (int)((float)frameskip_counter * TICKS_PER_FRAME);
+		video_driver->flipScreen(video_data, sync_flip);
+		curr = ticker_driver->currentUs(ticker_data);
 
-			/* Original PS2-port frame limiter (v20/v21): a single usleep to
-			 * the target deadline, then one fresh clock read. Kept per user
-			 * decision - the original timing is not the cause of the sf2
-			 * audio slowdown (that was a rominfo conversion bug). */
-			if (target > curr) usleep(target - curr);
-			curr = ticker_driver->currentUs(ticker_data);
+		/* A synchronous flip blocks until VBlank. Re-sample the clock before
+		 * applying the software limit so that VSync time is never counted twice. */
+		if (option_speedlimit && sync_flip)
+		{
+			uint64_t delay = frame_pacing_sleep_us(true, curr, target);
+			if (delay != 0)
+			{
+				usleep(delay);
+				scheduler_blocked = true;
+				curr = ticker_driver->currentUs(ticker_data);
+			}
 		}
-		/* If the frame overshot its deadline just flip immediately -
-		 * forcing a vsync here drops the whole emulator to 30fps with
-		 * choppy audio. Tearing during a single late frame is the lesser
-		 * evil; revisit once the render path itself is faster. */
-		if (!flip) video_driver->flipScreen(video_data, 0);
+
+		/* Falling behind the frame deadline can remove every natural blocking
+		 * point even with the limiter enabled. Yield explicitly in that case. */
+		if (!scheduler_blocked)
+			thread_driver->yieldThread();
 
 		rendered_frames_since_last_fps++;
 
 		if (frameskip_counter == 0)
 		{
 			float seconds_elapsed = (float)(curr - last_skipcount0_time)/ 1000000.0;
-			float frames_per_sec = (float)frames_since_last_fps / seconds_elapsed;
 
 			frames_per_second = ((float)rendered_frames_since_last_fps / seconds_elapsed);
 			game_speed_percent = (frames_per_second / (float)FPS) * 100;
-
-#if 0 /* DEBUG LOG DISABLED (v16 cleanup): no njemu_diag.txt FPS report */
-			{
-				static int fps_logged = 0;
-				if (!fps_logged && frames_displayed > 300)
-				{
-					FILE *fpf = fopen("mass:/njemu_diag.txt", "a");
-					if (!fpf) fpf = fopen("njemu_diag.txt", "a");
-					if (fpf)
-					{
-						fps_logged = 1;
-						fprintf(fpf, "FPS measured=%.1f speed=%.1f%% frames=%u fs=%d%c",
-							    frames_per_second, game_speed_percent,
-							    frames_displayed, frameskip, 10);
-						fclose(fpf);
-					}
-				}
-			}
-#endif /* DEBUG LOG DISABLED */
 
 			last_skipcount0_time = curr;
 			frames_since_last_fps = 0;
@@ -413,13 +509,11 @@ void show_fatal_error(void)
 				uifont_print_shadow_center(sy, UI_COLOR(UI_PAL_SELECT), fatal_error_message);
 
 				update = draw_battery_status(1);
-				update |= draw_volume_status(1);
 				video_driver->flipScreen(video_data, 1);
 			}
 			else
 			{
 				update = draw_battery_status(0);
-				update |= draw_volume_status(0);
 				video_driver->waitVsync(video_data);
 			}
 
@@ -454,20 +548,20 @@ void save_snapshot(void)
 
 	if (snap_no == -1)
 	{
-		FILE *fp;
-
 		snap_no = 1;
 
 		while (1)
 		{
-			sprintf(path, "%s/%s_%02d.png", screenshotDir, game_name, snap_no);
-			if ((fp = fopen(path, "rb")) == NULL) break;
-			fclose(fp);
+			int fd;
+			if (!path_format(path, sizeof(path), "%s/%s_%02d.png", screenshotDir, game_name, snap_no)) return;
+			fd = open(path, O_RDONLY);
+			if (fd < 0) break;
+			close(fd);
 			snap_no++;
 		}
 	}
 
-	sprintf(path, "%s/%s_%02d.png", screenshotDir, game_name, snap_no);
+	if (!path_format(path, sizeof(path), "%s/%s_%02d.png", screenshotDir, game_name, snap_no)) return;
 	if (save_png(path))
 		ui_popup(TEXT(SNAPSHOT_SAVED_AS_x_PNG), game_name, snap_no++);
 
@@ -483,73 +577,43 @@ void save_snapshot(void)
 
 int main(int argc, char *argv[]) {
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	// Default emulation options.
-	// NOTE: These were previously guarded by #if defined(NO_GUI). That was wrong
-	// for the GUI/menu builds (e.g. the PS2 native menu built with -DNO_GUI=OFF):
-	// the option_* globals have no initializers, so leaving them un-set made them
-	// all zero -> no sound, wrong speed, etc. The menu build has no config system
-	// to populate them, so always apply sensible defaults here. GUI platforms that
-	// load a saved config (PSP) simply overwrite these after main().
-	option_speedlimit = 1;
-#if defined(BUILD_CPS1) || defined(BUILD_CPS2)
-	option_vsync = 1;   /* CPS1/CPS2 default: vsync ON */
-#else
-	option_vsync = 0;   /* MVS/NCDZ default: vsync OFF (perf) */
-#endif
-	option_showfps = 0;
-	option_sound_enable = 1;
-	option_samplerate = 2;
-	option_sound_volume = 10;
-	option_stretch = 0;	/* original default: stretch to fill screen */
-	show_frames_each_second = 0;
-#if defined(BUILD_NCDZ)
-	option_mp3_enable = 1;
-	option_mp3_volume = 10;
-#endif
 
-	// Default control mapping P1_* -> PLATFORM_PAD_*. Previously guarded by
-	// #if defined(NO_GUI); the GUI/menu builds need this too, otherwise
-	// input_map[] stays all-zero and the core never sees any button presses.
-#if defined(BUILD_MVS) || defined(BUILD_NCDZ) || defined(BUILD_CPS1) || defined(BUILD_CPS2)
-	input_map[P1_UP] = PLATFORM_PAD_UP;
-	input_map[P1_DOWN] = PLATFORM_PAD_DOWN;
-	input_map[P1_LEFT] = PLATFORM_PAD_LEFT;
-	input_map[P1_RIGHT] = PLATFORM_PAD_RIGHT;
-#if defined(BUILD_MVS) || defined(BUILD_NCDZ)
-	/* Default button order: A/B/C/D -> Square / Cross / Triangle / Circle */
-	input_map[P1_BUTTONA] = PLATFORM_PAD_B3;
-	input_map[P1_BUTTONB] = PLATFORM_PAD_B2;
-	input_map[P1_BUTTONC] = PLATFORM_PAD_B4;
-	input_map[P1_BUTTOND] = PLATFORM_PAD_B1;
-	input_map[P1_START] = PLATFORM_PAD_START;
-#if defined(BUILD_MVS)
-	input_map[P1_COIN] = PLATFORM_PAD_SELECT;
-#else
-	input_map[P1_SELECT] = PLATFORM_PAD_SELECT;
-#endif
-#endif
-#if defined(BUILD_CPS1) || defined(BUILD_CPS2)
-	/* Default button order: 1/2/3/4 -> Square / Cross / Triangle / Circle */
-	input_map[P1_BUTTON1] = PLATFORM_PAD_B3;
-	input_map[P1_BUTTON2] = PLATFORM_PAD_B2;
-	input_map[P1_BUTTON3] = PLATFORM_PAD_B4;
-	input_map[P1_BUTTON4] = PLATFORM_PAD_B1;
-	input_map[P1_DIAL_L] = PLATFORM_PAD_L;
-	input_map[P1_DIAL_R] = PLATFORM_PAD_R;
-	input_map[P1_START] = PLATFORM_PAD_START;
-	input_map[P1_COIN] = PLATFORM_PAD_SELECT;
-#endif
-#endif
-
-    // Init process
-	platform_data = platform_driver->init();
-	ticker_data = ticker_driver->init();
-	power_data = power_driver->init();
+	    // Init process
+		platform_data = platform_driver->init();
+		if (platform_data == NULL) {
+			printf("Failed to initialize platform driver\n");
+			return 1;
+		}
+		if (platform_driver->queryMemoryInfo != NULL) {
+			platform_memory_info_t memory_info;
+			if (platform_driver->queryMemoryInfo(platform_data, &memory_info)) {
+				platform_memory_info_apply_env_overrides(&memory_info);
+				platform_memory_info_log(&memory_info);
+			}
+		}
+		ticker_data = ticker_driver->init();
+		if (ticker_data == NULL) {
+			printf("Failed to initialize ticker driver\n");
+			goto cleanup_platform;
+		}
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
 
-	getcwd(launchDir, PATH_MAX - 1);
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	strcat(launchDir, "/");
+		if (getcwd(launchDir, sizeof(launchDir)) == NULL) {
+			printf("Failed to determine launch directory\n");
+			goto cleanup_ticker;
+		}
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		{
+			size_t launch_len = strlen(launchDir);
+			if (launch_len == 0 || launchDir[launch_len - 1] != '/') {
+				if (launch_len + 1 >= sizeof(launchDir)) {
+					printf("Launch directory path is too long\n");
+					goto cleanup_ticker;
+				}
+				launchDir[launch_len++] = '/';
+				launchDir[launch_len] = '\0';
+			}
+		}
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
 
 	memset(screenshotDir, 0x00, sizeof(screenshotDir));
@@ -561,23 +625,50 @@ int main(int argc, char *argv[]) {
 	mkdir(screenshotDir,0777); // Create screenshot folder
 
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	power_driver->setLowestCpuClock(power_data);
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	ui_text_data = ui_text_driver->init();
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	pad_init();
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		power_set_lowest_performance_level();
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		ui_text_data = ui_text_driver->init();
+		if (ui_text_data == NULL) {
+			printf("Failed to initialize UI text driver\n");
+			goto cleanup_ticker;
+		}
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		if (!pad_init()) {
+			printf("Failed to initialize input driver\n");
+			goto cleanup_ui_text;
+		}
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+	
+		video_data = video_driver->init(emu_layer_textures, emu_layer_textures_count, &emu_clut_info);
+		if (video_data == NULL) {
+			printf("Failed to initialize video driver\n");
+			goto cleanup_input;
+		}
 
-	video_data = video_driver->init(emu_layer_textures, emu_layer_textures_count, &emu_clut_info);
+// #if defined(GUI) && defined(PS2)
+// 	while(1) {
+// 		printf("==> emumain: before beginFrame\n");
+// 		video_driver->beginFrame(video_data);
+// 		video_driver->fillFrame(video_data, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER, 0x00FF0000);
+// 		printf("==> emumain: before endFrame\n");
+// 		video_driver->endFrame(video_data);
+// 		printf("==> emumain: before flipScreen\n");
+// 		video_driver->flipScreen(video_data, 1);
+// 		printf("==> emumain: after flipScreen, sleeping\n");
+// 	}
+// #endif
+
+		if (!ui_init()) {
+			printf("Failed to initialize UI draw driver\n");
+			goto cleanup_video;
+		}
 
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	// Platform system buttom
-	systembuttons_available = platform_driver->startSystemButtons(platform_data);
-
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	file_browser();
-	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
-	video_driver->free(video_data);
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		file_browser();
+		ui_exit();
+		printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
+		video_driver->free(video_data);
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
 	ui_text_driver->free(ui_text_data);
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
@@ -585,9 +676,20 @@ int main(int argc, char *argv[]) {
 	printf("===> %s, %s:%i\n", __FUNCTION__, __FILE__, __LINE__);
 
 	// Platform exit
-	power_driver->free(power_data);
 	ticker_driver->free(ticker_data);
-	platform_driver->free(platform_data);
+		platform_driver->free(platform_data);
+	
+		return 0;
 
-	return 0;
+cleanup_video:
+		video_driver->free(video_data);
+cleanup_input:
+		pad_exit();
+cleanup_ui_text:
+		ui_text_driver->free(ui_text_data);
+cleanup_ticker:
+		ticker_driver->free(ticker_data);
+cleanup_platform:
+		platform_driver->free(platform_data);
+		return 1;
 }

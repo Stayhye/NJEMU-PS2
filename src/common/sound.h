@@ -9,6 +9,9 @@
 #ifndef COMMON_SOUND_H
 #define COMMON_SOUND_H
 
+#include <stdint.h>
+#include "emucfg.h"
+
 #define SOUND_SAMPLES_24000	(400*2)
 #define SOUND_SAMPLES_44100	(736*2)
 #define SOUND_SAMPLES_48000	(800)
@@ -44,6 +47,7 @@ extern struct sound_t *sound;
 void sound_thread_init(void);
 void sound_thread_exit(void);
 void sound_thread_enable(int enable);
+void sound_thread_pause(int pause);
 void sound_thread_set_volume(void);
 int sound_thread_start(void);
 void sound_thread_stop(void);

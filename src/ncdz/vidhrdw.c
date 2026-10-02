@@ -24,7 +24,14 @@
 ******************************************************************************/
 
 #include "ncdz.h"
+#include "common/palette_convert.h"
 #include "common/memory_sizes.h"
+#include "common/input_driver.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ticker_driver.h"
+#include "common/ui.h"
+#include <string.h>
 #include <unistd.h>
 
 
@@ -42,7 +49,6 @@ uint32_t palette_bank;
 
 uint16_t *video_palette;
 uint16_t ALIGN16_DATA video_palettebank[2][NEOGEO_PALETTE_SIZE / 2];
-uint16_t ALIGN16_DATA video_clut16[NEOGEO_CLUT_SIZE];
 
 uint8_t fix_pen_usage[0x20000 / 32];
 uint8_t spr_pen_usage[0x400000 / 128];
@@ -146,10 +152,9 @@ typedef struct
 static SPRITE_LIST sprite_list[MAX_SPRITES_PER_LINE];
 
 /*
- * Hardware-accelerated sprite rendering
- * Used for full-screen updates (>15 lines changed)
+ * Sprite rendering
  */
-static void draw_sprites_hardware(uint32_t start, uint32_t end, int min_y, int max_y)
+static void draw_sprites(uint32_t start, uint32_t end, int min_y, int max_y)
 {
 	int y = 0;
 	int x = 0;
@@ -288,159 +293,6 @@ static void draw_sprites_hardware(uint32_t start, uint32_t end, int min_y, int m
 }
 
 
-static inline int sprite_on_scanline(int scanline, int y, int rows)
-{
-	/* check if the current scanline falls inside this sprite,
-       two possible scenerios, wrap around or not */
-	int max_y = (y + rows - 1) & 0x1ff;
-
-	return (((max_y >= y) &&  (scanline >= y) && (scanline <= max_y)) ||
-			((max_y <  y) && ((scanline >= y) || (scanline <= max_y))));
-}
-
-
-/*
- * Software sprite rendering (scanline-by-scanline)
- * Used for partial updates (<15 lines) and shrunk sprites
- * This path uses zoom_x_tables for exact pixel-skip patterns
- */
-static void draw_sprites_software(uint32_t start, uint32_t end, int min_y, int max_y)
-{
-	int y = 0;
-	int x = 0;
-	int rows = 0;
-	int zoom_y = 0;
-	int zoom_x = 0;
-
-	uint16_t sprite_number = start;
-	uint16_t num_sprites = 0;
-	uint8_t fullmode = 0;
-	uint16_t attr;
-	uint32_t code;
-
-	do
-	{
-		for (;sprite_number < end; sprite_number++)
-		{
-			uint16_t y_control = sprite_y_control[sprite_number];
-			uint16_t zoom_control = sprite_zoom_control[sprite_number];
-
-			if (y_control & 0x40)
-			{
-				if (rows == 0) continue;
-
-				x += zoom_x + 1;
-			}
-			else
-			{
-				if (num_sprites != 0) break;
-
-				if ((rows = y_control & 0x3f) == 0) continue;
-
-				y = 0x200 - (y_control >> 7);
-				x = (sprite_x_control[sprite_number] >> 7) + 16;
-				zoom_y = zoom_control & 0xff;
-
-				if (rows > 0x20)
-				{
-					rows = 0x200;
-					fullmode = 1;
-				}
-				else
-				{
-					rows <<= 4;
-					fullmode = 0;
-				}
-			}
-
-			x &= 0x1ff;
-
-			zoom_x = (zoom_control >> 8) & 0x0f;
-
-			if ((x + zoom_x >= 24) && (x < 336))
-			{
-				sprite_list[num_sprites].x = x;
-				sprite_list[num_sprites].zoom_x = zoom_x + 1;
-				sprite_list[num_sprites].base = &neogeo_videoram[sprite_number << 6];
-				num_sprites++;
-			}
-		}
-
-		if (num_sprites)
-		{
-			uint16_t scanline;
-			uint8_t *zoom_y_table = memory_region_gfx3 + (zoom_y << 8);
-			uint8_t sprite_y;
-			uint8_t tile;
-			uint8_t sprite_y_and_tile;
-			uint8_t attr_and_code_offs;
-
-			for (scanline = min_y; scanline <= max_y; scanline++)
-			{
-				SPRITE_LIST *sprite = sprite_list;
-
-				if (sprite_on_scanline(scanline, y, rows))
-				{
-					uint16_t sprite_line = (scanline - y) & 0x1ff;
-					uint16_t zoom_line = sprite_line & 0xff;
-					uint16_t invert = sprite_line & 0x100;
-
-					if (invert)
-						zoom_line ^= 0xff;
-
-					if (fullmode)
-					{
-						zoom_line = zoom_line % ((zoom_y + 1) << 1);
-
-						if (zoom_line > zoom_y)
-						{
-							zoom_line = ((zoom_y + 1) << 1) - 1 - zoom_line;
-							invert = !invert;
-						}
-					}
-
-					sprite_y_and_tile = zoom_y_table[zoom_line];
-					sprite_y = sprite_y_and_tile & 0x0f;
-					tile = sprite_y_and_tile >> 4;
-
-					if (invert)
-					{
-						sprite_y ^= 0x0f;
-						tile ^= 0x1f;
-					}
-
-					attr_and_code_offs = tile << 1;
-
-					for (x = 0; x < num_sprites; x++)
-					{
-						attr = sprite->base[attr_and_code_offs + 1];
-						code = sprite->base[attr_and_code_offs + 0];
-
-						if (!auto_animation_disabled)
-						{
-							if (attr & 0x0008)
-								code = (code & ~0x07) | (auto_animation_counter & 0x07);
-							else if (attr & 0x0004)
-								code = (code & ~0x03) | (auto_animation_counter & 0x03);
-						}
-
-						code &= 0x7fff;
-
-						if (spr_pen_usage[code])
-							blit_draw_spr_line(sprite->x, scanline, sprite->zoom_x, sprite_y, code, attr, spr_pen_usage[code]);
-
-						sprite++;
-					}
-				}
-			}
-
-			num_sprites = 0;
-			rows = 0;
-		}
-	} while (sprite_number < end);
-}
-
-
 /*------------------------------------------------------
 	SPR Sprite Drawing (priority order / for ssrpg)
 ------------------------------------------------------*/
@@ -461,10 +313,7 @@ static void draw_spr_prio(int min_y, int max_y)
 
     do
 	{
-		if (max_y - min_y < 15)
-			draw_sprites_software(start, end, min_y, max_y);
-		else
-			draw_sprites_hardware(start, end, min_y, max_y);
+		draw_sprites(start, end, min_y, max_y);
 
 		end = start;
 		start = 0;
@@ -482,26 +331,7 @@ static void draw_spr_prio(int min_y, int max_y)
 
 void neogeo_video_init(void)
 {
-	int i, r, g, b;
-
-	for (r = 0; r < 32; r++)
-	{
-		for (g = 0; g < 32; g++)
-		{
-			for (b = 0; b < 32; b++)
-			{
-				int r1 = (r << 3) | (r >> 2);
-				int g1 = (g << 3) | (g >> 2);
-				int b1 = (b << 3) | (b >> 2);
-
-				uint16_t color = ((r & 1) << 14) | ((r & 0x1e) << 7)
-							 | ((g & 1) << 13) | ((g & 0x1e) << 3)
-							 | ((b & 1) << 12) | ((b & 0x1e) >> 1);
-
-				video_clut16[color] = MAKECOL15(r1, g1, b1);
-			}
-		}
-	}
+	int i;
 
 	skip_fullmode0 = &memory_region_user2[0x100*0x40*0];
 	tile_fullmode0 = &memory_region_user2[0x100*0x40*1];
@@ -563,8 +393,6 @@ void neogeo_video_reset(void)
 
 void neogeo_screenrefresh(void)
 {
-	extern uint32_t frames_displayed;
-	frames_displayed++; /* new frame: advance the tile-cache age counter */
 	if (video_enable)
 	{
 		if (!spr_disable)
@@ -624,10 +452,7 @@ void neogeo_partial_screenrefresh(int current_line)
 						case NGH_rbff2: patch_vram_rbff2(); break;
 						}
 
-						if (current_line - next_update_first_line < 15)
-							draw_sprites_software(0, MAX_SPRITES_PER_SCREEN, next_update_first_line, current_line);
-						else
-							draw_sprites_hardware(0, MAX_SPRITES_PER_SCREEN, next_update_first_line, current_line);
+						draw_sprites(0, MAX_SPRITES_PER_SCREEN, next_update_first_line, current_line);
 					}
 
 					next_update_first_line = current_line + 1;
@@ -792,8 +617,8 @@ STATE_LOAD( video )
 	{
 		if (i & 0x0f)
 		{
-			video_palettebank[0][i] = video_clut16[palettes[0][i] & 0x7fff];
-			video_palettebank[1][i] = video_clut16[palettes[1][i] & 0x7fff];
+				video_palettebank[0][i] = neogeo_palette_to_555(palettes[0][i]);
+				video_palettebank[1][i] = neogeo_palette_to_555(palettes[1][i]);
 		}
 	}
 

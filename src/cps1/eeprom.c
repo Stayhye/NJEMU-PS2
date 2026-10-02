@@ -1,4 +1,5 @@
 #include "cps1.h"
+#include "common/emulator_runtime.h"
 
 
 #define SERIAL_BUFFER_LENGTH	40
@@ -49,6 +50,7 @@ static int EEPROM_command_match(const char *buf, const char *cmd, int len)
 			case '0':
 			case '1':
 				if (b != c)	return 0;
+			/* fall through */
 			case 'X':
 			case 'x':
 				buf++;
@@ -282,14 +284,14 @@ void EEPROM_set_clock_line(int state)
 }
 
 
-void EEPROM_load(FILE *fp)
+void EEPROM_load(int fd)
 {
-	fread(eeprom_data, 1, (1 << intf->address_bits) * intf->data_bits / 8, fp);
+	{ ssize_t io_result = read(fd, eeprom_data, (1 << intf->address_bits) * intf->data_bits / 8); (void)io_result; }
 }
 
-void EEPROM_save(FILE *fp)
+void EEPROM_save(int fd)
 {
-	fwrite(eeprom_data, 1, (1 << intf->address_bits) * intf->data_bits / 8, fp);
+	{ ssize_t io_result = write(fd, eeprom_data, (1 << intf->address_bits) * intf->data_bits / 8); (void)io_result; }
 }
 
 uint8_t EEPROM_read_data(uint32_t address)

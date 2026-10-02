@@ -10,6 +10,7 @@
 #define MVS_SPRITE_COMMON_H
 
 #include "mvs.h"
+#include "common/video_geometry.h"
 
 /******************************************************************************
 	Constants/Macros
@@ -29,9 +30,11 @@
 #define TILE_8x8_PER_LINE	(BUF_WIDTH/8)
 #define TILE_16x16_PER_LINE	(BUF_WIDTH/16)
 
-#define SPR_TEXTURE_SIZE	((BUF_WIDTH/16)*((TEXTURE_HEIGHT*3)/16))
-#define SPR_HASH_MASK		0x1ff
-#define SPR_HASH_SIZE		0x200
+#define SPR_TEXTURE_LAYER_SIZE	((BUF_WIDTH/16)*(TEXTURE_HEIGHT/16))
+#define SPR_TEXTURE_LAYERS	3
+#define SPR_TEXTURE_SIZE	(SPR_TEXTURE_LAYER_SIZE * SPR_TEXTURE_LAYERS)
+#define SPR_HASH_MASK		0x7ff
+#define SPR_HASH_SIZE		0x800
 #define SPR_MAX_SPRITES		0x3000
 
 /******************************************************************************
@@ -55,29 +58,16 @@ struct sprite_t
 extern SPRITE ALIGN16_DATA *fix_head[FIX_HASH_SIZE];
 extern SPRITE ALIGN16_DATA fix_data[FIX_TEXTURE_SIZE];
 extern SPRITE *fix_free_head;
-extern uint16_t fix_num;
 extern uint16_t fix_texture_num;
 
 extern SPRITE ALIGN16_DATA *spr_head[SPR_HASH_SIZE];
 extern SPRITE ALIGN16_DATA spr_data[SPR_TEXTURE_SIZE];
-extern SPRITE *spr_free_head;
-extern uint16_t spr_num;
+extern SPRITE *spr_free_head[SPR_TEXTURE_LAYERS];
 extern uint16_t spr_texture_num;
-extern uint16_t spr_index;
-extern uint8_t spr_disable;
-
-extern int clip_min_y;
-extern int clip_max_y;
 extern int clear_spr_texture;
 extern int clear_fix_texture;
 
-extern uint16_t *scrbitmap;
-extern uint8_t *tex_fix;
-extern uint8_t *tex_spr[3];
-extern uint16_t *clut;
-
-extern const uint32_t ALIGN16_DATA color_table[16];
-extern const uint8_t zoom_x_tables[][16];
+extern const uint32_t ALIGN16_DATA sprite_color_table[16];
 
 /******************************************************************************
 	Common function declarations
@@ -89,23 +79,11 @@ int fix_insert_sprite(uint32_t key);
 void fix_delete_sprite(void);
 
 int spr_get_sprite(uint32_t key);
-int spr_insert_sprite(uint32_t key);
+int spr_insert_sprite(uint32_t key, uint8_t preferred_layer);
 void spr_delete_sprite(void);
 
 void blit_clear_fix_sprite(void);
 void blit_clear_spr_sprite(void);
-
-/* Software rendering functions */
-void drawgfxline_fixed(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_fixed_flip(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_zoom(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_zoom_flip(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_fixed_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_fixed_flip_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_zoom_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-void drawgfxline_zoom_flip_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
-
-extern void ALIGN16_DATA (*drawgfxline[8])(uint32_t *src, uint16_t *dst, uint16_t *pal, int zoom);
 
 /* Common sprite interface functions */
 void blit_clear_all_sprite(void);

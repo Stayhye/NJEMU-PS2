@@ -8,8 +8,32 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
 #include "cps2.h"
+#ifdef ADHOC
+#include "common/adhoc.h"
+#endif
+#include "common/cache.h"
+#include "common/cmdlist.h"
+#include "common/memory_plan.h"
 #include "common/memory_sizes.h"
+#include "common/emulator_options.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/loadrom.h"
+#include "common/power_driver.h"
+#include "common/runtime_paths.h"
+#include "common/path_utils.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui.h"
+#include "common/config.h"
 
 
 #define M68K_AMASK M68K_ADDR_MASK
@@ -68,14 +92,11 @@ uint16_t ALIGN16_DATA cps2_output[CPS2_OUTPUT_SIZE >> 1];
 uint8_t *qsound_sharedram1;
 uint8_t *qsound_sharedram2;
 
-#if !USE_CACHE
-char cache_parent_name[16];
-#endif
+/* cache_parent_name is now declared unconditionally in emumain.c */
 
-#ifdef LARGE_MEMORY
-uint32_t psp2k_mem_offset = PSP2K_MEM_TOP;
-int32_t psp2k_mem_left = PSP2K_MEM_SIZE;
-#endif
+static memory_plan_t cps2_memory_plan;
+static int cps2_memory_plan_valid = 0;
+static memory_allocation_shape_t cps2_memory_shape;
 
 
 /******************************************************************************
@@ -84,16 +105,12 @@ int32_t psp2k_mem_left = PSP2K_MEM_SIZE;
 
 static struct rom_t cpu1rom[MAX_CPU1ROM];
 static struct rom_t cpu2rom[MAX_CPU2ROM];
-#if !USE_CACHE
 static struct rom_t gfx1rom[MAX_GFX1ROM];
-#endif
 static struct rom_t snd1rom[MAX_SND1ROM];
 
 static int num_cpu1rom;
 static int num_cpu2rom;
-#if !USE_CACHE
 static int num_gfx1rom;
-#endif
 static int num_snd1rom;
 
 static uint8_t *static_ram1;
@@ -135,7 +152,7 @@ static int load_rom_cpu1(void)
 		strcpy(fname, cpu1rom[i].name);
 		if ((res = file_open(game_name, parent, cpu1rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -176,7 +193,7 @@ static int load_rom_cpu2(void)
 		strcpy(fname, cpu2rom[i].name);
 		if ((res = file_open(game_name, parent, cpu2rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -198,12 +215,49 @@ static int load_rom_cpu2(void)
 	GFX1 (graphic ROM)
 --------------------------------------------------------*/
 
-static int load_rom_gfx1(void)
+static int load_rom_gfx1_full_resident(void)
 {
-#if !USE_CACHE
 	int i, res;
 	char fname[32], *parent;
-#endif
+
+	memset(memory_region_gfx1, 0, memory_length_gfx1);
+	memset(gfx_pen_usage[TILE08], 0, gfx_total_elements[TILE08]);
+	memset(gfx_pen_usage[TILE16], 0, gfx_total_elements[TILE16]);
+	memset(gfx_pen_usage[TILE32], 0, gfx_total_elements[TILE32]);
+
+	parent = strlen(parent_name) ? parent_name : NULL;
+
+	for (i = 0; i < num_gfx1rom; )
+	{
+		strcpy(fname, gfx1rom[i].name);
+		if ((res = file_open(game_name, parent, gfx1rom[i].crc, fname)) < 0)
+		{
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
+				error_file(fname);
+			else
+				error_crc(fname);
+			return 0;
+		}
+
+		msg_printf(TEXT(LOADING), fname);
+		i = rom_load(gfx1rom, memory_region_gfx1, i, num_gfx1rom);
+		file_close();
+	}
+
+	msg_printf(TEXT(DECODING_GFX));
+	cps2_gfx_decode();
+	msg_printf(TEXT(CACHE_USAGE_GFX), memory_length_gfx1 / 1024,
+		memory_length_gfx1 / 1024);
+
+	return 1;
+}
+
+static int load_rom_gfx1(void)
+{
+	uint32_t planned_gfx_length = memory_length_gfx1;
+	memory_plan_t streaming_plan;
+	memory_probe_constraints_t constraints;
+	game_memory_requirements_t requirements;
 
 	gfx_total_elements[TILE08] = (memory_length_gfx1 - 0x800000) >> 6;
 	gfx_total_elements[TILE16] = memory_length_gfx1 >> 7;
@@ -228,49 +282,80 @@ static int load_rom_gfx1(void)
 		return 0;
 	}
 
-#if USE_CACHE
-	memory_length_gfx1 = driver->cache_size;
+	/* All mandatory CPS2 regions are resident at this point. Probe the allocator
+	 * itself and retain the successful GFX allocation so planning and ownership
+	 * cannot diverge between two malloc calls. */
+	memory_probe_constraints_default(&constraints);
+	memset(&requirements, 0, sizeof(requirements));
+	requirements.core = MEMORY_PLAN_CORE_CPS2;
+	requirements.gfx_or_crom_bytes = planned_gfx_length;
+	cps2_memory_plan_valid = memory_plan_allocate_shape(&requirements, &constraints,
+		&cps2_memory_shape);
 
-	if (cache_start() == 0)
+	/* A partial CPS2 allocation backs the compact streaming cache, not the full
+	 * decoded GFX image. Re-probe against that real payload ceiling if necessary. */
+	if (cps2_memory_plan_valid && !cps2_memory_shape.plan.gfx_fully_resident &&
+		cps2_memory_shape.plan.gfx_cache_bytes > driver->cache_size)
 	{
-		msg_printf(TEXT(PRESS_ANY_BUTTON2));
-		pad_wait_press(PAD_WAIT_INFINITY);
+		memory_allocation_shape_release(&cps2_memory_shape);
+		requirements.gfx_or_crom_bytes = driver->cache_size;
+		cps2_memory_plan_valid = memory_plan_allocate_shape(&requirements, &constraints,
+			&cps2_memory_shape);
+	}
+
+	if (cps2_memory_plan_valid)
+	{
+		cps2_memory_plan = cps2_memory_shape.plan;
+		memory_plan_log(&cps2_memory_plan);
+	}
+	else
+	{
+		printf("[memory_plan] CPS2 empirical probe has no viable cache shape\n");
+	}
+
+	if (!cps2_memory_plan_valid)
+	{
+		msg_printf(TEXT(MEMORY_NOT_ENOUGH));
 		Loop = LOOP_BROWSER;
 		return 0;
 	}
-#else
-	memset(gfx_pen_usage[TILE08], 0, gfx_total_elements[TILE08]);
-	memset(gfx_pen_usage[TILE16], 0, gfx_total_elements[TILE16]);
-	memset(gfx_pen_usage[TILE32], 0, gfx_total_elements[TILE32]);
 
-	memory_region_gfx1 = (uint8_t *)psp2k_mem_offset;
-	psp2k_mem_offset += memory_length_gfx1;
-	psp2k_mem_left -= memory_length_gfx1;
-
-	parent = strlen(parent_name) ? parent_name : NULL;
-
-	for (i = 0; i < num_gfx1rom; )
+	if (cps2_memory_plan.gfx_fully_resident &&
+		cps2_memory_plan.gfx_cache_bytes >= planned_gfx_length)
 	{
-		strcpy(fname, gfx1rom[i].name);
-		if ((res = file_open(game_name, parent, gfx1rom[i].crc, fname)) < 0)
+		memory_allocation_shape_release_reserve(&cps2_memory_shape);
+		memory_region_gfx1 = (uint8_t *)cps2_memory_shape.gfx_memory;
+		cps2_memory_shape.gfx_memory = NULL;
+		if (memory_region_gfx1 != NULL)
 		{
-			if (res == -1)
-				error_file(fname);
-			else
-				error_crc(fname);
-			return 0;
+			if (!load_rom_gfx1_full_resident())
+				return 0;
+			return 1;
 		}
 
-		msg_printf(TEXT(LOADING), fname);
-
-		i = rom_load(gfx1rom, memory_region_gfx1, i, num_gfx1rom);
-
-		file_close();
+		msg_printf(TEXT(COULD_NOT_ALLOCATE_MEMORY_FOR_SPRITE_DATA));
+		msg_printf(TEXT(TRY_TO_USE_SPRITE_CACHE));
 	}
 
-	msg_printf(TEXT(DECODING_GFX), fname);
-	cps2_gfx_decode();
-#endif
+	/* Streaming fallback. If a full-resident allocation failed, clamp the
+	 * request to the compact cache-file payload; cache_start() may still retry
+	 * down in 64 KiB blocks if fragmentation prevents that target. */
+	streaming_plan = cps2_memory_plan;
+	streaming_plan.gfx_fully_resident = false;
+	memory_length_gfx1 = driver->cache_size;
+	memory_allocation_shape_release_reserve(&cps2_memory_shape);
+
+	{
+		void *gfx_memory = cps2_memory_shape.gfx_memory;
+		cps2_memory_shape.gfx_memory = NULL;
+		if (cache_start(&streaming_plan, gfx_memory, NULL) == 0)
+		{
+			msg_printf(TEXT(PRESS_ANY_BUTTON2));
+			pad_wait_press(PAD_WAIT_INFINITY);
+			Loop = LOOP_BROWSER;
+			return 0;
+		}
+	}
 
 	return 1;
 }
@@ -299,7 +384,7 @@ static int load_rom_sound1(void)
 		strcpy(fname, snd1rom[i].name);
 		if ((res = file_open(game_name, parent, snd1rom[i].crc, fname)) < 0)
 		{
-			if (res == -1)
+			if (res == ROM_FILE_OPEN_NOT_FOUND)
 				error_file(fname);
 			else
 				error_crc(fname);
@@ -353,9 +438,7 @@ static int load_rom_info(const char *game_name)
 
 	num_cpu1rom = 0;
 	num_cpu2rom = 0;
-#if !USE_CACHE
 	num_gfx1rom = 0;
-#endif
 	num_snd1rom = 0;
 
 	machine_driver_type  = 0;
@@ -363,7 +446,7 @@ static int load_rom_info(const char *game_name)
 	machine_init_type    = 0;
 	machine_screen_type  = 0;
 
-	sprintf(path, "%srominfo.cps2", launchDir);
+	if (!path_format(path, sizeof(path), "%srominfo.cps2", launchDir)) return 0;
 
 	if ((fd = open(path, O_RDONLY, 0777)) >= 0)
 	{
@@ -376,7 +459,7 @@ static int load_rom_info(const char *game_name)
 			return 3;	// Shortcut
 		}
 
-		read(fd, buf, size);
+		{ ssize_t io_result = read(fd, buf, size); (void)io_result; }
 		close(fd);
 
 		i = 0;
@@ -439,40 +522,39 @@ static int load_rom_info(const char *game_name)
 			{
 				if (str_cmp(&linebuf[1], "REGION(") == 0)
 				{
-					char *size, *type, *flag;
+					char *size, *type;
 
 					strtok(&linebuf[1], " ");
 					size = strtok(NULL, " ,");
 					type = strtok(NULL, " ,");
-					flag = strtok(NULL, " ");
+					(void)strtok(NULL, " ");
 
 					if (strcmp(type, "CPU1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu1);
+						sscanf(size, "%" SCNx32, &memory_length_cpu1);
 						region = REGION_CPU1;
 					}
 					else if (strcmp(type, "CPU2") == 0)
 					{
-						sscanf(size, "%x", &memory_length_cpu2);
+						sscanf(size, "%" SCNx32, &memory_length_cpu2);
 						region = REGION_CPU2;
 					}
-					else if (strcmp(type, "GFX1") == 0)
-					{
-						sscanf(size, "%x", &memory_length_gfx1);
-#if USE_CACHE
-						region = REGION_SKIP;
-#else
-						region = REGION_GFX1;
-#endif
+						else if (strcmp(type, "GFX1") == 0)
+						{
+							sscanf(size, "%" SCNx32, &memory_length_gfx1);
+							/* Always retain the GFX ROM description. The runtime
+							 * memory plan decides later whether these entries are
+							 * loaded directly or served from the streaming cache. */
+							region = REGION_GFX1;
 					}
 					else if (strcmp(type, "SOUND1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_sound1);
+						sscanf(size, "%" SCNx32, &memory_length_sound1);
 						region = REGION_SOUND1;
 					}
 					else if (strcmp(type, "USER1") == 0)
 					{
-						sscanf(size, "%x", &memory_length_user1);
+						sscanf(size, "%" SCNx32, &memory_length_user1);
 						region = REGION_SKIP;
 					}
 					else
@@ -497,10 +579,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						cpu1rom[num_cpu1rom].group = 0;
 						cpu1rom[num_cpu1rom].skip = 0;
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
@@ -508,34 +590,32 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_CPU2:
-						sscanf(type, "%x", &cpu2rom[num_cpu2rom].type);
-						sscanf(offset, "%x", &cpu2rom[num_cpu2rom].offset);
-						sscanf(length, "%x", &cpu2rom[num_cpu2rom].length);
-						sscanf(crc, "%x", &cpu2rom[num_cpu2rom].crc);
+						sscanf(type, "%" SCNx32, &cpu2rom[num_cpu2rom].type);
+						sscanf(offset, "%" SCNx32, &cpu2rom[num_cpu2rom].offset);
+						sscanf(length, "%" SCNx32, &cpu2rom[num_cpu2rom].length);
+						sscanf(crc, "%" SCNx32, &cpu2rom[num_cpu2rom].crc);
 						cpu2rom[num_cpu2rom].group = 0;
 						cpu2rom[num_cpu2rom].skip = 0;
 						if (name) strcpy(cpu2rom[num_cpu2rom].name, name);
 						num_cpu2rom++;
 						break;
 
-#if !USE_CACHE
-					case REGION_GFX1:
-						sscanf(type, "%x", &gfx1rom[num_gfx1rom].type);
-						sscanf(offset, "%x", &gfx1rom[num_gfx1rom].offset);
-						sscanf(length, "%x", &gfx1rom[num_gfx1rom].length);
-						sscanf(crc, "%x", &gfx1rom[num_gfx1rom].crc);
+						case REGION_GFX1:
+						sscanf(type, "%" SCNx32, &gfx1rom[num_gfx1rom].type);
+						sscanf(offset, "%" SCNx32, &gfx1rom[num_gfx1rom].offset);
+						sscanf(length, "%" SCNx32, &gfx1rom[num_gfx1rom].length);
+						sscanf(crc, "%" SCNx32, &gfx1rom[num_gfx1rom].crc);
 						gfx1rom[num_gfx1rom].group = 0;
 						gfx1rom[num_gfx1rom].skip = 0;
 						if (name) strcpy(gfx1rom[num_gfx1rom].name, name);
 						num_gfx1rom++;
 						break;
-#endif
 
 					case REGION_SOUND1:
-						sscanf(type, "%x", &snd1rom[num_snd1rom].type);
-						sscanf(offset, "%x", &snd1rom[num_snd1rom].offset);
-						sscanf(length, "%x", &snd1rom[num_snd1rom].length);
-						sscanf(crc, "%x", &snd1rom[num_snd1rom].crc);
+						sscanf(type, "%" SCNx32, &snd1rom[num_snd1rom].type);
+						sscanf(offset, "%" SCNx32, &snd1rom[num_snd1rom].offset);
+						sscanf(length, "%" SCNx32, &snd1rom[num_snd1rom].length);
+						sscanf(crc, "%" SCNx32, &snd1rom[num_snd1rom].crc);
 						snd1rom[num_snd1rom].group = 0;
 						snd1rom[num_snd1rom].skip = 0;
 						if (name) strcpy(snd1rom[num_snd1rom].name, name);
@@ -563,10 +643,10 @@ static int load_rom_info(const char *game_name)
 					switch (region)
 					{
 					case REGION_CPU1:
-						sscanf(type, "%x", &cpu1rom[num_cpu1rom].type);
-						sscanf(offset, "%x", &cpu1rom[num_cpu1rom].offset);
-						sscanf(length, "%x", &cpu1rom[num_cpu1rom].length);
-						sscanf(crc, "%x", &cpu1rom[num_cpu1rom].crc);
+						sscanf(type, "%" SCNx32, &cpu1rom[num_cpu1rom].type);
+						sscanf(offset, "%" SCNx32, &cpu1rom[num_cpu1rom].offset);
+						sscanf(length, "%" SCNx32, &cpu1rom[num_cpu1rom].length);
+						sscanf(crc, "%" SCNx32, &cpu1rom[num_cpu1rom].crc);
 						sscanf(group, "%x", &cpu1rom[num_cpu1rom].group);
 						sscanf(skip, "%x", &cpu1rom[num_cpu1rom].skip);
 						if (name) strcpy(cpu1rom[num_cpu1rom].name, name);
@@ -574,34 +654,32 @@ static int load_rom_info(const char *game_name)
 						break;
 
 					case REGION_CPU2:
-						sscanf(type, "%x", &cpu2rom[num_cpu2rom].type);
-						sscanf(offset, "%x", &cpu2rom[num_cpu2rom].offset);
-						sscanf(length, "%x", &cpu2rom[num_cpu2rom].length);
-						sscanf(crc, "%x", &cpu2rom[num_cpu2rom].crc);
+						sscanf(type, "%" SCNx32, &cpu2rom[num_cpu2rom].type);
+						sscanf(offset, "%" SCNx32, &cpu2rom[num_cpu2rom].offset);
+						sscanf(length, "%" SCNx32, &cpu2rom[num_cpu2rom].length);
+						sscanf(crc, "%" SCNx32, &cpu2rom[num_cpu2rom].crc);
 						sscanf(group, "%x", &cpu2rom[num_cpu2rom].group);
 						sscanf(skip, "%x", &cpu2rom[num_cpu2rom].skip);
 						if (name) strcpy(cpu2rom[num_cpu2rom].name, name);
 						num_cpu2rom++;
 						break;
 
-#if !USE_CACHE
-					case REGION_GFX1:
-						sscanf(type, "%x", &gfx1rom[num_gfx1rom].type);
-						sscanf(offset, "%x", &gfx1rom[num_gfx1rom].offset);
-						sscanf(length, "%x", &gfx1rom[num_gfx1rom].length);
-						sscanf(crc, "%x", &gfx1rom[num_gfx1rom].crc);
+						case REGION_GFX1:
+						sscanf(type, "%" SCNx32, &gfx1rom[num_gfx1rom].type);
+						sscanf(offset, "%" SCNx32, &gfx1rom[num_gfx1rom].offset);
+						sscanf(length, "%" SCNx32, &gfx1rom[num_gfx1rom].length);
+						sscanf(crc, "%" SCNx32, &gfx1rom[num_gfx1rom].crc);
 						sscanf(group, "%x", &gfx1rom[num_gfx1rom].group);
 						sscanf(skip, "%x", &gfx1rom[num_gfx1rom].skip);
 						if (name) strcpy(gfx1rom[num_gfx1rom].name, name);
 						num_gfx1rom++;
 						break;
-#endif
 
 					case REGION_SOUND1:
-						sscanf(type, "%x", &snd1rom[num_snd1rom].type);
-						sscanf(offset, "%x", &snd1rom[num_snd1rom].offset);
-						sscanf(length, "%x", &snd1rom[num_snd1rom].length);
-						sscanf(crc, "%x", &snd1rom[num_snd1rom].crc);
+						sscanf(type, "%" SCNx32, &snd1rom[num_snd1rom].type);
+						sscanf(offset, "%" SCNx32, &snd1rom[num_snd1rom].offset);
+						sscanf(length, "%" SCNx32, &snd1rom[num_snd1rom].length);
+						sscanf(crc, "%" SCNx32, &snd1rom[num_snd1rom].crc);
 						sscanf(group, "%x", &snd1rom[num_snd1rom].group);
 						sscanf(skip, "%x", &snd1rom[num_snd1rom].skip);
 						if (name) strcpy(snd1rom[num_snd1rom].name, name);
@@ -646,14 +724,10 @@ int memory_init(void)
 	gfx_pen_usage[TILE16] = NULL;
 	gfx_pen_usage[TILE32] = NULL;
 
-#ifdef LARGE_MEMORY
-	psp2k_mem_offset = PSP2K_MEM_TOP;
-	psp2k_mem_left   = PSP2K_MEM_SIZE;
-#endif
+	cps2_memory_plan_valid = 0;
+	memset(&cps2_memory_shape, 0, sizeof(cps2_memory_shape));
 
-#if USE_CACHE
 	cache_init();
-#endif
 	pad_wait_clear();
 	video_driver->clearScreen(video_data);
 	msg_screen_init(WP_LOGO, ICON_SYSTEM, TEXT(LOAD_ROM));
@@ -666,7 +740,7 @@ int memory_init(void)
 		{
 		case 1: msg_printf(TEXT(THIS_GAME_NOT_SUPPORTED)); break;
 		case 2: msg_printf(TEXT(ROM_NOT_FOUND)); break;
-		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND)); break;
+		case 3: msg_printf(TEXT(ROMINFO_NOT_FOUND_CPS2)); break;
 		}
 		msg_printf(TEXT(PRESS_ANY_BUTTON2));
 		pad_wait_press(PAD_WAIT_INFINITY);
@@ -685,13 +759,12 @@ int memory_init(void)
 	{
 		cache_parent_name[0] = '\0';
 	}
-#if USE_CACHE
 	else if (!strcmp(game_name, "mpangj"))
 	{
-		// Japanese version is probably a BAD DUMP (some sprites are missing)
+		// Japanese version is probably a BAD DUMP (some sprites are missing).
+		// Keep its streaming cache independent from the parent cache.
 		cache_parent_name[0] = '\0';
 	}
-#endif
 	else
 	{
 		strcpy(cache_parent_name, parent_name);
@@ -780,8 +853,8 @@ int memory_init(void)
 #if ENABLE_RASTER_OPTION
 		cps_raster_enable    = 1;
 #endif
-		platform_cpuclock    = power_driver->getHighestCpuClock(power_data);
-		option_vsync         = 1;
+		platform_performance_level    = power_get_highest_performance_level();
+		option_vsync         = 0;
 		option_autoframeskip = 0;
 		option_frameskip     = 0;
 		option_showfps       = 0;
@@ -799,7 +872,7 @@ int memory_init(void)
 #endif
 	}
 
-	power_driver->setCpuClock(power_data, platform_cpuclock);
+	power_set_performance_level(platform_performance_level);
 
 	if (load_rom_cpu1() == 0) return 0;
 	if (load_rom_user1() == 0) return 0;
@@ -810,10 +883,10 @@ int memory_init(void)
 	}
 	if (load_rom_gfx1() == 0) return 0;
 
-	static_ram1 = (uint8_t *)cps1_ram    - 0xff0000;
-	static_ram2 = (uint8_t *)cps1_gfxram - 0x900000;
-	static_ram3 = (uint8_t *)cps2_ram    - 0x660000;
-	static_ram4 = (uint8_t *)cps2_output - 0x400000;
+	static_ram1 = (uint8_t *)cps1_ram;
+	static_ram2 = (uint8_t *)cps1_gfxram;
+	static_ram3 = (uint8_t *)cps2_ram;
+	static_ram4 = (uint8_t *)cps2_output;
 	static_ram5 = (uint8_t *)cps2_objram[0];
 	static_ram6 = (uint8_t *)cps2_objram[1];
 
@@ -832,9 +905,8 @@ int memory_init(void)
 
 void memory_shutdown(void)
 {
-#if USE_CACHE
 	cache_shutdown();
-#endif
+	memory_allocation_shape_release(&cps2_memory_shape);
 
 	if (gfx_pen_usage[TILE08]) free(gfx_pen_usage[TILE08]);
 	if (gfx_pen_usage[TILE16]) free(gfx_pen_usage[TILE16]);
@@ -842,16 +914,9 @@ void memory_shutdown(void)
 
 	if (memory_region_cpu1)   free(memory_region_cpu1);
 	if (memory_region_cpu2)   free(memory_region_cpu2);
-#if USE_CACHE
 	if (memory_region_gfx1)   free(memory_region_gfx1);
-#endif
 	if (memory_region_sound1) free(memory_region_sound1);
 	if (memory_region_user1)  free(memory_region_user1);
-
-#ifdef LARGE_MEMORY
-	psp2k_mem_offset = PSP2K_MEM_TOP;
-	psp2k_mem_left   = PSP2K_MEM_SIZE;
-#endif
 }
 
 
@@ -881,13 +946,13 @@ uint8_t m68000_read_memory_8(uint32_t offset)
 	switch (offset >> 16)
 	{
 	case 0x40:
-		return READ_BYTE(static_ram4, offset);
+		return READ_BYTE(static_ram4, (offset - 0x400000));
 
 	case 0x61:
 		return qsound_sharedram1_r(offset >> 1, mem_mask) >> shift;
 
 	case 0x66:
-		return READ_BYTE(static_ram3, offset);
+		return READ_BYTE(static_ram3, (offset - 0x660000));
 
 	case 0x70:
 		if (offset & 0x8000)
@@ -918,10 +983,10 @@ uint8_t m68000_read_memory_8(uint32_t offset)
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		return READ_BYTE(static_ram2, offset);
+		return READ_BYTE(static_ram2, (offset - 0x900000));
 
 	case 0xff:
-		return READ_BYTE(static_ram1, offset);
+		return READ_BYTE(static_ram1, (offset - 0xff0000));
 	}
 
 	return 0xff;
@@ -944,13 +1009,13 @@ uint16_t m68000_read_memory_16(uint32_t offset)
 	switch (offset >> 16)
 	{
 	case 0x40:
-		return READ_WORD(static_ram4, offset);
+		return READ_WORD(static_ram4, (offset - 0x400000));
 
 	case 0x61:
 		return qsound_sharedram1_r(offset >> 1, 0);
 
 	case 0x66:
-		return READ_WORD(static_ram3, offset);
+		return READ_WORD(static_ram3, (offset - 0x660000));
 
 	case 0x70:
 		if (offset & 0x8000)
@@ -981,10 +1046,10 @@ uint16_t m68000_read_memory_16(uint32_t offset)
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		return READ_WORD(static_ram2, offset);
+		return READ_WORD(static_ram2, (offset - 0x900000));
 
 	case 0xff:
-		return READ_WORD(static_ram1, offset);
+		return READ_WORD(static_ram1, (offset - 0xff0000));
 	}
 
 	return 0xffff;
@@ -1008,7 +1073,7 @@ void m68000_write_memory_8(uint32_t offset, uint8_t data)
 #if !RELEASE
 		if (!phoenix_edition)
 #endif
-			WRITE_BYTE(static_ram4, offset, data);
+			WRITE_BYTE(static_ram4, (offset - 0x400000), data);
 		return;
 
 	case 0x61:
@@ -1016,7 +1081,7 @@ void m68000_write_memory_8(uint32_t offset, uint8_t data)
 		return;
 
 	case 0x66:
-		WRITE_BYTE(static_ram3, offset, data);
+		WRITE_BYTE(static_ram3, (offset - 0x660000), data);
 		return;
 
 	case 0x70:
@@ -1056,7 +1121,7 @@ void m68000_write_memory_8(uint32_t offset, uint8_t data)
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		WRITE_BYTE(static_ram2, offset, data);
+		WRITE_BYTE(static_ram2, (offset - 0x900000), data);
 		return;
 
 	case 0xff:
@@ -1066,12 +1131,12 @@ void m68000_write_memory_8(uint32_t offset, uint8_t data)
 			if (offset >= 0xfffff0)
 			{
 				offset -= 0xbffff0;
-				WRITE_BYTE(static_ram4, offset, data);
+				WRITE_BYTE(static_ram4, (offset - 0x400000), data);
 				return;
 			}
 		}
 #endif
-		WRITE_BYTE(static_ram1, offset, data);
+		WRITE_BYTE(static_ram1, (offset - 0xff0000), data);
 		return;
 	}
 }
@@ -1091,7 +1156,7 @@ void m68000_write_memory_16(uint32_t offset, uint16_t data)
 #if !RELEASE
 		if (!phoenix_edition)
 #endif
-			WRITE_WORD(static_ram4, offset, data);
+			WRITE_WORD(static_ram4, (offset - 0x400000), data);
 		return;
 
 	case 0x61:
@@ -1099,7 +1164,7 @@ void m68000_write_memory_16(uint32_t offset, uint16_t data)
 		return;
 
 	case 0x66:
-		WRITE_WORD(static_ram3, offset, data);
+		WRITE_WORD(static_ram3, (offset - 0x660000), data);
 		return;
 
 	case 0x70:
@@ -1136,7 +1201,7 @@ void m68000_write_memory_16(uint32_t offset, uint16_t data)
 	case 0x90:
 	case 0x91:
 	case 0x92:
-		WRITE_WORD(static_ram2, offset, data);
+		WRITE_WORD(static_ram2, (offset - 0x900000), data);
 		return;
 
 	case 0xff:
@@ -1146,12 +1211,12 @@ void m68000_write_memory_16(uint32_t offset, uint16_t data)
 			if (offset >= 0xfffff0)
 			{
 				offset -= 0xbffff0;
-				WRITE_WORD(static_ram4, offset, data);
+				WRITE_WORD(static_ram4, (offset - 0x400000), data);
 				return;
 			}
 		}
 #endif
-		WRITE_WORD(static_ram1, offset, data);
+		WRITE_WORD(static_ram1, (offset - 0xff0000), data);
 		return;
 	}
 }

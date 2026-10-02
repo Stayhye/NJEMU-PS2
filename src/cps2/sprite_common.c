@@ -12,41 +12,34 @@
 ******************************************************************************/
 
 #include "sprite_common.h"
+#include "common/cache.h"
 
 /******************************************************************************
 	Shared variable definitions
 ******************************************************************************/
 
 /* OBJECT */
-/* Tile-cache diagnostics: increments when the pool is exhausted
- * and a sprite had to be skipped (never draw a black tile). */
-uint32_t g_tile_pool_full = 0;
-
 SPRITE ALIGN16_DATA *object_head[OBJECT_HASH_SIZE];
 SPRITE ALIGN16_DATA object_data[OBJECT_TEXTURE_SIZE];
 SPRITE ALIGN16_DATA *object_free_head;
-uint8_t *tex_object;
 uint16_t object_texture_num;
 
 /* SCROLL1 */
 SPRITE ALIGN16_DATA *scroll1_head[SCROLL1_HASH_SIZE];
 SPRITE ALIGN16_DATA scroll1_data[SCROLL1_TEXTURE_SIZE];
 SPRITE ALIGN16_DATA *scroll1_free_head;
-uint8_t *tex_scroll1;
 uint16_t scroll1_texture_num;
 
 /* SCROLL2 */
 SPRITE ALIGN16_DATA *scroll2_head[SCROLL2_HASH_SIZE];
 SPRITE ALIGN16_DATA scroll2_data[SCROLL2_TEXTURE_SIZE];
 SPRITE ALIGN16_DATA *scroll2_free_head;
-uint8_t *tex_scroll2;
 uint16_t scroll2_texture_num;
 
 /* SCROLL3 */
 SPRITE ALIGN16_DATA *scroll3_head[SCROLL3_HASH_SIZE];
 SPRITE ALIGN16_DATA scroll3_data[SCROLL3_TEXTURE_SIZE];
 SPRITE ALIGN16_DATA *scroll3_free_head;
-uint8_t *tex_scroll3;
 uint16_t scroll3_texture_num;
 
 /* Scroll2 clipping */
@@ -63,333 +56,14 @@ int16_t object_min_y;
 /* Pen usage */
 uint8_t *pen_usage;
 
-/* Screen bitmap */
-uint16_t *scrbitmap;
-
 /* Color table for palette index encoding */
-const uint32_t ALIGN16_DATA color_table[16] =
+const uint32_t ALIGN16_DATA sprite_color_table[16] =
 {
 	0x00000000, 0x10101010, 0x20202020, 0x30303030,
 	0x40404040, 0x50505050, 0x60606060, 0x70707070,
 	0x80808080, 0x90909090, 0xa0a0a0a0, 0xb0b0b0b0,
 	0xc0c0c0c0, 0xd0d0d0d0, 0xe0e0e0e0, 0xf0f0f0f0
 };
-
-/* 'swizzle' texture address calculation table (8-bit color) */
-const int ALIGN16_DATA swizzle_table_8bit[32] =
-{
-	   0, 16, 16, 16, 16, 16, 16, 16,
-	3984, 16, 16, 16, 16, 16, 16, 16,
-	3984, 16, 16, 16, 16, 16, 16, 16,
-	3984, 16, 16, 16, 16, 16, 16, 16
-};
-
-/* Function pointer array for software rendering */
-void ALIGN16_DATA (*drawgfx16[8])(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines) =
-{
-	drawgfx16_16x16,
-	drawgfx16_16x16_opaque,
-	drawgfx16_16x16_flipx,
-	drawgfx16_16x16_flipx_opaque,
-	drawgfx16_16x16_flipy,
-	drawgfx16_16x16_flipy_opaque,
-	drawgfx16_16x16_flipxy,
-	drawgfx16_16x16_flipxy_opaque
-};
-
-
-/******************************************************************************
-	SCROLL2 Software Rendering
-
-	Used when SCROLL2 clip region is too small for hardware rendering
-	(less than 16 scanlines). This enables per-line parallax scrolling
-	effects.
-
-	Note: The interleaved pixel pattern (0,4,1,5,2,6,3,7) is inherent to
-	CPS2's graphics ROM format, NOT a platform optimization.
-******************************************************************************/
-
-/*------------------------------------------------------------------------
-	16bpp 16x16 - Transparent pixels (color 0) are skipped
-------------------------------------------------------------------------*/
-
-void drawgfx16_16x16(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile, mask;
-
-	while (lines--)
-	{
-		tile = src[0];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 0] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[ 4] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 1] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[ 5] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[ 2] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 6] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[ 3] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 7] = pal[(tile >> 28) & 0x0f];
-		}
-		tile = src[1];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 8] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[12] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 9] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[13] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[10] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[14] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[11] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[15] = pal[(tile >> 28) & 0x0f];
-		}
-		src += 2;
-		dst += BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipx(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile, mask;
-
-	while (lines--)
-	{
-		tile = src[0];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[15] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[11] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[14] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[10] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[13] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 9] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[12] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 8] = pal[(tile >> 28) & 0x0f];
-		}
-		tile = src[1];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 7] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[ 3] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 6] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[ 2] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[ 5] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 1] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[ 4] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 0] = pal[(tile >> 28) & 0x0f];
-		}
-		src += 2;
-		dst += BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile, mask;
-
-	while (lines--)
-	{
-		tile = src[0];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 0] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[ 4] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 1] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[ 5] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[ 2] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 6] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[ 3] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 7] = pal[(tile >> 28) & 0x0f];
-		}
-		tile = src[1];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 8] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[12] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 9] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[13] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[10] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[14] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[11] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[15] = pal[(tile >> 28) & 0x0f];
-		}
-		src += 2;
-		dst -= BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipxy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile, mask;
-
-	while (lines--)
-	{
-		tile = src[0];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[15] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[11] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[14] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[10] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[13] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 9] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[12] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 8] = pal[(tile >> 28) & 0x0f];
-		}
-		tile = src[1];
-		mask = ~tile;
-		if (mask)
-		{
-			if (mask & 0x000f) dst[ 7] = pal[(tile >>  0) & 0x0f];
-			if (mask & 0x00f0) dst[ 3] = pal[(tile >>  4) & 0x0f];
-			if (mask & 0x0f00) dst[ 6] = pal[(tile >>  8) & 0x0f];
-			if (mask & 0xf000) dst[ 2] = pal[(tile >> 12) & 0x0f];
-			mask >>= 16;
-			if (mask & 0x000f) dst[ 5] = pal[(tile >> 16) & 0x0f];
-			if (mask & 0x00f0) dst[ 1] = pal[(tile >> 20) & 0x0f];
-			if (mask & 0x0f00) dst[ 4] = pal[(tile >> 24) & 0x0f];
-			if (mask & 0xf000) dst[ 0] = pal[(tile >> 28) & 0x0f];
-		}
-		src += 2;
-		dst -= BUF_WIDTH;
-	}
-}
-
-
-/*------------------------------------------------------------------------
-	16bpp 16x16 (opaque)
-------------------------------------------------------------------------*/
-
-void drawgfx16_16x16_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile;
-
-	while (lines--)
-	{
-		tile = src[0];
-		dst[ 0] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 4] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 1] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 5] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 2] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 6] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 3] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 7] = pal[tile & 0x0f];
-		tile = src[1];
-		dst[ 8] = pal[tile & 0x0f]; tile >>= 4;
-		dst[12] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 9] = pal[tile & 0x0f]; tile >>= 4;
-		dst[13] = pal[tile & 0x0f]; tile >>= 4;
-		dst[10] = pal[tile & 0x0f]; tile >>= 4;
-		dst[14] = pal[tile & 0x0f]; tile >>= 4;
-		dst[11] = pal[tile & 0x0f]; tile >>= 4;
-		dst[15] = pal[tile & 0x0f];
-		src += 2;
-		dst += BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipx_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile;
-
-	while (lines--)
-	{
-		tile = src[0];
-		dst[15] = pal[tile & 0x0f]; tile >>= 4;
-		dst[11] = pal[tile & 0x0f]; tile >>= 4;
-		dst[14] = pal[tile & 0x0f]; tile >>= 4;
-		dst[10] = pal[tile & 0x0f]; tile >>= 4;
-		dst[13] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 9] = pal[tile & 0x0f]; tile >>= 4;
-		dst[12] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 8] = pal[tile & 0x0f];
-		tile = src[1];
-		dst[ 7] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 3] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 6] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 2] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 5] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 1] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 4] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 0] = pal[tile & 0x0f];
-		src += 2;
-		dst += BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile;
-
-	while (lines--)
-	{
-		tile = src[0];
-		dst[ 0] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 4] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 1] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 5] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 2] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 6] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 3] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 7] = pal[tile & 0x0f];
-		tile = src[1];
-		dst[ 8] = pal[tile & 0x0f]; tile >>= 4;
-		dst[12] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 9] = pal[tile & 0x0f]; tile >>= 4;
-		dst[13] = pal[tile & 0x0f]; tile >>= 4;
-		dst[10] = pal[tile & 0x0f]; tile >>= 4;
-		dst[14] = pal[tile & 0x0f]; tile >>= 4;
-		dst[11] = pal[tile & 0x0f]; tile >>= 4;
-		dst[15] = pal[tile & 0x0f];
-		src += 2;
-		dst -= BUF_WIDTH;
-	}
-}
-
-void drawgfx16_16x16_flipxy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines)
-{
-	uint32_t tile;
-
-	while (lines--)
-	{
-		tile = src[0];
-		dst[15] = pal[tile & 0x0f]; tile >>= 4;
-		dst[11] = pal[tile & 0x0f]; tile >>= 4;
-		dst[14] = pal[tile & 0x0f]; tile >>= 4;
-		dst[10] = pal[tile & 0x0f]; tile >>= 4;
-		dst[13] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 9] = pal[tile & 0x0f]; tile >>= 4;
-		dst[12] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 8] = pal[tile & 0x0f];
-		tile = src[1];
-		dst[ 7] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 3] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 6] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 2] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 5] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 1] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 4] = pal[tile & 0x0f]; tile >>= 4;
-		dst[ 0] = pal[tile & 0x0f];
-		src += 2;
-		dst -= BUF_WIDTH;
-	}
-}
-
 
 /******************************************************************************
 	OBJECT Sprite Management
@@ -426,58 +100,13 @@ int32_t object_get_sprite(uint32_t key)
 	Register sprite in OBJECT texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-static void object_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < OBJECT_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = object_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			object_head[best->key & OBJECT_HASH_MASK] = best->next;
-		best->next = object_free_head;
-		object_free_head = best;
-		object_texture_num--;
-	}
-}
-
 int32_t object_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & OBJECT_HASH_MASK;
 	SPRITE *p = object_head[hash];
 	SPRITE *q = object_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		object_evict_lru();
-		q = object_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	object_free_head = object_free_head->next;
 
@@ -581,58 +210,13 @@ int32_t scroll1_get_sprite(uint32_t key)
 	Register sprite in SCROLL1 texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-static void scroll1_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < SCROLL1_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = scroll1_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			scroll1_head[best->key & SCROLL1_HASH_MASK] = best->next;
-		best->next = scroll1_free_head;
-		scroll1_free_head = best;
-		scroll1_texture_num--;
-	}
-}
-
 int32_t scroll1_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & SCROLL1_HASH_MASK;
 	SPRITE *p = scroll1_head[hash];
 	SPRITE *q = scroll1_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		scroll1_evict_lru();
-		q = scroll1_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	scroll1_free_head = scroll1_free_head->next;
 
@@ -736,58 +320,13 @@ int32_t scroll2_get_sprite(uint32_t key)
 	Register sprite in SCROLL2 texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-static void scroll2_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < SCROLL2_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = scroll2_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			scroll2_head[best->key & SCROLL2_HASH_MASK] = best->next;
-		best->next = scroll2_free_head;
-		scroll2_free_head = best;
-		scroll2_texture_num--;
-	}
-}
-
 int32_t scroll2_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & SCROLL2_HASH_MASK;
 	SPRITE *p = scroll2_head[hash];
 	SPRITE *q = scroll2_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		scroll2_evict_lru();
-		q = scroll2_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	scroll2_free_head = scroll2_free_head->next;
 
@@ -891,58 +430,13 @@ int32_t scroll3_get_sprite(uint32_t key)
 	Register sprite in SCROLL3 texture
 ------------------------------------------------------------------------*/
 
-/* Evict the least-recently-used entry so new tiles can always be
- * registered (prevents black tiles when the pool is exhausted). */
-static void scroll3_evict_lru(void)
-{
-	int i;
-	SPRITE *best = NULL, *best_prev = NULL;
-	uint32_t best_used = 0xFFFFFFFF;
-
-	/* Pass 1: prefer entries NOT used this frame (same rule as
-	 * delete_sprite) so eviction never aliases a slot this frame's
-	 * vertices still reference. */
-	for (i = 0; i < SCROLL3_HASH_SIZE; i++)
-	{
-		SPRITE *prev = NULL, *p = scroll3_head[i];
-		while (p)
-		{
-			if (p->used != frames_displayed && p->used < best_used)
-			{
-				best_used = p->used;
-				best = p;
-				best_prev = prev;
-			}
-			prev = p;
-			p = p->next;
-		}
-	}
-
-	if (best)
-	{
-		if (best_prev)
-			best_prev->next = best->next;
-		else
-			scroll3_head[best->key & SCROLL3_HASH_MASK] = best->next;
-		best->next = scroll3_free_head;
-		scroll3_free_head = best;
-		scroll3_texture_num--;
-	}
-}
-
 int32_t scroll3_insert_sprite(uint32_t key)
 {
 	uint16_t hash = key & SCROLL3_HASH_MASK;
 	SPRITE *p = scroll3_head[hash];
 	SPRITE *q = scroll3_free_head;
 
-	if (!q)
-	{
-		/* pool exhausted: evict LRU and retry once */
-		scroll3_evict_lru();
-		q = scroll3_free_head;
-		if (!q) { g_tile_pool_full++; return -1; }
-	}
+	if (!q) return -1;
 
 	scroll3_free_head = scroll3_free_head->next;
 
@@ -1095,6 +589,7 @@ void blit_update_object(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 
 void blit_update_scroll1(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 {
+	(void)x; (void)y;
 	uint32_t key = MAKE_KEY(code, attr);
 	SPRITE *p = scroll1_head[key & SCROLL1_HASH_MASK];
 
@@ -1122,6 +617,7 @@ void blit_update_scroll1(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 
 void blit_update_scroll2(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 {
+	(void)x;
 	if (y > clip_min_y - 16 && y < clip_max_y)
 	{
 		uint32_t key = MAKE_KEY(code, attr);
@@ -1152,6 +648,7 @@ void blit_update_scroll2(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 
 void blit_update_scroll3(int16_t x, int16_t y, uint32_t code, uint16_t attr)
 {
+	(void)x; (void)y;
 	uint32_t key = MAKE_KEY(code, attr);
 	SPRITE *p = scroll3_head[key & SCROLL3_HASH_MASK];
 

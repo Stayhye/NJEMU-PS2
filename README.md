@@ -15,7 +15,6 @@
 - [Building](#building)
   - [Build Commands](#build-commands)
   - [Build Options](#build-options)
-  - [Legacy Build System (Makefile)](#legacy-build-system-makefile)
 - [Platform-Specific Build Instructions](#platform-specific-build-instructions)
   - [PSP (PlayStation Portable)](#psp-playstation-portable)
   - [PS2 (PlayStation 2)](#ps2-playstation-2)
@@ -26,7 +25,7 @@
   - [NCDZ-Specific Setup](#ncdz-specific-setup)
 - [ROM Conversion Tool (romcnv)](#rom-conversion-tool-romcnv)
 - [Memory Requirements](#memory-requirements)
-  - [PSP Extended Memory (LARGE_MEMORY)](#psp-extended-memory-large_memory---slim2000)
+  - [PSP Runtime Memory Policy](#psp-runtime-memory-policy)
 - [Project Structure](#project-structure)
 - [Technical Architecture](#technical-architecture---emulator-targets)
   - [MVS (Neo-Geo) Target](#mvs-neo-geo-target)
@@ -49,43 +48,46 @@
 
 ## Overview
 
-**NJEMU** is an open-source arcade emulator that provides emulation for classic arcade systems from Capcom and SNK. Originally developed exclusively for the **PSP (PlayStation Portable)**, this project is now being ported to additional platforms.
+**NJEMU** is an open-source arcade emulator for classic Capcom and SNK hardware. It originated as a **PSP (PlayStation Portable)** project and now supports PSP, **PlayStation 2**, and **Desktop/SDL2** from the same C codebase.
 
 **Current Version:** 2.4.0  
 **Based on:** NJEmu 2.3.5
 
-### Porting Project
+### Multi-Platform Status
 
-This repository contains the ongoing effort to bring NJEMU to multiple platforms:
+The PSP-first codebase has completed its platform-driver refactor. All four emulator cores and the shared GUI/menu frontend now run through common contracts on all three supported hosts:
 
-- **PSP** - Original platform, fully supported
-- **PS2** - All four emulator cores ported and running
-- **DESKTOP** - All four emulator cores ported (SDL2-based, useful for development and debugging)
+- **PSP** - Original platform with native GU/audio/input backends
+- **PS2** - Native gsKit/PS2SDK backend for all four cores and the common GUI
+- **DESKTOP** - SDL2 backend for all four cores and the common GUI, also used for tests and debugging
 
-All four emulator cores (MVS, CPS1, CPS2, NCDZ) are now running on all three platforms. The PC port using SDL serves primarily as a development and debugging tool. The next milestone is porting the GUI/menu system — currently only available on PSP; other platforms use a stub UI for direct game loading.
+MVS, CPS1, CPS2, and NCDZ each have a single platform-neutral `sprite.c`. Target code owns emulation and rendering semantics; the selected host backend owns native texture layout, GPU submission, audio, physical input, threading, timing, lifecycle, and optional power capabilities.
 
 ### Architecture
 
-The porting effort involved encapsulating platform-agnostic code and creating specific **drivers** for each platform. This abstraction layer allows the emulation core to run on different hardware while platform-specific code handles:
+Platform selection is a build/link-time concern rather than a set of host `#ifdef`s spread through common code. Each backend binds the shared driver contracts from its `<platform>_drivers.c`, while common and target code remain independent of PSP/PS2/SDL SDK types.
 
-- Video rendering
-- Audio output
-- Input handling
-- Threading
-- File I/O
+The current architecture follows these rules:
+
+- `src/common/` contains no PSP/PS2/Desktop conditionals and no native platform SDK includes
+- Target sprite renderers emit compact portable texture updates and vertex/point batches through `video_driver_t`
+- PSP consumes the common sprite vertex layout directly; PS2 converts it once into its final gsKit queue location; Desktop consumes it through SDL
+- Input backends report stable physical state; player routing, menu combinations, autofire, and target-specific interpretation stay in common/target code
+- Power, frame readback, UI texture storage, and similar differences are expressed as capabilities instead of PSP-shaped assumptions
+- Platform SDK headers and private backend state stay inside `src/<platform>/`
 
 ### Current Porting Status
 
 | Emulator | PSP | PS2 | PC |
 |----------|-----|-----|-----|
-| **MVS** | ✅ Full | ✅ Core | ✅ Core |
-| **CPS1** | ✅ Full | ✅ Core | ✅ Core |
-| **CPS2** | ✅ Full | ✅ Core | ✅ Core |
-| **NCDZ** | ✅ Full | ✅ Core | ✅ Core |
+| **MVS** | ✅ Full | ✅ Full | ✅ Full |
+| **CPS1** | ✅ Full | ✅ Full | ✅ Full |
+| **CPS2** | ✅ Full | ✅ Full | ✅ Full |
+| **NCDZ** | ✅ Full | ✅ Full | ✅ Full |
 
-> **Note:** All four emulator cores (MVS, CPS1, CPS2, NCDZ) have been ported to PS2 and PC. The menu/GUI system has not been ported yet — only the emulation core runs on the new platforms.
+> **Note:** "Full" here means the emulator core and common GUI/menu frontend are available on the platform. Platform-specific features such as PSP Ad Hoc remain capability-dependent.
 
-📋 See [PORTING_PLAN.md](PORTING_PLAN.md) for detailed roadmap and remaining work.
+📋 See [PORTING_PLAN.md](PORTING_PLAN.md) for current platform status and follow-up work, and [docs/PLATFORM_PORTING_GUIDE.md](docs/PLATFORM_PORTING_GUIDE.md) for the backend extension contract.
 
 ---
 
@@ -108,18 +110,14 @@ Each target has specific setup requirements. See the linked README files for:
 | Platform | Description | Status |
 |----------|-------------|--------|
 | **PSP** | Sony PlayStation Portable | ✅ Original platform |
-| **PS2** | Sony PlayStation 2 | ✅ Core complete |
-| **DESKTOP** | PC/Desktop (SDL2) | ✅ Core complete |
+| **PS2** | Sony PlayStation 2 | ✅ Full |
+| **DESKTOP** | PC/Desktop (SDL2) | ✅ Full |
 
-### PSP Firmware Compatibility
+### PSP Runtime and Packaging
 
-| Build Type | Required Firmware | Target Hardware |
-|------------|-------------------|-----------------|
-| **FW 3.xx** | CFW 3.03+ | PSP-1000/2000/3000 |
-| **FW 1.50 Kernel** | FW 1.50 | PSP-1000 only |
-| **PSP Slim (LARGE_MEMORY)** | CFW 3.71 M33+ | PSP-2000/3000 |
+The maintained PSP build uses the current CMake/PSPSDK PRX + `EBOOT.PBP` packaging path. By default NJEMU runs as a user-mode module and explicitly requests the largest PSP user-memory partition; runtime memory sizing is then determined by the common allocator policy.
 
-> **Note:** The 1.50 Kernel build does NOT work on PSP-2000 or later models.
+`KERNEL_MODE=ON` remains available for the PSP-specific code paths that require a kernel module, but it is not a separate legacy 1.50 packaging system. Historical firmware-specific build layouts from the original PSP-only project are no longer the maintained build path.
 
 ---
 
@@ -132,11 +130,10 @@ Each target has specific setup requirements. See the linked README files for:
 | O (Circle) | OK / Confirm |
 | X (Cross) | Cancel |
 | SELECT | Help (press in any menu except game screen) |
-| HOME / PS | Emulator menu (during gameplay) |
-| SELECT + START | Emulator menu (alternative) |
+| SELECT + START | Emulator menu (during gameplay) |
 | R Trigger | BIOS menu (MVS file browser) |
 
-> **Note:** On PS Vita or PPSSPP, the HOME/PS button may not work. You can delete `SystemButtons.prx` and use SELECT+START instead.
+> **Menu shortcut:** press START+SELECT during gameplay to open the emulator menu on every platform.
 
 ### In-Game Controls
 
@@ -264,8 +261,7 @@ All folders are automatically created on first launch.
 ```
 /PSP/GAME/CPS1PSP/              (or CPS2PSP/)
 ├── EBOOT.PBP                   # Main executable
-├── SystemButtons.prx           # System button handler
-├── cps1psp.ini                 # Settings (auto-created)
+├── njemu.ini                    # Settings (auto-created)
 ├── rominfo.cps1                # ROM database (REQUIRED)
 ├── zipname.cps1                # English game names (REQUIRED)
 ├── zipnamej.cps1               # Japanese game names (optional)
@@ -283,8 +279,7 @@ All folders are automatically created on first launch.
 ```
 /PSP/GAME/MVSPSP/
 ├── EBOOT.PBP                   # Main executable
-├── SystemButtons.prx           # System button handler
-├── mvspsp.ini                  # Settings (auto-created)
+├── njemu.ini                  # Settings (auto-created)
 ├── rominfo.mvs                 # ROM database (REQUIRED)
 ├── zipname.mvs                 # English game names (REQUIRED)
 ├── zipnamej.mvs                # Japanese game names (optional)
@@ -304,20 +299,16 @@ All folders are automatically created on first launch.
 ```
 /PSP/GAME/NCDZPSP/
 ├── EBOOT.PBP                   # Main executable
-├── SystemButtons.prx           # System button handler
-├── ncdzpsp.ini                 # Settings (auto-created)
+├── njemu.ini                    # Settings (auto-created)
 ├── command.dat                 # MAME Plus! command list (optional)
 ├── roms/                       # CD-ROM images
 │   └── [Game Name]/            # Game folder
 │       ├── *.PRG, *.SPR, etc.  # CD-ROM files (or single .zip)
 │       └── mp3/                # MP3 audio tracks
 ├── config/                     # Per-game settings
-├── data/                       # Custom wallpapers (optional)
 ├── snap/                       # Screenshots
 └── state/                      # Save states
 ```
-
-> **Note:** For FW 1.5 Kernel, use `/PSP/GAME150/` or `/PSP/GAME3xx/` instead of `/PSP/GAME/`.
 
 ---
 
@@ -327,18 +318,15 @@ All folders are automatically created on first launch.
 - ROM caching system for improved performance
 - Save state support
 - Cheat support with extensive cheat databases
-- Multiple language support (auto-detected from PSP system language)
+- Multiple language support (platform system language on PSP/PS2; English fallback on Desktop)
 - DIP switch configuration (CPS1, MVS)
 - BIOS menu with UniBIOS 1.0-3.0 support (MVS)
 - Ad Hoc multiplayer (PSP, except NCDZPSP)
 - Command list display (MAME Plus! format)
-- Custom wallpaper support (NCDZ)
 
 ### Language Support
 
-The UI language is automatically detected from your PSP's system language:
-- **Japanese system language** → Japanese UI
-- **Other languages** → English UI
+The UI language is selected through the platform driver. PSP and PS2 map their system language to Japanese, Spanish, Simplified Chinese, Traditional Chinese, or English; Desktop currently uses English. If a requested catalog is unavailable, NJEMU falls back to English.
 
 The `zipnamej.*` files (Japanese game name lists) are optional and can be deleted if not needed.
 
@@ -380,11 +368,10 @@ cmake --build build_psp_cps1
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `LARGE_MEMORY` | Enable large memory mode (PSP-2000+) | OFF |
 | `KERNEL_MODE` | Enable kernel mode (PSP) | OFF |
 | `COMMAND_LIST` | Enable command list display | OFF |
 | `ADHOC` | Enable Ad Hoc multiplayer | OFF |
-| `NO_GUI` | Disable GUI (headless mode) | ON |
+| `GUI` | Enable GUI menu system | OFF |
 | `SAVE_STATE` | Enable save state support | OFF |
 | `RELEASE` | Release build | OFF |
 
@@ -410,59 +397,6 @@ Each target has a corresponding resource folder under `resources/` containing fi
 | NCDZ | `resources/ncdz/` | [README](resources/ncdz/README.md) |
 
 These resource files are automatically copied to the build directory and included in release artifacts when running CMake.
-
----
-
-## Legacy Build System (Makefile)
-
-> **Note:** The original NJEMU used Makefile-based builds. The modern CMake system (documented above) is recommended, but this legacy information is preserved for reference.
-
-### Original Build Environment
-
-- **PSPSDK 0.11.2 + MSYS**
-
-### Makefile Configuration
-
-Before compiling, edit the Makefile to configure build targets. Lines starting with `#` are disabled; remove `#` to enable.
-
-#### Build Targets
-
-| Option | Description |
-|--------|-------------|
-| `BUILD_CPS1 = 1` | Compile CPS1PSP |
-| `BUILD_CPS2 = 1` | Compile CPS2PSP |
-| `BUILD_MVS = 1` | Compile MVSPSP |
-| `BUILD_NCDZ = 1` | Compile NCDZPSP |
-
-#### Build Options
-
-| Option | Description |
-|--------|-------------|
-| `LARGE_MEMORY = 1` | Compile for PSP-2000+ with CFW 3.71 M33 or higher (user mode) |
-| `KERNEL_MODE = 1` | Compile for FW 1.5 kernel |
-| `ADHOC = 1` | Enable AdHoc multiplayer (not supported by NCDZPSP) |
-| `SAVE_STATE = 1` | Enable save state/load functionality |
-| `COMMAND_LIST = 1` | Enable command list (move list) display |
-| `RELEASE = 1` | Release build (code within `#if RELEASE ~ #endif` is enabled) |
-
-#### Version Settings
-
-| Option | Description |
-|--------|-------------|
-| `VERSION_MAJOR = 2` | Major version number (for large-scale updates) |
-| `VERSION_MINOR = 2` | Minor version number (even = stable, odd = development) |
-| `VERSION_BUILD = 0` | Build number (for minor bug fixes) |
-
-> **Note:** Version numbering follows the pattern where the next release after v1.0 would be v1.2 (even numbers for stable releases).
-
-### SystemButtons.prx
-
-SystemButtons.prx is a PRX module that reads system button input in kernel mode via a dedicated thread.
-
-**Building:**
-1. Navigate to the `systembutton_prx` directory
-2. Run `make`
-3. Copy `systembutton.prx` to the same directory as `EBOOT.PBP`
 
 ---
 
@@ -509,13 +443,13 @@ Replace `{TARGET}` with one of: `CPS1`, `CPS2`, `MVS`, or `NCDZ`.
 3. Build the project:
 
 ```bash
-make
+cmake --build . --parallel
 ```
 
 #### Example: Building CPS1 for PSP
 
 ```bash
-export PSPDEV=/Users/fjtrujy/toolchains/psp/pspdev
+export PSPDEV=/path/to/pspdev
 export PATH=$PSPDEV/bin:$PATH
 
 mkdir build_psp_cps1
@@ -525,18 +459,20 @@ cmake -DPLATFORM="PSP" \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DTARGET=CPS1 \
       ..
-make
+cmake --build . --parallel
 ```
 
 #### Output
 
 After a successful build, you'll find the following files in the build directory:
 - `EBOOT.PBP` - The main executable for PSP
-- Resource files copied from `{TARGET}_RESOURCE/`
+  - The PBP embeds the target-specific XMB icon from `data/{target}.png`.
+  - Its XMB title includes the target and NJEMU version (for example, `MVS 2.4 for PSP`).
+- Resource entries are staged directly in the build root. Large/read-only assets are **linked** back to `resources/{target}/`, while writable data such as `config/`, `nvram/`, `memcard/`, `state/`, screenshots, and `game_name.ini` are private build copies. Set `-DCOPY_RESOURCES=ON` to force a full copy.
 
-#### Configuring the Game (NO_GUI builds)
+#### Configuring the Game (without GUI)
 
-For builds with `NO_GUI=ON` (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
+For builds without GUI (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
 
 ```bash
 echo "sf2" > game_name.ini
@@ -602,47 +538,47 @@ cd build_ps2_{target}
 2. Run CMake with the PS2 toolchain:
 
 ```bash
-cmake -DCMAKE_TOOLCHAIN_FILE=${PS2SDK}/ps2dev.cmake \
+cmake -DCMAKE_TOOLCHAIN_FILE=${PS2DEV}/share/ps2dev.cmake \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DTARGET={TARGET} \
       -DPLATFORM=PS2 \
       ..
 ```
 
-Replace `{TARGET}` with one of: `MVS`, `NCDZ`, or `CPS1` (currently supported on PS2).
+Replace `{TARGET}` with one of: `MVS`, `NCDZ`, `CPS1`, or `CPS2`.
 
 3. Build the project:
 
 ```bash
-make
+cmake --build . --parallel
 ```
 
 #### Example: Building MVS for PS2
 
 ```bash
-export PS2DEV=/Users/fjtrujy/toolchains/ps2/ps2dev
+export PS2DEV=/path/to/ps2dev
 export PS2SDK=$PS2DEV/ps2sdk
 export PATH=$PATH:$PS2DEV/bin:$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2DEV/dvp/bin:$PS2SDK/bin
 
 mkdir build_ps2_mvs
 cd build_ps2_mvs
-cmake -DCMAKE_TOOLCHAIN_FILE=${PS2SDK}/ps2dev.cmake \
+cmake -DCMAKE_TOOLCHAIN_FILE=${PS2DEV}/share/ps2dev.cmake \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DTARGET=MVS \
       -DPLATFORM=PS2 \
       ..
-make
+cmake --build . --parallel
 ```
 
 #### Output
 
-After a successful build, you'll find the following files in the build directory:
-- `{TARGET}.elf` - The main executable for PS2
-- Resource files copied from `{TARGET}_RESOURCE/`
+After a successful build, you'll find the following in the build directory:
+- `{TARGET}` - The main executable for PS2
+- Resource entries are staged directly in the build root. Large/read-only assets such as `roms/`, `data/`, `cache/`, `rominfo.*`, and `zipname.*` are **linked** from `resources/{target}/`; writable data such as `config/`, `nvram/`, `memcard/`, `state/`, screenshots, and `game_name.ini` are private build copies. This matches the runtime `launchDir` layout and PCSX2's `host:` root without letting runtime writes modify `resources/`. Use `-DCOPY_RESOURCES=ON` to force a full copy.
 
-#### Configuring the Game (NO_GUI builds)
+#### Configuring the Game (without GUI)
 
-For builds with `NO_GUI=ON` (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
+For builds without GUI (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
 
 ```bash
 echo "mslug" > game_name.ini
@@ -663,7 +599,7 @@ From the build directory, run:
 /Applications/PCSX2.app/Contents/MacOS/PCSX2 -elf $(pwd)/{TARGET}
 ```
 
-Replace `{TARGET}` with the target name (e.g., `MVS`, `NCDZ`).
+Replace `{TARGET}` with the target name (e.g., `MVS`, `NCDZ`, `CPS1`, `CPS2`). PCSX2 exposes the executable's directory as the PS2 `host:` root, so the resource links/copies must remain beside the executable.
 
 #### Debugging
 
@@ -716,12 +652,12 @@ cmake -DPLATFORM="Desktop" \
       ..
 ```
 
-Replace `{TARGET}` with one of: `MVS`, `NCDZ`, or `CPS1` (currently supported on Desktop).
+Replace `{TARGET}` with one of: `CPS1`, `CPS2`, `MVS`, or `NCDZ`.
 
 3. Build the project:
 
 ```bash
-make
+cmake --build . --parallel
 ```
 
 #### Example: Building MVS for Desktop
@@ -733,18 +669,18 @@ cmake -DPLATFORM="Desktop" \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DTARGET=MVS \
       ..
-make
+cmake --build . --parallel
 ```
 
 #### Output
 
 After a successful build, you'll find the following files in the build directory:
 - `{TARGET}` - The main executable
-- Resource files copied from `{TARGET}_RESOURCE/`
+- Resource entries are staged directly in the build root. Large/read-only assets are linked back to `resources/{target}/`, while writable data such as `config/`, `nvram/`, `memcard/`, `state/`, screenshots, and `game_name.ini` are private build copies. Use `-DCOPY_RESOURCES=ON` to force a full copy.
 
-#### Configuring the Game (NO_GUI builds)
+#### Configuring the Game (without GUI)
 
-For builds with `NO_GUI=ON` (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
+For builds without GUI (default), the emulator reads the game to boot from the `game_name.ini` file in the build directory. Edit this file and set it to the ROM name (without extension):
 
 ```bash
 echo "mslug" > game_name.ini
@@ -904,22 +840,6 @@ roms/
         └── ...
 ```
 
-#### Custom Background Images
-
-Replace default wallpapers with custom PNG images (8-bit or 24-bit color, 480×272 pixels recommended):
-
-| File | Screen |
-|------|--------|
-| `data/logo.png` | Startup / Main menu |
-| `data/filer.png` | File browser |
-| `data/gamecfg.png` | Game settings |
-| `data/keycfg.png` | Button configuration |
-| `data/state.png` | Save/Load state |
-| `data/colorcfg.png` | Color settings |
-| `data/cmdlist.png` | Command list |
-
-> **Note:** Large images may fail to load due to memory constraints.
-
 ---
 
 ## ROM Conversion Tool (romcnv)
@@ -989,7 +909,7 @@ Understanding memory allocation is crucial for PSP and PS2 platforms where RAM i
 | Platform | Available RAM | Notes |
 |----------|--------------|-------|
 | PSP (Fat) | ~24 MB | User memory only |
-| PSP (Slim/2000+) | ~64 MB | With LARGE_MEMORY builds |
+| PSP (Slim/2000+) | ~64 MB | Same EBOOT requests the expanded user-memory partition |
 | PS2 | ~32 MB | Main RAM |
 | Desktop | Unlimited | System dependent |
 
@@ -1011,118 +931,32 @@ Many arcade games have graphics data larger than available RAM:
 
 The cache system streams graphics from storage in 64 KB blocks, allowing large games to run on memory-constrained platforms.
 
-### Cache Configuration
+### PSP Runtime Memory Policy
 
-| Constant | Normal Memory | LARGE_MEMORY |
-|----------|---------------|--------------|
-| MAX_CACHE_SIZE | 20 MB | 32 MB |
-| MIN_CACHE_SIZE | 2 MB | 4 MB |
-| BLOCK_SIZE | 64 KB | 64 KB |
+NJEMU ships a single PSP binary. Its PARAM.SFO explicitly requests the largest
+user-memory partition with `MEMSIZE=1`; the same EBOOT therefore runs on
+PSP-1000 and PSP-2000/3000-class hardware without a model-specific build.
 
-### PSP Extended Memory (LARGE_MEMORY - Slim/2000+)
+At startup NJEMU measures the memory actually available to the process with
+`pspSdkTotalFreeUserMemSize()` and the largest contiguous allocation with
+`sceKernelMaxFreeMemSize()`. The game-specific memory planner then chooses the
+cache/residency targets from those runtime measurements.
 
-PSP Slim (2000/3000) models have 32 MB of additional memory that's not accessible to standard PSP applications. NJEMU can use this extended memory when built with `-DLARGE_MEMORY=ON`.
+The important consequences are:
 
-#### Memory Address Space
-
-```c
-#define PSP2K_MEM_TOP    0xa000000   // Start of extended memory
-#define PSP2K_MEM_BOTTOM 0xbffffff   // End of extended memory
-#define PSP2K_MEM_SIZE   0x2000000   // 32 MB total
-```
-
-#### Custom Allocator
-
-A custom allocator manages this extended memory region:
-
-```c
-static void *psp2k_mem_alloc(int32_t size);   // Allocate from extended memory
-static void *psp2k_mem_move(void *mem, int32_t size);  // Move data to extended memory
-static void psp2k_mem_free(void *mem);        // Free (only works for standard memory)
-```
-
-**Important Limitations:**
-- Memory allocated in the extended region **cannot be freed** (causes system freeze)
-- Allocations are linear - no fragmentation management
-- Once a game uses extended memory, system must restart to reclaim it
-
-#### Concrete Usage in Code
-
-**Direct Allocation with `psp2k_mem_alloc()`:**
-
-| Location | Region | Purpose | Size |
-|----------|--------|---------|------|
-| `src/mvs/memintrf.c:847` | `memory_region_gfx3` | Sprite ROM data (unencrypted games) | 8-64 MB |
-| `src/mvs/memintrf.c:966` | `memory_region_sound1` | YM2610 ADPCM samples (fallback when malloc fails) | 1-8 MB |
-
-**Memory Migration with `psp2k_mem_move()`:**
-
-When SOUND1 allocation triggers extended memory use (`psp2k_mem_left != PSP2K_MEM_SIZE`), regions are moved to free main RAM for cache (`src/mvs/memintrf.c:1775-1785`):
-
-| Region | Data Type | Typical Size |
-|--------|-----------|--------------|
-| `memory_region_user3` | Protection/banking data | Variable |
-| `memory_region_gfx4` | Fixed layer sprites (FIX) | 128 KB - 1 MB |
-| `memory_region_gfx2` | Zoom table data | 128 KB |
-| `memory_region_gfx1` | Fixed layer ROM | 128 KB - 512 KB |
-| `memory_region_cpu2` | Z80 program ROM | 128 KB - 512 KB |
-| `memory_region_user1` | BIOS ROM | 128 KB |
-| `memory_region_cpu1` | M68000 program ROM | 1-4 MB |
-| `gfx_pen_usage[0-2]` | Sprite transparency tables | Variable |
-
-**Cache Buffer Direct Assignment (`src/common/cache.c:710`):**
-
-When no extended memory has been used yet, the cache buffer is placed directly at the start of extended memory:
-```c
-if (psp2k_mem_left == PSP2K_MEM_SIZE) {
-    GFX_MEMORY = (uint8_t *)PSP2K_MEM_TOP;  // Direct pointer, up to 32 MB
-}
-```
-
-**Safe Deallocation with `psp2k_mem_free()`:**
-
-At shutdown (`src/mvs/memintrf.c:2025-2039`), all regions are passed through `psp2k_mem_free()` which only calls `free()` for standard memory addresses:
-```c
-// Only frees if address < PSP2K_MEM_TOP (0xa000000)
-// Extended memory regions are silently ignored to prevent freeze
-```
-
-#### What Gets Placed in Extended Memory
-
-**MVS (Priority order):**
-1. **GFX3 (Sprite ROMs)** - Large sprite data (8-64 MB) goes directly to extended memory
-2. **Cache buffer** - If GFX3 uses cache, the cache buffer uses extended memory (up to 32 MB)
-3. **SOUND1 (ADPCM)** - If normal malloc fails, ADPCM data moves to extended memory
-4. **Other regions** - CPU1, CPU2, GFX1, GFX2, GFX4, USER1, USER3 can be moved to free main RAM
-
-**CPS2:**
-- Disables the cache system entirely (`USE_CACHE=0`)
-- Graphics data loaded directly into memory
-- Only suitable for games with smaller graphics data
-
-#### Impact on Cache System
-
-| Setting | Normal (PSP Fat) | LARGE_MEMORY (PSP Slim) |
-|---------|------------------|-------------------------|
-| USE_CACHE (CPS2) | Enabled | **Disabled** |
-| USE_CACHE (MVS) | Enabled | Enabled |
-| MIN_CACHE_SIZE | 2 MB (0x20 blocks) | 4 MB (0x40 blocks) |
-| MAX_CACHE_SIZE | 20 MB (0x140 blocks) | 32 MB (0x200 blocks) |
-| Cache location | Main RAM | Extended memory (if available) |
-
-#### Memory Optimization Strategy
-
-When MVS detects that SOUND1 had to use extended memory (indicating main RAM pressure), it automatically moves previously allocated regions to extended memory in reverse allocation order:
-
-```
-USER3 → GFX4 → GFX2 → GFX1 → CPU2 → USER1 → CPU1 → pen_usage tables
-```
-
-This frees contiguous blocks in main RAM for the cache system.
-
-#### Power Management
-
-Extended memory state is preserved during PSP sleep/resume cycles. The system stores the last 4 MB of extended memory (`PSP2K_MEM_TOP + 0x1c00000`) to handle sleep mode properly.
+- PSP-1000 naturally receives a smaller cache budget;
+- PSP-2000/3000 can use the expanded user heap exposed by the same EBOOT;
+- GFX/C-ROM gets allocation priority, with MVS PCM using the remaining planned
+  share;
+- cache targets are dynamic and aligned to the 64 KB streaming block size;
+- CPS2 uses full GFX residency only when the complete region fits the selected
+  plan, otherwise it uses the streaming cache;
+- MVS applies the same runtime policy to C-ROM and PCM/V-ROM;
+- allocation retry-down handles fragmentation without a second build mode;
+- the loading log reports the effective allocation, for example
+  `C-ROM cache: 15360KB / 65536KB`;
+- all PSP allocations use normal heap ownership; there is no raw model-specific
+  memory allocator or suspend/resume memory-copy workaround.
 
 ### Static RAM Allocations (per system)
 
@@ -1195,17 +1029,24 @@ NJEMU/
 
 ### Driver Architecture
 
-Each platform implements the same driver interfaces:
+A platform backend is selected at link time and implements the shared contracts declared in `src/common/`. The normal backend layout is:
 
-| Driver | Purpose |
-|--------|---------|
-| `*_platform.c` | Platform initialization and main loop |
-| `*_video.c` | Screen rendering and sprite drawing |
-| `*_audio.c` | Sound output and mixing |
-| `*_input.c` | Controller/keyboard input |
+| Backend file | Purpose |
+|--------------|---------|
+| `*_drivers.c` | Bind the common driver globals to this platform's implementations |
+| `*_platform.c` | Startup, launch path, main loop, language and memory telemetry |
+| `*_video.c` | Native GPU/display, texture layout, sprite submission and readback |
+| `*_audio.c` | Native audio output |
+| `*_input.c` | Raw physical controller/keyboard sampling |
 | `*_thread.c` | Threading and synchronization |
-| `*_ticker.c` | Timing and frame pacing |
-| `*_power.c` | Power management |
+| `*_ticker.c` | Monotonic timing/frame pacing support |
+| `*_power.c` | Optional battery/performance capabilities |
+| `*_ui_draw.c` | GUI texture storage/lifecycle adapter when `GUI=ON` |
+| `png.c` | Platform image load/save/readback glue when `GUI=ON` |
+
+The bound common services are `audio_driver_t`, `input_driver_t`, `platform_driver_t`, `power_driver_t`, `thread_driver_t`, `ticker_driver_t`, `video_driver_t`, and `ui_draw_driver_t`. `ui_draw_driver_t` is deliberately not a second renderer: low-level drawing belongs to `video_driver_t`, while the UI adapter only handles texture storage/lifetime details that genuinely differ by host.
+
+All four target renderers are shared across platforms. A backend receives logical indexed/direct-color atlas updates plus compact `video_sprite_vertex_t`/`video_point_vertex_t` batches and chooses the fastest native execution path without exposing native GPU objects back to target code.
 
 ### Target Configuration
 
@@ -1268,25 +1109,9 @@ All targets use a hash-table based texture caching system to avoid re-decoding s
 
 #### PSP Texture Swizzling (PSP-Specific)
 
-The PSP GPU has a specific memory layout for optimal texture cache performance called "swizzling". This rearranges bytes within texture blocks:
+The PSP GPU benefits from swizzled texture storage, but swizzling is no longer part of any target renderer. Common MVS/CPS/NCDZ code always describes atlas updates in logical rectangular coordinates through `video_driver_t::writeIndexedTextureRect()` / `writeDirectTextureRect()`.
 
-```c
-// PSP swizzle table - controls row advancement in swizzled texture
-static const int swizzle_table_8bit[16] = {
-       0, 16, 16, 16, 16, 16, 16, 16,
-    3984, 16, 16, 16, 16, 16, 16, 16
-};
-
-// Swizzled address calculation for 16x16 tile
-dst = SWIZZLED8_16x16(texture_base, tile_index);
-```
-
-**For porting to other platforms:** Replace with linear row/column calculation:
-```c
-row = idx / TILES_PER_LINE;
-column = idx % TILES_PER_LINE;
-dst = &texture[((row * TILE_HEIGHT) + line) * BUF_WIDTH + (column * TILE_WIDTH)];
-```
+The PSP backend translates those logical coordinates into its native swizzled T8 layout; PS2 and Desktop use their own backend-native layouts. This keeps cache/decode policy shared while preventing PSP memory-addressing rules from leaking back into target code. A new platform should implement the same logical texture-update contract rather than copying PSP swizzle helpers.
 
 #### Color Table (CLUT) System
 
@@ -1307,7 +1132,7 @@ This allows storing a 4-bit palette index in the upper nibble of each 8-bit text
 
 ### MVS (Neo-Geo) Target
 
-**Files:** `src/mvs/psp_sprite.c`, `src/mvs/ps2_sprite.c`, `src/mvs/desktop_sprite.c`, `src/mvs/sprite_common.c`
+**Files:** `src/mvs/sprite.c`, `src/mvs/sprite_common.c`, `src/mvs/sprite_common.h`
 
 **Hardware Reference:** https://wiki.neogeodev.org/
 
@@ -1356,15 +1181,13 @@ $8400-$85FF  SCB4 - X position
 
 #### Code Organization
 
-MVS uses a shared sprite management architecture:
+MVS uses one platform-neutral renderer:
 
 | File | Purpose |
 |------|---------|
-| `sprite_common.h` | Shared declarations, constants, macros, extern variables |
-| `sprite_common.c` | Hash table management, software rendering, shared data |
-| `psp_sprite.c` | PSP-specific: swizzled textures, sceGu* API, ROM caching |
-| `ps2_sprite.c` | PS2-specific: GSKit types, linear textures |
-| `desktop_sprite.c` | Desktop-specific: SDL/linear textures |
+| `sprite_common.h` | Target sprite/cache declarations and constants |
+| `sprite_common.c` | Hash/cache management and shared target data |
+| `sprite.c` | MVS decoding, batching, atlas/cache policy and portable draw submission |
 
 #### Graphics Layers
 
@@ -1551,7 +1374,7 @@ The emulator uses lookup tables (`zoom_x_tables[]`) to determine which pixels to
 
 ### CPS1 (Capcom Play System 1) Target
 
-**Files:** `src/cps1/psp_sprite.c`, `src/cps1/ps2_sprite.c`, `src/cps1/sprite_common.c`
+**Files:** `src/cps1/sprite.c`, `src/cps1/sprite_common.c`, `src/cps1/sprite_common.h`
 
 **Hardware Reference:**
 - [Fabien Sanglard's CPS-1 Graphics Study](https://fabiensanglard.net/cps1_gfx/index.html)
@@ -1576,11 +1399,9 @@ The emulator uses lookup tables (`zoom_x_tables[]`) to determine which pixels to
 
 | File | Purpose |
 |------|---------|
-| `sprite_common.h` | Shared declarations, constants, macros, extern variables |
-| `sprite_common.c` | Hash table management, software rendering, shared data |
-| `psp_sprite.c` | PSP-specific: swizzled textures, sceGu* API |
-| `ps2_sprite.c` | PS2-specific: GSKit rendering, linear textures |
-| `desktop_sprite.c` | Desktop-specific: SDL2 rendering (TODO) |
+| `sprite_common.h` | CPS1 cache/decode declarations and constants |
+| `sprite_common.c` | Shared sprite-cache management and target data |
+| `sprite.c` | CPS1 object/scroll/stars/high-priority rendering and portable draw submission |
 
 #### Graphics Layers
 
@@ -1870,7 +1691,7 @@ CPS1 has a flexible layer priority system controlled by hardware registers:
 
 ### CPS2 (Capcom Play System 2) Target
 
-**File:** `src/cps2/psp_sprite.c`
+**File:** `src/cps2/sprite.c` (shared by PSP, PS2 and Desktop)
 
 #### Graphics Layers
 
@@ -1924,7 +1745,7 @@ CPS2 uses the same interleaved planar format as CPS1 (see CPS1 section above).
 
 ### NCDZ (Neo-Geo CD) Target
 
-**Files:** `src/ncdz/psp_sprite.c`, `src/ncdz/ps2_sprite.c`, `src/ncdz/desktop_sprite.c`, `src/ncdz/sprite_common.c`
+**Files:** `src/ncdz/sprite.c`, `src/ncdz/sprite_common.c`, `src/ncdz/sprite_common.h`
 
 **Hardware Reference:** https://wiki.neogeodev.org/
 
@@ -1974,15 +1795,13 @@ $8400-$85FF  SCB4 - X position
 
 #### Code Organization
 
-NCDZ uses a shared sprite management architecture similar to MVS:
+NCDZ uses one platform-neutral renderer similar to MVS:
 
 | File | Purpose |
 |------|---------|
-| `sprite_common.h` | Shared declarations, constants, macros, extern variables |
-| `sprite_common.c` | Hash table management, software rendering, shared data |
-| `psp_sprite.c` | PSP-specific: swizzled textures, sceGu* API |
-| `ps2_sprite.c` | PS2-specific: GSKit types, linear textures |
-| `desktop_sprite.c` | Desktop-specific: SDL/linear textures |
+| `sprite_common.h` | Neo Geo CD sprite/cache declarations and constants |
+| `sprite_common.c` | Shared target cache management and data |
+| `sprite.c` | NCDZ decoding, batching, atlas policy and portable draw submission |
 
 #### Graphics Layers
 
@@ -2153,141 +1972,9 @@ NCDZ is similar to MVS but with key differences:
 
 ### Porting Guide
 
-#### What Must Change Per Platform
+Target renderers are no longer ported separately per host. They emit portable texture updates and compact sprite/point batches through `video_driver_t`; PSP, PS2 and Desktop keep native texture layout, CLUT handling and GPU submission inside their backends.
 
-| Component | PSP | PS2 | Desktop |
-|-----------|-----|-----|---------|
-| Texture storage | Swizzled (GPU-specific) | Linear | Linear |
-| Texture upload | `sceGuTexImage()` | GSKit | SDL texture |
-| CLUT handling | `sceGuClutLoad()` | GS CLUT | Software lookup |
-| Vertex submission | `sceGuDrawArray()` | GS primitives | SDL render |
-| Frame sync | `sceGuSync()` | GS vsync | SDL_RenderPresent |
-
-#### What Must Stay the Same (All Platforms)
-
-1. **Sprite cache hash tables** - Platform agnostic
-2. **Graphics data decoding** - CPS1/CPS2 interleaved format is hardware-defined
-3. **Tile indexing formulas** - UV coordinate calculations
-4. **Palette/CLUT organization** - 16 colors per palette, 4-bit indices
-
-#### Key Macros for Porting
-
-**PSP (swizzled):**
-```c
-#define SWIZZLED8_8x8(tex, idx)    &tex[((idx & ~1) << 6) | ((idx & 1) << 3)]
-#define SWIZZLED8_16x16(tex, idx)  &tex[((idx & ~31) << 8) | ((idx & 31) << 7)]
-```
-
-**Desktop/PS2 (linear):**
-```c
-row = idx / TILES_PER_LINE;
-column = idx % TILES_PER_LINE;
-offset = ((row * TILE_HEIGHT) + line) * BUF_WIDTH + (column * TILE_WIDTH);
-dst = &texture[offset];
-```
-
-#### Platform-Specific Texture Atlas Implementation
-
-**MVS/NCDZ Texture Decoding (Platform-Specific):**
-
-The tile decoding writes to texture atlas positions differently per platform:
-
-```c
-// PS2/Desktop (linear layout):
-row = idx / TILE_16x16_PER_LINE;      // Which row of tiles
-column = idx % TILE_16x16_PER_LINE;   // Which column
-for (lines = 0; lines < 16; lines++) {
-    offset = ((row * 16) + lines) * BUF_WIDTH + (column * 16);
-    dst = &tex_spr[0][offset];
-    // Decode 16 pixels per line...
-}
-
-// PSP (swizzled layout):
-dst = SWIZZLED8_16x16(tex_spr, idx);
-// Different byte ordering for GPU cache optimization
-```
-
-**CLUT Upload Per Platform:**
-
-| Platform | CLUT Location | Upload Method |
-|----------|---------------|---------------|
-| PSP | GPU CLUT registers | `sceGuClutLoad()` with 16 entries |
-| PS2 | GS VRAM | `gsKit_texture_send_inline()` to VRAM |
-| Desktop | Software | Direct palette lookup in shader/CPU |
-
-**PS2 CLUT Specifics:**
-```c
-// CLUT stored in GS VRAM (256×16 colors per bank)
-#define CLUT_WIDTH 256
-#define CLUT_BANK_HEIGHT 16
-#define CLUT_BANKS_COUNT 2
-
-// CLUT offset calculation for PS2 CSM2 mode:
-gs_texclut texclut = postion_to_TEXCLUT(CLUT_CBW, 0, cov);
-```
-
-#### Vertex Format Per Platform
-
-**PS2 (GSKit GSPRIMUVPOINTFLAT):**
-```c
-typedef struct {
-    gs_xyz2 xyz2;    // Position (X, Y, Z packed)
-    gs_uv uv;        // Texture coordinates
-} GSPRIMUVPOINTFLAT;
-
-// Vertex submission:
-gskit_prim_list_sprite_texture_uv_flat_color2(gsGlobal, tex, color, count, vertices);
-```
-
-**PSP (sceGu Vertex):**
-```c
-struct Vertex {
-    uint16_t u, v;   // Texture coordinates
-    uint16_t color;  // Vertex color
-    int16_t x, y, z; // Position
-};
-
-// Vertex submission:
-sceGuDrawArray(GU_SPRITES, TEXTURE_FLAGS, count, NULL, vertices);
-```
-
-#### Rendering Pipeline (MVS/NCDZ)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Frame Rendering Flow                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. blit_start()                                                │
-│     └─ Upload CLUT for current palette bank                     │
-│     └─ Clear work frame with background color                   │
-│                                                                  │
-│  2. blit_draw_spr() [called per visible sprite]                 │
-│     └─ Check sprite cache (hash lookup)                         │
-│     └─ If miss: decode tile → texture atlas                     │
-│     └─ Add vertices to draw list                                │
-│     └─ Track which texture bank and CLUT offset                 │
-│                                                                  │
-│  3. blit_finish_spr()                                           │
-│     └─ Upload modified texture banks to VRAM                    │
-│     └─ Batch draw sprites by texture bank + CLUT                │
-│     └─ Submit vertex lists to GPU                               │
-│                                                                  │
-│  4. blit_draw_fix() [called per FIX tile]                       │
-│     └─ Same cache/decode flow as SPR                            │
-│     └─ Add to FIX vertex list                                   │
-│                                                                  │
-│  5. blit_finish_fix()                                           │
-│     └─ Upload TEX_FIX if modified                               │
-│     └─ Draw all FIX tiles in one batch                          │
-│                                                                  │
-│  6. blit_finish()                                               │
-│     └─ Transfer work frame to display (with scaling)            │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
+For the current extension recipe, including logical-vs-physical geometry, driver binding, input capabilities, UI ownership, renderer performance requirements and the validation gate for a new host such as PS Vita, see [docs/PLATFORM_PORTING_GUIDE.md](docs/PLATFORM_PORTING_GUIDE.md). The completed refactor and its measurements are recorded in [docs/PLATFORM_DRIVER_REFACTOR_PLAN.md](docs/PLATFORM_DRIVER_REFACTOR_PLAN.md).
 
 ## Internal Systems Documentation
 
@@ -2506,12 +2193,11 @@ The coin counter (`src/common/coin.c`) tracks coin insertions for arcade authent
 ## Changelog
 
 ### Version 2.4.0 (Cross-Platform Port)
-- Refactored codebase with platform abstraction layers (drivers)
-- Ported **MVS core** to PS2 (PlayStation 2)
-- Ported **MVS core** to PC/SDL2 for development and debugging
-- Introduced CMake build system for unified cross-platform builds
-- Maintained full PSP compatibility
-- Note: Menu/GUI not yet ported to PS2 and PC (core emulation only)
+- Refactored the codebase around platform driver contracts and common emulator policy
+- Ported **CPS1, CPS2, MVS and NCDZ** to PS2 and Desktop/SDL2
+- Unified each target's sprite renderer across PSP, PS2 and Desktop
+- Ported the common menu/GUI frontend to PS2 and Desktop
+- Introduced CMake builds for all supported hosts while maintaining PSP compatibility
 
 ### Version 2.3.x (Development Version)
 

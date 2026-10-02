@@ -7,6 +7,17 @@
 ******************************************************************************/
 
 #include "mvs.h"
+#include "common/emulator_runtime.h"
+#include "common/input_driver.h"
+#include "common/loadrom.h"
+#include "common/ui_defs.h"
+#include "common/ui_text_driver.h"
+#include "common/video_driver.h"
+#include "common/ui_draw.h"
+#include "common/filer.h"
+#include <stdio.h>
+#include "common/ui.h"
+#include "common/ui_layout.h"
 
 
 /******************************************************************************
@@ -133,13 +144,13 @@ static uint8_t bios_exist[BIOS_MAX];
 	Display Error Message
 ------------------------------------------------------*/
 
-static void bios_error(const char *rom_name, int64_t error, int flag)
+static void bios_error(const char *rom_name, rom_file_open_result_t error, int flag)
 {
 	char mes[128];
 
-	zip_close();
+	file_close();
 
-	if (error == -2)
+	if (error == ROM_FILE_OPEN_CRC_MISMATCH)
 		sprintf(mes, TEXT(CRC32_NOT_CORRECT_x), rom_name);
 	else
 		sprintf(mes, TEXT(FILE_NOT_FOUND_x), rom_name);
@@ -158,12 +169,12 @@ static void bios_error(const char *rom_name, int64_t error, int flag)
 static int bios_check(int flag)
 {
 	int i, count = 0, check_max = DEBUG_BIOS;
-    int64_t err;
+	rom_file_open_result_t err;
 	char *fname;
 
 	if (!flag) ui_popup_reset();
 
-	video_driver->copyRect(video_data, show_frame, draw_frame, &full_rect, &full_rect);
+	video_driver->copyRect(video_data, COMMON_GRAPHIC_OBJECTS_SHOW_FRAME_BUFFER, COMMON_GRAPHIC_OBJECTS_DRAW_FRAME_BUFFER, &full_rect, &full_rect);
 	video_driver->flipScreen(video_data, 1);
 
 	for (i = 0; i < BIOS_MAX; i++)
@@ -232,9 +243,12 @@ static int bios_check(int flag)
 
 void bios_select(int flag)
 {
-	int sel = 0, rows = 13, top = 0;
+	int sel = 0, rows = ui_layout_visible_rows(40, 17), top = 0;
 	int i, prev_sel, update = 1;
 	int old_bios = neogeo_bios;
+
+	if (rows < 1)
+		rows = 1;
 
 	if (!bios_check(flag)) return;
 
@@ -264,13 +278,13 @@ void bios_select(int flag)
 	{
 		if (update)
 		{
+			video_driver->beginFrame(video_data);
 			show_background();
 
-			small_icon(8, 3, UI_COLOR(UI_PAL_TITLE), ICON_SYSTEM);
-			uifont_print(36, 5, UI_COLOR(UI_PAL_TITLE), TEXT(BIOS_SELECT_MENU));
-
-			if (top != 0)
-				uifont_print(118, 24, UI_COLOR(UI_PAL_SELECT), FONT_UPTRIANGLE);
+				small_icon(8, 3, UI_COLOR(UI_PAL_TITLE), ICON_SYSTEM);
+				uifont_print(36, 5, UI_COLOR(UI_PAL_TITLE), TEXT(BIOS_SELECT_MENU));
+				draw_scrollbar(ui_layout_right(10), 26, ui_layout_right(0),
+					ui_layout_bottom(1), rows, BIOS_MAX, sel);
 
 			for (i = 0; i < rows; i++)
 			{
@@ -290,24 +304,19 @@ void bios_select(int flag)
 				}
 			}
 
-			if (flag != 2 && top + rows < BIOS_MAX)
-				uifont_print(118, 260, UI_COLOR(UI_PAL_SELECT), FONT_DOWNTRIANGLE);
-			if (flag == 2 && sel > 12)
-				uifont_print(118, 260, UI_COLOR(UI_PAL_SELECT), FONT_DOWNTRIANGLE);
-
-			update  = draw_battery_status(1);
-			update |= draw_volume_status(1);
+				update  = draw_battery_status(1);
 			update |= ui_show_popup(1);
+			video_driver->endFrame(video_data);
 			video_driver->flipScreen(video_data, 1);
 		}
 		else
 		{
 			update  = draw_battery_status(0);
-			update |= draw_volume_status(0);
 			update |= ui_show_popup(0);
 			video_driver->waitVsync(video_data);
 		}
 
+		pad_update();
 		prev_sel = sel;
 
 		if (pad_pressed(PLATFORM_PAD_UP))
@@ -363,8 +372,6 @@ void bios_select(int flag)
 		if (sel < top) top = sel;
 
 		if (prev_sel != sel) update = 1;
-
-		pad_update();
 
 		if (Loop == LOOP_EXIT) break;
 	} while (!pad_pressed(PLATFORM_PAD_L) && !pad_pressed(PLATFORM_PAD_B2));

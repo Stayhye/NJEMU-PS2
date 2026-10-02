@@ -21,6 +21,7 @@
 #define CPS1_SPRITE_COMMON_H
 
 #include "cps1.h"
+#include "common/video_geometry.h"
 
 /******************************************************************************
 	Constants/Macros
@@ -70,6 +71,8 @@
 #define SCROLLH_TEXTURE_SIZE	((BUF_WIDTH/8)*(SCROLLH_MAX_HEIGHT/8))
 #define SCROLLH_MAX_SPRITES		SCROLL1_MAX_SPRITES
 
+#define STARS_MAX_POINTS		0x1000
+
 #define SCROLL1H_TEXTURE_SIZE	SCROLLH_TEXTURE_SIZE
 #define SCROLL1H_MAX_SPRITES	SCROLL1_MAX_SPRITES
 #define SCROLL2H_TEXTURE_SIZE	((BUF_WIDTH/16)*(SCROLLH_MAX_HEIGHT/16))
@@ -104,7 +107,6 @@ extern SPRITE ALIGN16_DATA *object_head[OBJECT_HASH_SIZE];
 extern SPRITE ALIGN16_DATA object_data[OBJECT_TEXTURE_SIZE];
 extern SPRITE *object_free_head;
 extern uint8_t *gfx_object;
-extern uint8_t *tex_object;
 extern uint16_t object_texture_num;
 
 /* SCROLL1 */
@@ -112,7 +114,6 @@ extern SPRITE ALIGN16_DATA *scroll1_head[SCROLL1_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll1_data[SCROLL1_TEXTURE_SIZE];
 extern SPRITE *scroll1_free_head;
 extern uint8_t *gfx_scroll1;
-extern uint8_t *tex_scroll1;
 extern uint16_t scroll1_texture_num;
 
 /* SCROLL2 */
@@ -120,7 +121,6 @@ extern SPRITE ALIGN16_DATA *scroll2_head[SCROLL2_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll2_data[SCROLL2_TEXTURE_SIZE];
 extern SPRITE *scroll2_free_head;
 extern uint8_t *gfx_scroll2;
-extern uint8_t *tex_scroll2;
 extern uint16_t scroll2_texture_num;
 
 /* SCROLL3 */
@@ -128,14 +128,12 @@ extern SPRITE ALIGN16_DATA *scroll3_head[SCROLL3_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scroll3_data[SCROLL3_TEXTURE_SIZE];
 extern SPRITE *scroll3_free_head;
 extern uint8_t *gfx_scroll3;
-extern uint8_t *tex_scroll3;
 extern uint16_t scroll3_texture_num;
 
 /* SCROLLH */
 extern SPRITE ALIGN16_DATA *scrollh_head[SCROLLH_HASH_SIZE];
 extern SPRITE ALIGN16_DATA scrollh_data[SCROLLH_TEXTURE_SIZE];
 extern SPRITE *scrollh_free_head;
-extern uint16_t *tex_scrollh;
 extern uint16_t scrollh_num;
 extern uint16_t scrollh_texture_num;
 extern uint8_t scrollh_texture_clear;
@@ -153,11 +151,8 @@ extern int16_t scroll2_ey;
 /* Pen usage */
 extern uint8_t *pen_usage;
 
-/* Screen bitmap */
-extern uint16_t *scrbitmap;
-
 /* Color table */
-extern const uint32_t ALIGN16_DATA color_table[16];
+extern const uint32_t ALIGN16_DATA sprite_color_table[16];
 
 /* Frame counter (from vidhrdw.c) */
 extern uint32_t frames_displayed;
@@ -193,26 +188,6 @@ int16_t scrollh_insert_sprite(uint32_t key);
 void scrollh_delete_sprite(void);
 void scrollh_delete_sprite_tpens(uint16_t tpens);
 void scrollh_delete_dirty_palette(void);
-
-/* Software rendering functions for SCROLL2 */
-void drawgfx16_16x16(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipx(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipxy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-
-void drawgfx16_16x16_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipx_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-void drawgfx16_16x16_flipxy_opaque(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-
-void drawgfx16h_16x16(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines, uint16_t tpens);
-void drawgfx16h_16x16_flipx(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines, uint16_t tpens);
-void drawgfx16h_16x16_flipy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines, uint16_t tpens);
-void drawgfx16h_16x16_flipxy(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines, uint16_t tpens);
-
-/* Function pointer arrays for software rendering */
-extern void ALIGN16_DATA (*drawgfx16[8])(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines);
-extern void ALIGN16_DATA (*drawgfx16h[4])(uint32_t *src, uint16_t *dst, uint16_t *pal, int lines, uint16_t tpens);
 
 /* Platform-agnostic blit functions */
 void blit_clear_all_sprite(void);

@@ -2,18 +2,22 @@
 
 	psp.c
 
-	PSP¥á¥¤¥ó
+	PSPï¿½á¥¤ï¿½ï¿½
 
 ******************************************************************************/
 
-#include <fcntl.h>
-#include <limits.h>
+#include <pspkernel.h>
+#include <psppower.h>
 #include <pspsdk.h>
-#include <pspctrl.h>
-#include <pspimpose_driver.h>
+#include <psputility_sysparam.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include "SystemButtons.h"
-#include "psp.h"
+#include "emucfg.h"
+#include "common/emulator_runtime.h"
+#include "common/platform_driver.h"
+#include "common/runtime_paths.h"
 
 
 #ifdef KERNEL_MODE
@@ -24,21 +28,12 @@ PSP_MODULE_INFO(TARGET_STR, PSP_MODULE_USER, VERSION_MAJOR, VERSION_MINOR);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 #endif
 
-typedef struct psp_platform {
-	SceUID modID;
-	int32_t devkit_version;
-#if SYSTEM_BUTTONS
-	char prx_path[PATH_MAX];
-#endif
-} psp_platform_t;
-
-
 /******************************************************************************
-	¥°¥í©`¥Ð¥ëévÊý
+	ï¿½ï¿½ï¿½ï¿½ï¿½`ï¿½Ð¥ï¿½ï¿½vï¿½ï¿½
 ******************************************************************************/
 
 /******************************************************************************
-	¥í©`¥«¥ëévÊý
+	ï¿½ï¿½ï¿½`ï¿½ï¿½ï¿½ï¿½ï¿½vï¿½ï¿½
 ******************************************************************************/
 
 /*--------------------------------------------------------
@@ -48,48 +43,15 @@ typedef struct psp_platform {
 static SceKernelCallbackFunction PowerCallback(int unknown, int pwrflags, void *arg)
 {
 	int cbid;
+	(void)unknown;
+	(void)arg;
 
 	if (pwrflags & PSP_POWER_CB_POWER_SWITCH)
 	{
-#if defined(LARGE_MEMORY) && ((EMU_SYSTEM == CPS2) || (EMU_SYSTEM == MVS))
-		extern int32_t psp2k_mem_left;
-
-		if (psp2k_mem_left < 0x400000)
-		{
-			char path[PATH_MAX];
-			SceUID fd;
-
-			sprintf(path, "%sresume.bin", launchDir);
-
-			if ((fd = open(path, O_WRONLY|O_CREAT, 0777)) >= 0)
-			{
-				write(fd, (void *)(PSP2K_MEM_TOP + 0x1c00000), 0x400000);
-				close(fd);
-			}
-		}
-#endif
 		Sleep = 1;
 	}
 	else if (pwrflags & PSP_POWER_CB_RESUME_COMPLETE)
 	{
-#if defined(LARGE_MEMORY) && ((EMU_SYSTEM == CPS2) || (EMU_SYSTEM == MVS))
-		extern int32_t psp2k_mem_left;
-
-		if (psp2k_mem_left < 0x400000)
-		{
-			char path[PATH_MAX];
-			SceUID fd;
-
-			sprintf(path, "%sresume.bin", launchDir);
-
-			if ((fd = open(path, O_RDONLY, 0777)) >= 0)
-			{
-				read(fd, (void *)(PSP2K_MEM_TOP + 0x1c00000), 0x400000);
-				close(fd);
-			}
-			remove(path);
-		}
-#endif
 		Sleep = 0;
 	}
 
@@ -101,12 +63,14 @@ static SceKernelCallbackFunction PowerCallback(int unknown, int pwrflags, void *
 }
 
 /*--------------------------------------------------------
-	¥³©`¥ë¥Ð¥Ã¥¯¥¹¥ì¥Ã¥É×÷³É
+	ï¿½ï¿½ï¿½`ï¿½ï¿½Ð¥Ã¥ï¿½ï¿½ï¿½ï¿½ï¿½Ã¥ï¿½ï¿½ï¿½ï¿½ï¿½
 --------------------------------------------------------*/
 
 static int CallbackThread(SceSize args, void *argp)
 {
 	int cbid;
+	(void)args;
+	(void)argp;
 
 	cbid = sceKernelCreateCallback("Power Callback", (void *)PowerCallback, NULL);
 	scePowerRegisterCallback(0, cbid);
@@ -118,7 +82,7 @@ static int CallbackThread(SceSize args, void *argp)
 
 
 /*--------------------------------------------------------
-	¥³©`¥ë¥Ð¥Ã¥¯¥¹¥ì¥Ã¥ÉÔO¶¨
+	ï¿½ï¿½ï¿½`ï¿½ï¿½Ð¥Ã¥ï¿½ï¿½ï¿½ï¿½ï¿½Ã¥ï¿½ï¿½Oï¿½ï¿½
 --------------------------------------------------------*/
 
 static int SetupCallbacks(void)
@@ -139,7 +103,7 @@ static int SetupCallbacks(void)
 
 
 /*--------------------------------------------------------
-	Kernel¥â©`¥É main()
+	Kernelï¿½ï¿½`ï¿½ï¿½ main()
 --------------------------------------------------------*/
 
 // #ifdef KERNEL_MODE
@@ -173,24 +137,34 @@ static int SetupCallbacks(void)
 // #endif
 
 static void *psp_init(void) {
-	psp_platform_t *psp = (psp_platform_t*)calloc(1, sizeof(psp_platform_t));
-	return psp;
+	return calloc(1, 1);
 }
 
 static void psp_free(void *data) {
-	psp_platform_t *psp = (psp_platform_t*)data;
-
 #ifdef KERNEL_MODE
 	sceKernelExitThread(0);
 #else
 	sceKernelExitGame();
 #endif
 
-	free(psp);
+	free(data);
 }
 
 static void psp_main(void *data, int argc, char *argv[]) {
-	psp_platform_t *psp = (psp_platform_t*)data;
+	(void)data;
+
+	// Override launchDir from argv[0] for PPSSPP compatibility.
+	// getcwd() may return "umd0:" which is not browsable, but argv[0]
+	// contains the full path to EBOOT.PBP on the memory stick.
+	if (argc > 0 && argv[0]) {
+		char *last_slash = strrchr(argv[0], '/');
+		if (last_slash) {
+			size_t len = last_slash - argv[0] + 1;
+			strncpy(launchDir, argv[0], len);
+			launchDir[len] = '\0';
+		}
+	}
+
 #if	(EMU_SYSTEM == CPS1)
 	strcat(screenshotDir, "ms0:/PICTURE/CPS1");
 #endif
@@ -204,31 +178,28 @@ static void psp_main(void *data, int argc, char *argv[]) {
 	strcat(screenshotDir, "ms0:/PICTURE/NCDZ");
 #endif
 
-	psp->devkit_version = sceKernelDevkitVersion();
-
 	SetupCallbacks();
 }
 
-static bool psp_startSystemButtons(void *data) {
-	psp_platform_t *psp = (psp_platform_t*)data;
-#if SYSTEM_BUTTONS
-	sprintf(psp->prx_path, "%sSystemButtons.prx", launchDir);
+static ui_language_t psp_getSystemLanguage(void *data) {
+	int language = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
+	(void)data;
 
-	if ((psp->modID = pspSdkLoadStartModule(psp->prx_path, PSP_MEMORY_PARTITION_KERNEL)) >= 0)
-	{
-		initSystemButtons(devkit_version);
-		return true;
-	}
-	else
-#endif
-	{
-		return false;
-	}
-}
+	if (sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_LANGUAGE, &language) < 0)
+		return UI_LANG_ENGLISH;
 
-static int32_t psp_getDevkitVersion(void *data) {
-	psp_platform_t *psp = (psp_platform_t*)data;
-	return psp->devkit_version;
+	switch (language) {
+	case PSP_SYSTEMPARAM_LANGUAGE_JAPANESE:
+		return UI_LANG_JAPANESE;
+	case PSP_SYSTEMPARAM_LANGUAGE_SPANISH:
+		return UI_LANG_SPANISH;
+	case PSP_SYSTEMPARAM_LANGUAGE_CHINESE_SIMPLIFIED:
+		return UI_LANG_CHINESE_SIMPLIFIED;
+	case PSP_SYSTEMPARAM_LANGUAGE_CHINESE_TRADITIONAL:
+		return UI_LANG_CHINESE_TRADITIONAL;
+	default:
+		return UI_LANG_ENGLISH;
+	}
 }
 
 platform_driver_t platform_psp = {
@@ -236,6 +207,6 @@ platform_driver_t platform_psp = {
 	psp_init,
 	psp_free,
 	psp_main,
-	psp_startSystemButtons,
-	psp_getDevkitVersion,
+	NULL,
+	psp_getSystemLanguage,
 };
